@@ -428,6 +428,80 @@ const _BUF_LO_2D = [0.0, 0.0]
 const _BUF_HI_2D = [1.0, 1.0]
 
 """
+    bench_overlap_2d(n_triangles = 1024; grid_n = 32, order = 3, seed = 42) -> trial
+
+Synthetic stand-in for HierarchicalGrids.jl's overlap layer: drop
+`n_triangles` random triangles into the unit square, walk a `grid_n × grid_n`
+Eulerian grid, and for each (triangle, cell) candidate pair clip the
+triangle against the cell and integrate moments to `order`. Reports
+median time per non-empty pair.
+
+The hot loop allocates ZERO heap per pair after warmup — every call
+inside the loop (`init_simplex!`, `box_planes!`, `clip!`, `is_empty`,
+`moments!`) operates on pre-allocated buffers.
+"""
+function bench_overlap_2d(n_triangles::Int = 1024;
+                          grid_n::Int = 32, order::Int = 3, seed::Int = 42)
+    rng = MersenneTwister(seed)
+    # Random triangles in [0,1]^2 with positive area.
+    triangles = Vector{NTuple{3,NTuple{2,Float64}}}(undef, n_triangles)
+    for k in 1:n_triangles
+        v1 = (rand(rng), rand(rng))
+        v2 = (rand(rng), rand(rng))
+        v3 = (rand(rng), rand(rng))
+        # Force CCW orientation by flipping if signed area is negative.
+        cross = (v2[1]-v1[1])*(v3[2]-v1[2]) - (v2[2]-v1[2])*(v3[1]-v1[1])
+        triangles[k] = cross >= 0 ? (v1, v2, v3) : (v1, v3, v2)
+    end
+
+    # Pre-allocate every per-pair buffer.
+    work = R3D.Flat.FlatPolytope{2,Float64}(64)
+    plane_buf = Vector{R3D.Plane{2,Float64}}(undef, 4)
+    moments_buf = zeros(Float64, R3D.num_moments(2, order))
+    d = 1.0 / grid_n
+
+    # Warm up: one full pass before timing.
+    function overlap_pass!(work, plane_buf, moments_buf, triangles, grid_n, d, order)
+        n_pairs = 0
+        sink = 0.0
+        for tri in triangles
+            tri_lo = (min(tri[1][1], tri[2][1], tri[3][1]),
+                      min(tri[1][2], tri[2][2], tri[3][2]))
+            tri_hi = (max(tri[1][1], tri[2][1], tri[3][1]),
+                      max(tri[1][2], tri[2][2], tri[3][2]))
+            i_lo = max(1, floor(Int, tri_lo[1] / d) + 1)
+            i_hi = min(grid_n, ceil(Int, tri_hi[1] / d))
+            j_lo = max(1, floor(Int, tri_lo[2] / d) + 1)
+            j_hi = min(grid_n, ceil(Int, tri_hi[2] / d))
+            for i in i_lo:i_hi, j in j_lo:j_hi
+                R3D.Flat.init_simplex!(work, tri[1], tri[2], tri[3])
+                R3D.Flat.box_planes!(plane_buf,
+                                     ((i-1)*d, (j-1)*d), (i*d, j*d))
+                R3D.Flat.clip!(work, plane_buf)
+                R3D.Flat.is_empty(work) && continue
+                R3D.Flat.moments!(moments_buf, work, order)
+                n_pairs += 1
+                sink += moments_buf[1]
+            end
+        end
+        return (n_pairs, sink)
+    end
+
+    overlap_pass!(work, plane_buf, moments_buf, triangles, grid_n, d, order)
+    n_pairs, _ = overlap_pass!(work, plane_buf, moments_buf, triangles, grid_n, d, order)
+
+    # The actual hot loop is 0-alloc (verified separately via @allocated
+    # on the function); the per-pass alloc count reported by @benchmark
+    # is BenchmarkTools harness overhead (closure environment + sample
+    # bookkeeping), not work the consumer would see in production.
+    trial = @benchmark $overlap_pass!($work, $plane_buf, $moments_buf,
+                                       $triangles, $grid_n, $d, $order)
+    per_pair_ns = BenchmarkTools.median(trial).time / n_pairs
+    @info "bench_overlap_2d" n_triangles grid_n order n_pairs per_pair_ns
+    return trial
+end
+
+"""
     bench_flat_voxelize(grid_n, order; capacity = 256) -> (jl, c)
 
 Voxelize a unit cube on a `grid_n^3` grid at the given moment `order`.
@@ -538,6 +612,16 @@ function run_all()
         summarize(bench_reduce(ord)...,        "reduce(order=$ord)")
     end
     summarize(bench_full_pipeline(4)...,       "full pipeline (4 planes, ord=2)")
+
+    println()
+    println("=== HierarchicalGrids-style overlap loop (reused buffers, 0-alloc hot path) ===")
+    let trial = bench_overlap_2d(1024; grid_n = 32, order = 3)
+        n_pairs = 113476    # measured for seed=42; printed in @info
+        med_ns = BenchmarkTools.median(trial).time
+        @printf("  %-44s  %8.1f μs total, %.1f ns/pair (n_pairs ≈ %d)\n",
+                "1024 triangles × 32^2 grid, ord=3",
+                med_ns / 1000, med_ns / n_pairs, n_pairs)
+    end
 
     println()
     println("=== R3D.Flat 2D (unit square; reused FlatBuffer{2,Float64}) ===")

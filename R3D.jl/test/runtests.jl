@@ -565,6 +565,115 @@ using LinearAlgebra: I
         @test isapprox(g2, fd; atol=1e-6)
     end
 
+    @testset "Phase-2 overlap-layer helpers (aabb / box_planes / volume / is_empty / copy!)" begin
+        # aabb closed-form
+        sq = R3D.Flat.box((0.13, 0.27), (1.62, 1.45))
+        @test R3D.Flat.aabb(sq) == ((0.13, 0.27), (1.62, 1.45))
+        cube = R3D.Flat.box((-1.0, -2.0, -3.0), (4.0, 5.0, 6.0))
+        @test R3D.Flat.aabb(cube) == ((-1.0, -2.0, -3.0), (4.0, 5.0, 6.0))
+
+        # aabb of an empty polytope returns identity tuples
+        sq_empty = R3D.Flat.box((0.0, 0.0), (1.0, 1.0))
+        plane_far = R3D.Plane{2,Float64}(R3D.Vec{2,Float64}(1.0, 0.0), -100.0)
+        R3D.Flat.clip!(sq_empty, [plane_far])
+        @test R3D.Flat.is_empty(sq_empty)
+        @test R3D.Flat.aabb(sq_empty) == ((Inf, Inf), (-Inf, -Inf))
+
+        # 0-alloc check
+        sq2 = R3D.Flat.box((0.0, 0.0), (1.0, 1.0))
+        cube2 = R3D.Flat.box((0.0,0.0,0.0), (1.0,1.0,1.0))
+        R3D.Flat.aabb(sq2); R3D.Flat.aabb(cube2)   # warmup
+        @test (@allocated R3D.Flat.aabb(sq2)) == 0
+        @test (@allocated R3D.Flat.aabb(cube2)) == 0
+
+        # box_planes 2D + 3D
+        ps2 = R3D.Flat.box_planes((0.0, 0.0), (1.0, 1.0))
+        @test length(ps2) == 4
+        ps3 = R3D.Flat.box_planes((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+        @test length(ps3) == 6
+
+        # Round-trip: clipping a larger box by another box's planes equals
+        # the inner box (up to floating-point).
+        big2 = R3D.Flat.box((-0.5, -0.5), (1.5, 1.5))
+        R3D.Flat.clip!(big2, ps2)
+        @test isapprox(R3D.Flat.moments(big2, 0)[1], 1.0; atol=1e-12)
+
+        big3 = R3D.Flat.box((-0.5,-0.5,-0.5), (1.5,1.5,1.5))
+        R3D.Flat.clip!(big3, ps3)
+        @test isapprox(R3D.Flat.moments(big3, 0)[1], 1.0; atol=1e-12)
+
+        # box_planes! 0-alloc
+        out2 = Vector{R3D.Plane{2,Float64}}(undef, 4)
+        R3D.Flat.box_planes!(out2, (0.0, 0.0), (1.0, 1.0))   # warmup
+        @test (@allocated R3D.Flat.box_planes!(out2, (0.0, 0.0), (1.0, 1.0))) == 0
+        out3 = Vector{R3D.Plane{3,Float64}}(undef, 6)
+        R3D.Flat.box_planes!(out3, (0.0,0.0,0.0), (1.0,1.0,1.0))
+        @test (@allocated R3D.Flat.box_planes!(out3, (0.0,0.0,0.0), (1.0,1.0,1.0))) == 0
+
+        # is_empty
+        sq3 = R3D.Flat.box((0.0,0.0), (1.0,1.0))
+        @test !R3D.Flat.is_empty(sq3)
+        R3D.Flat.clip!(sq3, [plane_far])
+        @test R3D.Flat.is_empty(sq3)
+
+        # volume — matches moments(., 0)[1] exactly, 0-alloc after warmup
+        sq4 = R3D.Flat.box((0.0, 0.0), (3.0, 5.0))
+        @test R3D.Flat.volume(sq4) == 15.0
+        R3D.Flat.volume(sq4)   # warmup
+        @test (@allocated R3D.Flat.volume(sq4)) == 0
+        cube4 = R3D.Flat.box((0.0,0.0,0.0), (1.0,2.0,3.0))
+        R3D.Flat.volume(cube4)
+        @test R3D.Flat.volume(cube4) == 6.0
+        @test (@allocated R3D.Flat.volume(cube4)) == 0
+
+        # volume on empty polytope
+        @test R3D.Flat.volume(sq3) == 0.0
+
+        # copy! 0-alloc, faithful
+        src2 = R3D.Flat.box((1.0, 2.0), (4.0, 7.0))
+        dst2 = R3D.Flat.FlatPolytope{2,Float64}(64)
+        R3D.Flat.copy!(dst2, src2)
+        @test dst2.nverts == src2.nverts
+        @test isapprox(R3D.Flat.moments(dst2, 0)[1], 15.0; atol=1e-12)
+        @test (@allocated R3D.Flat.copy!(dst2, src2)) == 0
+
+        src3 = R3D.Flat.box((-1.0, -1.0, -1.0), (1.0, 1.0, 1.0))
+        dst3 = R3D.Flat.FlatPolytope{3,Float64}(64)
+        R3D.Flat.copy!(dst3, src3)
+        @test dst3.nverts == src3.nverts
+        @test isapprox(R3D.Flat.moments(dst3, 0)[1], 8.0; atol=1e-12)
+        @test (@allocated R3D.Flat.copy!(dst3, src3)) == 0
+    end
+
+    @testset "Hot-loop overlap pattern is 0-alloc end-to-end" begin
+        # Mirror exactly what the HierarchicalGrids overlap layer does:
+        # init_simplex! + box_planes! + clip! + moments!. Every call must
+        # be 0-alloc once warmed up.
+        work = R3D.Flat.FlatPolytope{2,Float64}(64)
+        plane_buf = Vector{R3D.Plane{2,Float64}}(undef, 4)
+        moments_buf = zeros(Float64, R3D.num_moments(2, 3))
+
+        verts = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)]
+        leaf_lo = (0.25, 0.0); leaf_hi = (1.0, 0.5)
+
+        # warmup
+        R3D.Flat.init_simplex!(work, verts)
+        R3D.Flat.box_planes!(plane_buf, leaf_lo, leaf_hi)
+        R3D.Flat.clip!(work, plane_buf)
+        R3D.Flat.moments!(moments_buf, work, 3)
+
+        # Now a clean iteration measured.
+        a_init = @allocated R3D.Flat.init_simplex!(work, verts)
+        a_box  = @allocated R3D.Flat.box_planes!(plane_buf, leaf_lo, leaf_hi)
+        a_clip = @allocated R3D.Flat.clip!(work, plane_buf)
+        a_mom  = @allocated R3D.Flat.moments!(moments_buf, work, 3)
+        @test a_init <= 256   # only the literal `[(0.0,0.0), …]` from the call site
+        @test a_box  == 0
+        @test a_clip == 0
+        @test a_mom  == 0
+        @test isapprox(moments_buf[1], 0.25; atol=1e-12)
+    end
+
     @testset "voxelize_batch! parallel agrees with serial" begin
         # Build a small batch of clipped boxes
         rng = Random.MersenneTwister(20260435)

@@ -2178,6 +2178,73 @@ function tet(v1::NTuple{3,Real}, v2::NTuple{3,Real},
 end
 
 """
+    init_simplex!(poly::FlatPolytope{3,T}, v1, v2, v3, v4) -> poly
+
+D = 3 alias for [`init_tet!`](@ref). Provided for API uniformity with
+the D = 2 version of `init_simplex!` (triangle from 3 vertices).
+"""
+@inline init_simplex!(poly::FlatPolytope{3,T},
+                      v1::AbstractVector, v2::AbstractVector,
+                      v3::AbstractVector, v4::AbstractVector) where {T} =
+    init_tet!(poly, v1, v2, v3, v4)
+
+"""
+    init_simplex!(poly::FlatPolytope{D,T}, vertices) -> poly
+
+Initialize from a length-`(D+1)` collection of vertex positions
+(`AbstractVector`s, `NTuple`s, or `SVector`s). Convenience wrapper
+that splats into the per-vertex `init_simplex!` (D=2: 3 verts;
+D=3: 4 verts).
+"""
+function init_simplex!(poly::FlatPolytope{2,T}, vertices) where {T}
+    @assert length(vertices) == 3 "D=2 simplex needs 3 vertices, got $(length(vertices))"
+    init_simplex!(poly, vertices[1], vertices[2], vertices[3])
+end
+
+function init_simplex!(poly::FlatPolytope{3,T}, vertices) where {T}
+    @assert length(vertices) == 4 "D=3 simplex needs 4 vertices, got $(length(vertices))"
+    init_simplex!(poly, vertices[1], vertices[2], vertices[3], vertices[4])
+end
+
+# Accept tuple-element vertices as well (the 2D init_simplex! signature
+# above takes AbstractVector; tuples don't match it directly). These
+# methods write the positions directly from the tuples — no Vector
+# splat — so they're 0-alloc for hot loops.
+function init_simplex!(poly::FlatPolytope{2,T},
+                       v1::NTuple{2,<:Real}, v2::NTuple{2,<:Real},
+                       v3::NTuple{2,<:Real}) where {T}
+    @assert poly.capacity >= 3
+    poly.nverts = 3
+    @inbounds begin
+        poly.positions[1,1] = T(v1[1]); poly.positions[2,1] = T(v1[2])
+        poly.positions[1,2] = T(v2[1]); poly.positions[2,2] = T(v2[2])
+        poly.positions[1,3] = T(v3[1]); poly.positions[2,3] = T(v3[2])
+        poly.pnbrs[1,1] = Int32(2); poly.pnbrs[2,1] = Int32(3)
+        poly.pnbrs[1,2] = Int32(3); poly.pnbrs[2,2] = Int32(1)
+        poly.pnbrs[1,3] = Int32(1); poly.pnbrs[2,3] = Int32(2)
+    end
+    return poly
+end
+
+function init_simplex!(poly::FlatPolytope{3,T},
+                       v1::NTuple{3,<:Real}, v2::NTuple{3,<:Real},
+                       v3::NTuple{3,<:Real}, v4::NTuple{3,<:Real}) where {T}
+    @assert poly.capacity >= 4
+    poly.nverts = 4
+    @inbounds begin
+        poly.positions[1,1] = T(v1[1]); poly.positions[2,1] = T(v1[2]); poly.positions[3,1] = T(v1[3])
+        poly.positions[1,2] = T(v2[1]); poly.positions[2,2] = T(v2[2]); poly.positions[3,2] = T(v2[3])
+        poly.positions[1,3] = T(v3[1]); poly.positions[2,3] = T(v3[2]); poly.positions[3,3] = T(v3[3])
+        poly.positions[1,4] = T(v4[1]); poly.positions[2,4] = T(v4[2]); poly.positions[3,4] = T(v4[3])
+        poly.pnbrs[1,1]=Int32(2); poly.pnbrs[2,1]=Int32(4); poly.pnbrs[3,1]=Int32(3)
+        poly.pnbrs[1,2]=Int32(3); poly.pnbrs[2,2]=Int32(4); poly.pnbrs[3,2]=Int32(1)
+        poly.pnbrs[1,3]=Int32(1); poly.pnbrs[2,3]=Int32(4); poly.pnbrs[3,3]=Int32(2)
+        poly.pnbrs[1,4]=Int32(2); poly.pnbrs[2,4]=Int32(3); poly.pnbrs[3,4]=Int32(1)
+    end
+    return poly
+end
+
+"""
     init_simplex!(poly::FlatPolytope{2,T}, v1, v2, v3)
 
 Initialize as a triangle (2D simplex) with the three given vertices in
@@ -2561,6 +2628,175 @@ function affine!(poly::FlatPolytope{3,T}, mat::AbstractMatrix) where {T}
         poly.positions[3, v] = T(nz / w)
     end
     return poly
+end
+
+# ===========================================================================
+# Phase 2 helpers — ergonomics for the overlap-layer style hot loop.
+# ===========================================================================
+
+"""
+    aabb(poly::FlatPolytope{D,T}) -> (lo::NTuple{D,T}, hi::NTuple{D,T})
+
+Axis-aligned bounding box of the polytope's current vertex set as a
+pair of `NTuple{D,T}`s. O(`nverts`), 0 allocations. For an empty
+polytope (`nverts == 0`) returns `((+Inf, …), (-Inf, …))` so callers
+can use the result as the identity for `extend` reductions.
+"""
+function aabb(poly::FlatPolytope{2,T}) where {T}
+    if poly.nverts <= 0
+        return ((T(Inf), T(Inf)), (T(-Inf), T(-Inf)))
+    end
+    @inbounds begin
+        x_lo = poly.positions[1, 1]; x_hi = x_lo
+        y_lo = poly.positions[2, 1]; y_hi = y_lo
+        for v in 2:poly.nverts
+            x = poly.positions[1, v]; y = poly.positions[2, v]
+            x < x_lo && (x_lo = x); x > x_hi && (x_hi = x)
+            y < y_lo && (y_lo = y); y > y_hi && (y_hi = y)
+        end
+    end
+    return ((x_lo, y_lo), (x_hi, y_hi))
+end
+
+function aabb(poly::FlatPolytope{3,T}) where {T}
+    if poly.nverts <= 0
+        return ((T(Inf), T(Inf), T(Inf)), (T(-Inf), T(-Inf), T(-Inf)))
+    end
+    @inbounds begin
+        x_lo = poly.positions[1, 1]; x_hi = x_lo
+        y_lo = poly.positions[2, 1]; y_hi = y_lo
+        z_lo = poly.positions[3, 1]; z_hi = z_lo
+        for v in 2:poly.nverts
+            x = poly.positions[1, v]; y = poly.positions[2, v]; z = poly.positions[3, v]
+            x < x_lo && (x_lo = x); x > x_hi && (x_hi = x)
+            y < y_lo && (y_lo = y); y > y_hi && (y_hi = y)
+            z < z_lo && (z_lo = z); z > z_hi && (z_hi = z)
+        end
+    end
+    return ((x_lo, y_lo, z_lo), (x_hi, y_hi, z_hi))
+end
+
+"""
+    aabb(poly::StaticFlatPolytope) -> (lo, hi)
+
+`StaticFlatPolytope` analog of [`aabb`](@ref).
+"""
+function aabb(poly::StaticFlatPolytope{3,T,N,DN}) where {T,N,DN}
+    if poly.nverts <= 0
+        return ((T(Inf), T(Inf), T(Inf)), (T(-Inf), T(-Inf), T(-Inf)))
+    end
+    @inbounds begin
+        x_lo = poly.positions[1, 1]; x_hi = x_lo
+        y_lo = poly.positions[2, 1]; y_hi = y_lo
+        z_lo = poly.positions[3, 1]; z_hi = z_lo
+        for v in 2:poly.nverts
+            x = poly.positions[1, v]; y = poly.positions[2, v]; z = poly.positions[3, v]
+            x < x_lo && (x_lo = x); x > x_hi && (x_hi = x)
+            y < y_lo && (y_lo = y); y > y_hi && (y_hi = y)
+            z < z_lo && (z_lo = z); z > z_hi && (z_hi = z)
+        end
+    end
+    return ((x_lo, y_lo, z_lo), (x_hi, y_hi, z_hi))
+end
+
+"""
+    box_planes(lo, hi) -> Vector{Plane{D,T}}
+
+The `2D` clipping planes for the axis-aligned box `[lo[1], hi[1]] × …`,
+in the `n·x + d ≥ 0`-keeps convention used by [`clip!`](@ref).
+Allocates the result; for hot loops use [`box_planes!`](@ref) into a
+pre-sized buffer.
+
+D = 2 returns 4 planes (in `+x, -x, +y, -y` order); D = 3 returns 6.
+"""
+function box_planes(lo::NTuple{2,T}, hi::NTuple{2,T}) where {T}
+    out = Vector{Plane{2,T}}(undef, 4)
+    box_planes!(out, lo, hi)
+    return out
+end
+
+function box_planes(lo::NTuple{3,T}, hi::NTuple{3,T}) where {T}
+    out = Vector{Plane{3,T}}(undef, 6)
+    box_planes!(out, lo, hi)
+    return out
+end
+
+"""
+    box_planes!(out::AbstractVector{Plane{D,T}}, lo, hi) -> out
+
+Write the `2D` axis-aligned-box clipping planes for `[lo, hi]` into
+`out` (must satisfy `length(out) == 2D`). Zero allocations.
+
+Plane order: `(+axis_k, -axis_k)` pairs for `k = 1, …, D` — i.e.
+`[+x, -x, +y, -y]` in 2D, `[+x, -x, +y, -y, +z, -z]` in 3D.
+"""
+function box_planes!(out::AbstractVector{Plane{2,T}},
+                     lo::NTuple{2,T}, hi::NTuple{2,T}) where {T}
+    @assert length(out) == 4 "box_planes! D=2 needs out of length 4, got $(length(out))"
+    @inbounds begin
+        out[1] = Plane{2,T}(Vec{2,T}(T( 1), T(0)), -lo[1])
+        out[2] = Plane{2,T}(Vec{2,T}(T(-1), T(0)),  hi[1])
+        out[3] = Plane{2,T}(Vec{2,T}(T(0),  T( 1)), -lo[2])
+        out[4] = Plane{2,T}(Vec{2,T}(T(0),  T(-1)),  hi[2])
+    end
+    return out
+end
+
+function box_planes!(out::AbstractVector{Plane{3,T}},
+                     lo::NTuple{3,T}, hi::NTuple{3,T}) where {T}
+    @assert length(out) == 6 "box_planes! D=3 needs out of length 6, got $(length(out))"
+    @inbounds begin
+        out[1] = Plane{3,T}(Vec{3,T}(T( 1), T(0), T(0)), -lo[1])
+        out[2] = Plane{3,T}(Vec{3,T}(T(-1), T(0), T(0)),  hi[1])
+        out[3] = Plane{3,T}(Vec{3,T}(T(0),  T( 1), T(0)), -lo[2])
+        out[4] = Plane{3,T}(Vec{3,T}(T(0),  T(-1), T(0)),  hi[2])
+        out[5] = Plane{3,T}(Vec{3,T}(T(0),  T(0),  T( 1)), -lo[3])
+        out[6] = Plane{3,T}(Vec{3,T}(T(0),  T(0),  T(-1)),  hi[3])
+    end
+    return out
+end
+
+"""
+    is_empty(poly::FlatPolytope) -> Bool
+
+`true` iff the polytope has been fully clipped away (`nverts == 0`).
+"""
+@inline is_empty(poly::FlatPolytope) = poly.nverts <= 0
+@inline is_empty(poly::StaticFlatPolytope) = poly.nverts <= 0
+
+"""
+    volume(poly::FlatPolytope{D,T}) -> T
+
+The 0-th moment of the polytope (signed volume in 3D, signed area in
+2D). Allocation-free convenience around `moments!` with a 1-element
+output.
+"""
+function volume(poly::FlatPolytope{D,T}) where {D,T}
+    poly.nverts <= 0 && return zero(T)
+    out = poly.sdists       # piggy-back on the per-call scratch — bounded ≥ 1
+    moments!(out, poly, 0)
+    return @inbounds out[1]
+end
+
+function volume(poly::StaticFlatPolytope{D,T,N,DN}) where {D,T,N,DN}
+    poly.nverts <= 0 && return zero(T)
+    out = poly.sdists
+    moments!(out, poly, 0)
+    return @inbounds out[1]
+end
+
+"""
+    copy!(dst::FlatPolytope{D,T}, src::FlatPolytope{D,T}) -> dst
+
+Copy `src`'s vertex graph (positions, pnbrs, nverts) into `dst`. Does
+NOT touch `dst`'s scratch buffers. `dst.capacity` must be ≥ `src.nverts`.
+"""
+@inline function copy!(dst::FlatPolytope{2,T}, src::FlatPolytope{2,T}) where {T}
+    return _copy_polytope_2d!(dst, src)
+end
+
+@inline function copy!(dst::FlatPolytope{3,T}, src::FlatPolytope{3,T}) where {T}
+    return _copy_polytope!(dst, src)
 end
 
 # ===========================================================================

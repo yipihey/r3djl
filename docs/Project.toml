@@ -1,0 +1,7 @@
+[deps]
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+R3D = "6888587b-6711-4ff3-8558-83329515e735"
+R3D_C = "e8b3f423-9ea5-47d3-a1a6-8b28a7754f95"
+
+[compat]
+Documenter = "1"

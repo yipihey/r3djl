@@ -27,3 +27,6 @@
 *.dylib
 *.dll
 /r3d_build/
+
+# Documenter build output
+docs/Manifest.toml

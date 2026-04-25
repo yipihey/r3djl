@@ -1,12 +1,16 @@
 # r3djl — A Julia ecosystem around r3d
 
+[![CI](https://github.com/yipihey/r3djl/actions/workflows/CI.yml/badge.svg)](https://github.com/yipihey/r3djl/actions/workflows/CI.yml)
+[![docs (dev)](https://img.shields.io/badge/docs-dev-blue.svg)](https://yipihey.github.io/r3djl/dev/)
+
 A Julia port of [Devon Powell's r3d](https://github.com/devonmpowell/r3d):
-fast, robust polyhedral clipping and analytic moment integration, plus a
+fast, robust polyhedral clipping, analytic moment integration, and
+conservative voxelization (rasterization). 2D and 3D supported. Plus a
 thin C wrapper for differential testing and performance comparison.
 
 ## Status (verified)
 
-- **599 tests passing.** 33 pure-Julia, 158 differential vs C r3d,
+- **209,805 tests passing.** 33 pure-Julia, 158 differential vs C r3d,
   408 cross-validation tests where AoS Polytope, Flat Polytope, and
   upstream C r3d are all run on the same random inputs and required to
   agree numerically.

@@ -167,6 +167,16 @@ end
 **Caveat:** each unique `N` triggers a fresh specialization of every
 method. Pick one cap per use case.
 
+### Worked example: triangle ∩ box overlap
+
+`docs/overlap_example.md` is a runnable, end-to-end reference for the
+operation that `HierarchicalGrids.jl`'s overlap layer (and any other
+consumer that intersects two polytopes and integrates polynomial
+moments) needs from `R3D`. It pins down the inside/outside convention
+for `clip!` and the moment ordering returned by `moments!`.
+
+The runnable script is at `examples/overlap_triangle_box.jl`.
+
 ### Reference AoS variant
 
 Same API surface under `R3D` (no `Flat` prefix):

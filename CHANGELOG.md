@@ -7,7 +7,38 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-(Nothing yet.)
+### Added (HierarchicalGrids overlap-layer support)
+
+- `init_simplex!(buf, vertices)` collection wrappers for D = 2 and D = 3.
+- D = 3 alias `init_simplex!` forwarding to `init_tet!` so the same
+  API name covers both dimensions.
+- Phase 2 overlap-layer helpers, all 0-alloc:
+  - `aabb(poly)` returning `((lo…), (hi…))` `NTuple`s for D = 2, D = 3,
+    and `StaticFlatPolytope` D = 3.
+  - `box_planes(lo, hi)` and `box_planes!(out, lo, hi)` for D = 2 (4
+    planes) and D = 3 (6 planes), in `(+axis_k, -axis_k)` pair order.
+  - `is_empty(poly)` predicate.
+  - `volume(poly)` returning the 0-th moment scalar without allocating.
+  - `copy!(dst, src)` for D = 2 and D = 3.
+- `init_box!(::FlatPolytope{D,T}, lo, hi)` and
+  `init_simplex!(::FlatPolytope{D,T}, vertices)` for `D ≥ 4` —
+  vertices and `pnbrs` only; the `finds[D][D]` 2-face table for
+  `clip!` is not yet populated. `clip!` and `moments!` for `D ≥ 4`
+  raise informative errors pointing at `docs/phase3_status.md`.
+- `bench_overlap_2d` synthetic benchmark: 1024 random triangles ×
+  `32²` Eulerian grid → ~530 ns per overlap pair.
+- `docs/overlap_example.md` and `examples/overlap_triangle_box.jl` —
+  worked end-to-end overlap with closed-form sanity check.
+- `docs/phase3_status.md` — status note for the D ≥ 4 (rNd) port,
+  documenting the `finds[][]` 2-face table requirement, dimension
+  scaffolding, and validation infrastructure plan.
+
+### Notes
+
+- An init signature surprise relative to the overlap-layer prompt:
+  the D = 3 simplex constructor was already named `init_tet!`. Both
+  names now work (`init_simplex!` is an alias plus the
+  collection-style wrapper).
 
 ## [0.1.0] — 2026-04-25
 

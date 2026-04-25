@@ -2631,6 +2631,72 @@ function affine!(poly::FlatPolytope{3,T}, mat::AbstractMatrix) where {T}
 end
 
 # ===========================================================================
+# Generic D ≥ 4 constructors. The clip + moments kernels themselves are
+# NOT yet generalized to D ≥ 4 (see docs/phase3_status.md and the
+# `clip!`/`moments!` D ≥ 4 stubs further down). These constructors
+# exist so consumers can build the initial polytope in any D and
+# inspect it; they're zero-alloc on a reused buffer like the D = 2 / 3
+# versions.
+# ===========================================================================
+
+"""
+    init_box!(poly::FlatPolytope{D,T}, lo::AbstractVector, hi::AbstractVector) -> poly
+
+D-dimensional axis-aligned box constructor for `D ≥ 4`. Mirrors
+`rNd_init_box` (`src/rNd.c`): `2^D` vertices indexed by a bitmask
+(bit `i` set ⇒ vertex's `i`-th coordinate is `hi[i]`); the `i`-th
+neighbour of vertex `v` is `v ⊻ (1 << (i-1))`.
+
+The 2-face (`finds`) connectivity table needed by `clip!` in `D ≥ 4`
+is **not** populated by this constructor yet; see Phase 3 status.
+"""
+function init_box!(poly::FlatPolytope{D,T},
+                   lo::AbstractVector, hi::AbstractVector) where {D,T}
+    @assert D >= 4 "use the D=2 / D=3 init_box! methods for those dimensions"
+    nv = 1 << D
+    @assert poly.capacity >= nv "init_box! D=$D needs capacity ≥ $nv, got $(poly.capacity)"
+    @assert length(lo) == D && length(hi) == D
+    poly.nverts = nv
+    @inbounds for v in 0:(nv - 1)
+        # Bit-hack: bit i of v selects between lo[i+1] and hi[i+1] for axis i+1.
+        for i in 1:D
+            stride = 1 << (i - 1)
+            poly.positions[i, v + 1] = T((v & stride) != 0 ? hi[i] : lo[i])
+            # Neighbour along axis i: flip bit (i-1).
+            poly.pnbrs[i, v + 1] = Int32((v ⊻ stride) + 1)
+        end
+    end
+    return poly
+end
+
+"""
+    init_simplex!(poly::FlatPolytope{D,T}, vertices) -> poly
+
+D-dimensional simplex constructor for `D ≥ 4`. Takes a length-`(D+1)`
+collection of vertex positions. Mirrors `rNd_init_simplex`
+(`src/rNd.c`): vertex `v`'s neighbours are `(v + i + 1) mod (D + 1)`
+for `i ∈ 1:D` (i.e. every other vertex, in cyclic order).
+
+The 2-face (`finds`) connectivity needed by `clip!` is **not** yet
+populated; see Phase 3 status.
+"""
+function init_simplex!(poly::FlatPolytope{D,T}, vertices) where {D,T}
+    @assert D >= 4 "use the D=2 / D=3 init_simplex! methods for those dimensions"
+    nv = D + 1
+    @assert length(vertices) == nv "D=$D simplex needs $(D+1) vertices, got $(length(vertices))"
+    @assert poly.capacity >= nv
+    poly.nverts = nv
+    @inbounds for v in 1:nv
+        p = vertices[v]
+        for i in 1:D
+            poly.positions[i, v] = T(p[i])
+            poly.pnbrs[i, v] = Int32(((v - 1 + i) % nv) + 1)
+        end
+    end
+    return poly
+end
+
+# ===========================================================================
 # Phase 2 helpers — ergonomics for the overlap-layer style hot loop.
 # ===========================================================================
 
@@ -2948,6 +3014,41 @@ end
 
 function Base.show(io::IO, p::StaticFlatPolytope{D,T,N,DN}) where {D,T,N,DN}
     print(io, "StaticFlatPolytope{", D, ",", T, ",", N, "}(nverts=", p.nverts, ")")
+end
+
+# ===========================================================================
+# D ≥ 4 stubs — these will become real implementations in Phase 3 of the
+# HierarchicalGrids overlap-layer work. See docs/phase3_status.md.
+# ===========================================================================
+
+"""
+    clip!(poly::FlatPolytope{D,T}, planes) where {D ≥ 4}
+
+**Not yet implemented for D ≥ 4.** See `docs/phase3_status.md` for the
+planned port of `rNd_clip` (the `finds[][]` 2-face linker from
+`src/rNd.c`).
+"""
+function clip!(::FlatPolytope{D,T}, ::Any) where {D,T}
+    D >= 4 || error("clip! reached the D ≥ 4 fallback at D = $D")
+    error("R3D.Flat.clip!: D = $D not yet implemented. ",
+          "Tracked in docs/phase3_status.md (Phase 3 of HierarchicalGrids overlap layer). ",
+          "D = 2 and D = 3 are fully supported.")
+end
+
+"""
+    moments(poly::FlatPolytope{D,T}, order) where {D ≥ 4}
+    moments!(out, poly::FlatPolytope{D,T}, order) where {D ≥ 4}
+
+**Not yet implemented for D ≥ 4.** See `docs/phase3_status.md`.
+"""
+function moments(::FlatPolytope{D,T}, ::Integer) where {D,T}
+    D >= 4 || error("moments reached the D ≥ 4 fallback at D = $D")
+    error("R3D.Flat.moments: D = $D not yet implemented. See docs/phase3_status.md.")
+end
+
+function moments!(::AbstractVector, ::FlatPolytope{D,T}, ::Integer) where {D,T}
+    D >= 4 || error("moments! reached the D ≥ 4 fallback at D = $D")
+    error("R3D.Flat.moments!: D = $D not yet implemented. See docs/phase3_status.md.")
 end
 
 end # module Flat

@@ -645,6 +645,40 @@ using LinearAlgebra: I
         @test (@allocated R3D.Flat.copy!(dst3, src3)) == 0
     end
 
+    @testset "Phase 3 groundwork: D ≥ 4 constructors + num_moments" begin
+        # init_box for D = 4, 5, 6 — bit-hack vertex enumeration
+        for D in 4:6
+            buf = R3D.Flat.FlatPolytope{D,Float64}(128)
+            R3D.Flat.init_box!(buf, zeros(D), ones(D))
+            @test buf.nverts == 1 << D
+            # vertex 0 should be all zeros, vertex (2^D - 1) all ones
+            @test all(buf.positions[i, 1] == 0.0 for i in 1:D)
+            @test all(buf.positions[i, 1 << D] == 1.0 for i in 1:D)
+        end
+
+        # init_simplex for D = 4, 5, 6 — D+1 vertices, cyclic neighbours
+        for D in 4:6
+            buf = R3D.Flat.FlatPolytope{D,Float64}(128)
+            verts = [ntuple(j -> j == i ? 1.0 : 0.0, D) for i in 0:D]
+            R3D.Flat.init_simplex!(buf, verts)
+            @test buf.nverts == D + 1
+            # Spot-check pnbrs cyclic structure
+            @test buf.pnbrs[1, 1] == ((0 + 1) % (D + 1)) + 1
+        end
+
+        # num_moments(D, P) = binomial(D+P, P) for D = 4..6, P = 0..3
+        for D in 4:6, P in 0:3
+            @test R3D.num_moments(D, P) == binomial(D + P, P)
+        end
+
+        # Stubs raise informative errors so consumers don't get silent
+        # wrong answers if they call into the unimplemented path.
+        buf4 = R3D.Flat.FlatPolytope{4,Float64}(64)
+        R3D.Flat.init_box!(buf4, zeros(4), ones(4))
+        @test_throws ErrorException R3D.Flat.clip!(buf4, [])
+        @test_throws ErrorException R3D.Flat.moments(buf4, 0)
+    end
+
     @testset "Hot-loop overlap pattern is 0-alloc end-to-end" begin
         # Mirror exactly what the HierarchicalGrids overlap layer does:
         # init_simplex! + box_planes! + clip! + moments!. Every call must

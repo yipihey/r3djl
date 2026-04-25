@@ -29,20 +29,38 @@ const R3D_MAX_VERTS = parse(Int, get(ENV, "R3D_MAX_VERTS", "512"))
 const libr3d = Ref{String}("")
 
 function __init__()
+    # Resolution order:
+    #   1. ENV["R3D_LIB"] — explicit override always wins.
+    #   2. r3d_jll (if installed) — preferred when available.
+    #   3. Warn that no library is set; ccalls will fail.
     libpath = get(ENV, "R3D_LIB", "")
-    if isempty(libpath)
-        @warn "R3D_C: ENV[\"R3D_LIB\"] not set; ccalls will fail until you " *
-              "set it to the path of libr3d.{so,dylib,dll}."
-        return
+    if !isempty(libpath)
+        if !isfile(libpath)
+            error("R3D_C: ENV[\"R3D_LIB\"] = $libpath does not exist")
+        end
+        libr3d[] = libpath
+    else
+        # Try to load r3d_jll lazily so users without it don't pay any
+        # cost (and don't hit a missing-package error when the JLL
+        # isn't yet registered).
+        jll_loaded = false
+        try
+            @eval Main using r3d_jll
+            libr3d[] = Main.r3d_jll.libr3d
+            jll_loaded = true
+        catch
+            # JLL not available — fall through.
+        end
+        if !jll_loaded
+            @warn "R3D_C: ENV[\"R3D_LIB\"] not set and `r3d_jll` not available; " *
+                  "ccalls will fail until you set R3D_LIB or `Pkg.add(\"r3d_jll\")`."
+            return
+        end
     end
-    if !isfile(libpath)
-        error("R3D_C: ENV[\"R3D_LIB\"] = $libpath does not exist")
-    end
-    libr3d[] = libpath
     try
-        Libdl.dlopen(libpath)
+        Libdl.dlopen(libr3d[])
     catch e
-        @error "R3D_C: failed to dlopen $libpath" exception=e
+        @error "R3D_C: failed to dlopen $(libr3d[])" exception=e
         rethrow()
     end
 end

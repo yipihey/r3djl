@@ -1,6 +1,7 @@
 using Test
 using R3D
 using ForwardDiff
+using Aqua
 
 @testset "R3D pure-Julia" begin
 
@@ -562,6 +563,22 @@ using LinearAlgebra: I
         eps = 1e-6
         fd = (centroid_y_2d(0.3 + eps) - centroid_y_2d(0.3 - eps)) / (2eps)
         @test isapprox(g2, fd; atol=1e-6)
+    end
+
+    @testset "Aqua quality checks" begin
+        # Standard hygiene: no method ambiguities, no piracy of Base
+        # methods, all declared deps used, no unbound type parameters,
+        # no stale-pin compat bounds. We allow Project-extras compat
+        # warnings since Aqua < v0.8 didn't always recognize the test
+        # extras pattern across Julia versions.
+        Aqua.test_all(R3D;
+                      ambiguities = (recursive = false,),
+                      piracies = true,
+                      deps_compat = (check_extras = false,),
+                      project_extras = true,
+                      stale_deps = true,
+                      unbound_args = true,
+                      undefined_exports = true)
     end
 
     @testset "Base.show outputs include nverts" begin

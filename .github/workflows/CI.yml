@@ -59,20 +59,26 @@ jobs:
 
       - uses: julia-actions/cache@v2
 
-      - name: Develop sibling packages and resolve
+      - name: Build sibling-package test env
         run: |
-          julia --project=R3D.jl -e '
+          # We can't use `Pkg.test("R3D")` directly because R3D_C is an
+          # unregistered local sibling that needs `Pkg.develop`. Build a
+          # composite env that has both packages dev'd plus the test
+          # extras, then run the test file directly with coverage.
+          mkdir -p ci_env
+          julia --project=ci_env -e '
             using Pkg
-            Pkg.develop(PackageSpec(path="R3D_C.jl"))
+            Pkg.develop([PackageSpec(path="R3D.jl"),
+                         PackageSpec(path="R3D_C.jl")])
+            Pkg.add(["Test", "Random", "ForwardDiff", "Aqua", "LinearAlgebra"])
             Pkg.instantiate()'
 
       - name: Run tests with coverage
         env:
           JULIA_NUM_THREADS: 4
         run: |
-          julia --project=R3D.jl --code-coverage=user -e '
-            using Pkg
-            Pkg.test("R3D"; coverage=true)'
+          cd R3D.jl
+          julia --project=../ci_env --code-coverage=user test/runtests.jl
 
       - uses: julia-actions/julia-processcoverage@v1
         with:
@@ -106,6 +112,5 @@ jobs:
           julia --project=docs -e '
             using Pkg
             Pkg.develop(PackageSpec(path="R3D.jl"))
-            Pkg.develop(PackageSpec(path="R3D_C.jl"))
             Pkg.instantiate()'
           julia --project=docs --color=yes docs/make.jl

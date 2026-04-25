@@ -1,0 +1,111 @@
+name: CI
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test:
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - '1.10'    # Julia LTS
+          - '1'       # latest stable
+        os:
+          - ubuntu-latest
+          - macos-latest
+        include:
+          - version: 'nightly'
+            os: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build libr3d from upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Clone the exact commit pinned in r3d_jll/build_tarballs.jl so
+          # the C oracle in differential tests matches the JLL we'll ship.
+          R3D_REV=58dfbfb2fd2a89e36e3c7ceb5ca6aef3f9c4c4e6
+          mkdir -p r3d_build
+          cd r3d_build
+          git clone https://github.com/devonmpowell/r3d.git src
+          (cd src && git checkout "$R3D_REV")
+          mkdir -p libr3d
+          cat > libr3d/r3d-config.h <<'EOF'
+          #ifndef R3D_CONFIG_H
+          #define R3D_CONFIG_H
+          #define R3D_MAX_VERTS 512
+          #endif
+          EOF
+          if [ "$RUNNER_OS" = "macOS" ]; then EXT=dylib; else EXT=so; fi
+          gcc -O3 -fPIC -shared -Ilibr3d -Isrc/src \
+              src/src/r3d.c src/src/v3d.c src/src/r2d.c src/src/v2d.c \
+              -lm -o "libr3d/libr3d.${EXT}"
+          echo "R3D_LIB=$PWD/libr3d/libr3d.${EXT}" >> "$GITHUB_ENV"
+
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.version }}
+
+      - uses: julia-actions/cache@v2
+
+      - name: Develop sibling packages and resolve
+        run: |
+          julia --project=R3D.jl -e '
+            using Pkg
+            Pkg.develop(PackageSpec(path="R3D_C.jl"))
+            Pkg.instantiate()'
+
+      - name: Run tests with coverage
+        env:
+          JULIA_NUM_THREADS: 4
+        run: |
+          julia --project=R3D.jl --code-coverage=user -e '
+            using Pkg
+            Pkg.test("R3D"; coverage=true)'
+
+      - uses: julia-actions/julia-processcoverage@v1
+        with:
+          directories: R3D.jl/src
+
+      - uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: read
+      statuses: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+      - name: Build and deploy docs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
+        run: |
+          julia --project=docs -e '
+            using Pkg
+            Pkg.develop(PackageSpec(path="R3D.jl"))
+            Pkg.develop(PackageSpec(path="R3D_C.jl"))
+            Pkg.instantiate()'
+          julia --project=docs --color=yes docs/make.jl

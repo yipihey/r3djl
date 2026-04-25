@@ -2563,6 +2563,98 @@ function affine!(poly::FlatPolytope{3,T}, mat::AbstractMatrix) where {T}
     return poly
 end
 
+# ===========================================================================
+# Multi-threaded batched voxelization. Each thread gets its own
+# VoxelizeWorkspace (and its own polytope copy if it'll be consumed).
+# ===========================================================================
+
+"""
+    voxelize_batch!(grids, polys, ibox_lo, ibox_hi, d, order;
+                    workspaces = nothing) -> grids
+
+Voxelize each `polys[k]` into `grids[k]` in parallel via
+`Threads.@threads`. Each thread needs its own `VoxelizeWorkspace`;
+pass them as `workspaces` (a vector of length `nthreads()`), or omit
+to allocate a fresh one per thread.
+
+`grids` is a vector of pre-allocated grids (each shape
+`(nmom, ni, nj, nk)`); they are zeroed before voxelization.
+`polys`, `ibox_lo`, `ibox_hi` are vectors of the same length.
+
+Run with `julia --threads=N` to actually get parallelism. The
+serial path falls out when `nthreads() == 1`.
+"""
+function voxelize_batch!(grids::AbstractVector,
+                         polys::AbstractVector,
+                         ibox_lo::AbstractVector,
+                         ibox_hi::AbstractVector,
+                         d::NTuple{3,T},
+                         order::Int;
+                         workspaces::Union{Nothing,AbstractVector} = nothing) where {T}
+    n = length(polys)
+    @assert length(grids) == n
+    @assert length(ibox_lo) == n
+    @assert length(ibox_hi) == n
+
+    # `Threads.threadid()` can exceed `nthreads()` with the interactive
+    # thread pool or task migration, so size by `maxthreadid()`.
+    nthr = Threads.maxthreadid()
+    ws_local = if workspaces === nothing
+        # Each thread allocates its own workspace once.
+        cap = isempty(polys) ? 64 : polys[1].capacity
+        [VoxelizeWorkspace{3,T}(cap) for _ in 1:nthr]
+    else
+        @assert length(workspaces) >= nthr
+        workspaces
+    end
+
+    Threads.@threads for k in 1:n
+        tid = Threads.threadid()
+        fill!(grids[k], zero(T))
+        voxelize!(grids[k], polys[k], ibox_lo[k], ibox_hi[k], d, order;
+                  workspace = ws_local[tid])
+    end
+    return grids
+end
+
+"""
+    voxelize_batch!(grids, polys::AbstractVector{<:FlatPolytope{2,T}},
+                    ibox_lo, ibox_hi, d::NTuple{2,T}, order;
+                    workspaces = nothing)
+
+2D variant of [`voxelize_batch!`](@ref). `grids[k]` has shape
+`(nmom, ni, nj)`; `ibox_lo[k]`, `ibox_hi[k]` are `NTuple{2,Int}`.
+"""
+function voxelize_batch!(grids::AbstractVector,
+                         polys::AbstractVector{<:FlatPolytope{2,T}},
+                         ibox_lo::AbstractVector{<:NTuple{2,Int}},
+                         ibox_hi::AbstractVector{<:NTuple{2,Int}},
+                         d::NTuple{2,T},
+                         order::Int;
+                         workspaces::Union{Nothing,AbstractVector} = nothing) where {T}
+    n = length(polys)
+    @assert length(grids) == n
+
+    # `Threads.threadid()` can exceed `nthreads()` with the interactive
+    # thread pool or task migration, so size by `maxthreadid()`.
+    nthr = Threads.maxthreadid()
+    ws_local = if workspaces === nothing
+        cap = isempty(polys) ? 64 : polys[1].capacity
+        [VoxelizeWorkspace{2,T}(cap) for _ in 1:nthr]
+    else
+        @assert length(workspaces) >= nthr
+        workspaces
+    end
+
+    Threads.@threads for k in 1:n
+        tid = Threads.threadid()
+        fill!(grids[k], zero(T))
+        voxelize!(grids[k], polys[k], ibox_lo[k], ibox_hi[k], d, order;
+                  workspace = ws_local[tid])
+    end
+    return grids
+end
+
 # ---------------------------------------------------------------------------
 # Base.show — REPL pretty-printing for FlatPolytope / StaticFlatPolytope
 # ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 name = "R3D"
 uuid = "6888587b-6711-4ff3-8558-83329515e735"
 authors = ["Tom Abel <tabel@stanford.edu>"]
-version = "0.1.0-DEV"
+version = "0.1.0"
 description = "Pure-Julia port of devonmpowell/r3d: fast, robust polyhedral and polygon clipping, analytic moment integration, and conservative voxelization (rasterization)."
 
 [deps]

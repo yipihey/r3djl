@@ -565,6 +565,51 @@ using LinearAlgebra: I
         @test isapprox(g2, fd; atol=1e-6)
     end
 
+    @testset "voxelize_batch! parallel agrees with serial" begin
+        # Build a small batch of clipped boxes
+        rng = Random.MersenneTwister(20260435)
+        N = 16
+        polys = R3D.Flat.FlatPolytope{3,Float64}[]
+        for _ in 1:N
+            p = R3D.Flat.box((0.0,0.0,0.0), (1.0,1.0,1.0))
+            nplanes = rand(rng, 0:2)
+            pls = R3D.Plane{3,Float64}[]
+            for _ in 1:nplanes
+                v = randn(rng, 3); v ./= sqrt(sum(v.^2))
+                dd = -(v[1]*0.5+v[2]*0.5+v[3]*0.5) + 0.3*randn(rng)
+                push!(pls, R3D.Plane{3,Float64}(R3D.Vec{3,Float64}(v), dd))
+            end
+            R3D.Flat.clip!(p, pls)
+            push!(polys, p)
+        end
+        nmom = R3D.num_moments(3, 1)
+        grids_par = [zeros(Float64, nmom, 8, 8, 8) for _ in 1:N]
+        grids_ser = [zeros(Float64, nmom, 8, 8, 8) for _ in 1:N]
+        los = [(0,0,0) for _ in 1:N]
+        his = [(8,8,8) for _ in 1:N]
+        d = (1/8, 1/8, 1/8)
+
+        R3D.Flat.voxelize_batch!(grids_par, polys, los, his, d, 1)
+
+        # Serial reference
+        ws = R3D.Flat.VoxelizeWorkspace{3,Float64}(64)
+        for k in 1:N
+            R3D.Flat.voxelize!(grids_ser[k], polys[k], los[k], his[k], d, 1;
+                                workspace = ws)
+        end
+
+        for k in 1:N
+            for I in eachindex(grids_par[k])
+                @test isapprox(grids_par[k][I], grids_ser[k][I];
+                               atol=1e-12, rtol=1e-10)
+            end
+            # Also: grid total mass equals direct moments(poly, 0)[1]
+            @test isapprox(sum(@view grids_par[k][1, :, :, :]),
+                           R3D.Flat.moments(polys[k], 0)[1];
+                           atol=1e-10, rtol=1e-9)
+        end
+    end
+
     @testset "Aqua quality checks" begin
         # Standard hygiene: no method ambiguities, no piracy of Base
         # methods, all declared deps used, no unbound type parameters,

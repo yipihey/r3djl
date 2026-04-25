@@ -14,6 +14,12 @@ jobs:
   test:
     name: Julia ${{ matrix.version }} - ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    # Nightly is tracked but doesn't block CI. Julia 1.14-DEV tightened
+    # the `ccall((:func, libpath), ...)` parse-time check to require a
+    # constant library expression; R3D_C uses runtime-resolved paths
+    # via `libr3d[]`. Fixing this requires a dlsym-pointer refactor;
+    # tracked separately. Stable + LTS + macOS must all pass.
+    continue-on-error: ${{ matrix.version == 'nightly' }}
     strategy:
       fail-fast: false
       matrix:

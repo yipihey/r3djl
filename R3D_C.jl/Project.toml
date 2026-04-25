@@ -1,0 +1,17 @@
+name = "R3D_C"
+uuid = "e8b3f423-9ea5-47d3-a1a6-8b28a7754f95"
+authors = ["Tom Abel <tabel@stanford.edu>"]
+version = "0.1.0-DEV"
+description = "Thin ccall wrapper around the upstream r3d C library. Used as a ground-truth oracle for differential testing of R3D.jl and as a performance baseline."
+
+[deps]
+Libdl = "8f399da3-3557-5675-b5ff-fb832c97cbdb"
+
+[compat]
+julia = "1.9"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]

@@ -1,0 +1,29 @@
+# Julia
+*.jl.cov
+*.jl.*.cov
+*.jl.mem
+/Manifest.toml
+**/Manifest.toml
+/deps/deps.jl
+/deps/build.log
+/docs/build/
+/docs/site/
+
+# Local dev env directories (per-machine)
+/test_env/
+/bench_env/
+
+# Editor / OS junk
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+.claude/
+*~
+
+# Local libr3d build artifacts (users build their own)
+*.so
+*.dylib
+*.dll
+/r3d_build/

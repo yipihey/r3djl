@@ -1,0 +1,4 @@
+# Recreate via:
+#   julia --project=test_env -e 'using Pkg; Pkg.develop([
+#       PackageSpec(path="../R3D.jl"), PackageSpec(path="../R3D_C.jl")])'
+[deps]

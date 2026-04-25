@@ -1,0 +1,2625 @@
+"""
+    R3D.Flat
+
+Struct-of-arrays variant of `Polytope` that mirrors r3d's C struct
+exactly: positions and neighbour indices live in flat dense matrices,
+not in an array of mutable `Vertex` objects.
+
+This module is parallel to the main `Polytope` type — both implement
+the same algorithm, the only difference is memory layout. Benchmarks
+in `R3DBenchmarks.bench_flat_*` compare them head-to-head.
+
+# Layout
+
+```
+mutable struct FlatPolytope{D,T}
+    positions::Matrix{T}    # D × capacity, column-major (D coords per vertex)
+    pnbrs::Matrix{Int32}    # D × capacity, column-major (D neighbours per vertex)
+    nverts::Int
+    capacity::Int
+
+    # scratch (reused across clip/moments calls — caller-allocated buffer pattern)
+    sdists::Vector{T}
+    clipped::Vector{Int32}
+    emarks::Matrix{Bool}
+    Sm::Array{T,3}
+    Dm::Array{T,3}
+    Cm::Array{T,3}
+    moment_order::Int
+end
+```
+
+This matches the C struct's memory pattern (a packed sequence of
+`(pnbrs[3], pos)` records per vertex) but uses SoA instead of AoS,
+which is friendlier to modern CPU prefetching and SIMD when scanning
+many vertices for one operation (e.g. computing all signed distances
+at once).
+
+# Caller-allocated buffer pattern (the fast path)
+
+The `FlatPolytope` itself **is** the reusable buffer — exactly mirroring
+how the upstream C library is used (`r3d_poly poly; r3d_init_box(&poly,
+…); r3d_clip(&poly, …);` — caller owns the storage). Allocate once,
+re-init and re-clip in a hot loop:
+
+```julia
+buf = R3D.Flat.FlatBuffer{3,Float64}(64)        # one allocation
+for cell in cells
+    R3D.Flat.init_box!(buf, cell.lo, cell.hi)   # 0 allocs
+    R3D.Flat.clip!(buf, planes)                 # 0 allocs (after first call of an order)
+    m = R3D.Flat.moments(buf, 1)                # only `out` allocates; use moments! for 0
+end
+```
+
+`FlatBuffer` is an alias for `FlatPolytope`. The convenience constructor
+`box(lo, hi)` allocates a fresh polytope each call; reach for the
+buffer pattern in tight loops.
+"""
+module Flat
+
+using StaticArrays
+using ..R3D: Vec, Plane, signed_distance
+
+# ---------------------------------------------------------------------------
+# Type
+# ---------------------------------------------------------------------------
+
+"""
+    FlatPolytope{D,T}
+
+POD-layout polytope plus pre-allocated scratch storage for clip and
+moment integration. Two `Matrix` allocations for the vertex graph plus
+a handful of fixed-size scratch buffers, all owned by the polytope.
+
+This is the reusable buffer type — see the module docstring for the
+caller-allocated buffer pattern.
+"""
+mutable struct FlatPolytope{D,T}
+    positions::Matrix{T}    # D × capacity
+    pnbrs::Matrix{Int32}    # D × capacity
+    nverts::Int
+    capacity::Int
+
+    # Per-clip scratch. Allocated once at construction; reused across calls.
+    sdists::Vector{T}       # capacity
+    clipped::Vector{Int32}  # capacity
+
+    # Per-moments scratch. emarks is capacity-sized; S/D/C are sized by
+    # the largest order ever requested and grown lazily.
+    emarks::Matrix{Bool}    # capacity × D
+    Sm::Array{T,3}
+    Dm::Array{T,3}
+    Cm::Array{T,3}
+    moment_order::Int       # current allocated order for Sm/Dm/Cm; -1 = none
+end
+
+function FlatPolytope{D,T}(capacity::Int = 512) where {D,T}
+    FlatPolytope{D,T}(zeros(T, D, capacity),
+                      zeros(Int32, D, capacity),
+                      0, capacity,
+                      Vector{T}(undef, capacity),
+                      Vector{Int32}(undef, capacity),
+                      Matrix{Bool}(undef, capacity, D),
+                      Array{T,3}(undef, 0, 0, 0),
+                      Array{T,3}(undef, 0, 0, 0),
+                      Array{T,3}(undef, 0, 0, 0),
+                      -1)
+end
+
+"""
+    FlatBuffer{D,T}
+
+Alias for [`FlatPolytope`](@ref). Use this name when documenting the
+caller-allocated buffer pattern; the underlying type is the same.
+"""
+const FlatBuffer = FlatPolytope
+
+# ---------------------------------------------------------------------------
+# Constructors (init_box, init_tet)
+# ---------------------------------------------------------------------------
+
+"""
+    init_box!(poly, lo, hi)
+
+Initialize as an axis-aligned box. Same neighbour table as r3d_init_box,
+written directly into the flat matrices. Re-uses `poly`'s storage —
+zero allocations.
+"""
+function init_box!(poly::FlatPolytope{3,T},
+                   lo::AbstractVector, hi::AbstractVector) where {T}
+    @assert poly.capacity >= 8
+    poly.nverts = 8
+
+    # Vertex positions
+    @inbounds begin
+        poly.positions[1,1] = lo[1]; poly.positions[2,1] = lo[2]; poly.positions[3,1] = lo[3]
+        poly.positions[1,2] = hi[1]; poly.positions[2,2] = lo[2]; poly.positions[3,2] = lo[3]
+        poly.positions[1,3] = hi[1]; poly.positions[2,3] = hi[2]; poly.positions[3,3] = lo[3]
+        poly.positions[1,4] = lo[1]; poly.positions[2,4] = hi[2]; poly.positions[3,4] = lo[3]
+        poly.positions[1,5] = lo[1]; poly.positions[2,5] = lo[2]; poly.positions[3,5] = hi[3]
+        poly.positions[1,6] = hi[1]; poly.positions[2,6] = lo[2]; poly.positions[3,6] = hi[3]
+        poly.positions[1,7] = hi[1]; poly.positions[2,7] = hi[2]; poly.positions[3,7] = hi[3]
+        poly.positions[1,8] = lo[1]; poly.positions[2,8] = hi[2]; poly.positions[3,8] = hi[3]
+    end
+
+    # Neighbour table — same as in init.jl, line for line
+    @inbounds begin
+        poly.pnbrs[1,1] = Int32(2); poly.pnbrs[2,1] = Int32(5); poly.pnbrs[3,1] = Int32(4)
+        poly.pnbrs[1,2] = Int32(3); poly.pnbrs[2,2] = Int32(6); poly.pnbrs[3,2] = Int32(1)
+        poly.pnbrs[1,3] = Int32(4); poly.pnbrs[2,3] = Int32(7); poly.pnbrs[3,3] = Int32(2)
+        poly.pnbrs[1,4] = Int32(1); poly.pnbrs[2,4] = Int32(8); poly.pnbrs[3,4] = Int32(3)
+        poly.pnbrs[1,5] = Int32(8); poly.pnbrs[2,5] = Int32(1); poly.pnbrs[3,5] = Int32(6)
+        poly.pnbrs[1,6] = Int32(5); poly.pnbrs[2,6] = Int32(2); poly.pnbrs[3,6] = Int32(7)
+        poly.pnbrs[1,7] = Int32(6); poly.pnbrs[2,7] = Int32(3); poly.pnbrs[3,7] = Int32(8)
+        poly.pnbrs[1,8] = Int32(7); poly.pnbrs[2,8] = Int32(4); poly.pnbrs[3,8] = Int32(5)
+    end
+    return poly
+end
+
+"Convenience: build a fresh box."
+function box(lo::NTuple{3,Real}, hi::NTuple{3,Real}; capacity::Int = 512)
+    p = FlatPolytope{3,Float64}(capacity)
+    init_box!(p, [lo...], [hi...])
+    return p
+end
+
+# ---------------------------------------------------------------------------
+# Helpers — accessing a vertex's position/neighbours as views
+# ---------------------------------------------------------------------------
+
+@inline pos_view(p::FlatPolytope{D,T}, i::Int) where {D,T} =
+    SVector{D,T}(ntuple(k -> @inbounds(p.positions[k, i]), Val(D)))
+
+@inline function set_pos!(p::FlatPolytope{D,T}, i::Int, v::AbstractVector) where {D,T}
+    @inbounds for k in 1:D
+        p.positions[k, i] = v[k]
+    end
+end
+
+@inline get_nbr(p::FlatPolytope, i::Int, k::Int) = @inbounds Int(p.pnbrs[k, i])
+@inline set_nbr!(p::FlatPolytope, i::Int, k::Int, v::Integer) = @inbounds (p.pnbrs[k, i] = Int32(v))
+
+# Find the slot k ∈ {1,2,3} such that pnbrs[k, vnext] == vcur. The C
+# kernel does a 3-way linear search; unrolling lets LLVM keep the
+# comparisons in registers and elide the `break`.
+@inline function find_back3(pnbrs::Matrix{Int32}, vnext::Int, vcur::Int)
+    @inbounds begin
+        pnbrs[1, vnext] == Int32(vcur) && return 1
+        pnbrs[2, vnext] == Int32(vcur) && return 2
+        return 3   # by elimination — pnbrs is a 3-regular graph in D=3
+    end
+end
+
+# Branchless next-index for the (np mod 3)+1 face walk. Avoids the
+# integer-mod that mod1(np+1, 3) would otherwise emit.
+@inline next3(np::Int) = ifelse(np == 3, 1, np + 1)
+
+# ---------------------------------------------------------------------------
+# clip!
+# ---------------------------------------------------------------------------
+
+"""
+    clip!(poly, planes) -> Bool
+
+Clip `poly` in-place against `planes`. Returns `true` on success, `false`
+on capacity overflow.
+
+Reuses `poly.sdists` / `poly.clipped` scratch — zero per-call heap allocation.
+"""
+function clip!(poly::FlatPolytope{3,T},
+               planes::AbstractVector{Plane{3,T}}) where {T}
+    poly.nverts <= 0 && return false
+
+    @inbounds for plane in planes
+        ok = clip_plane!(poly, plane)
+        ok || return false
+        poly.nverts == 0 && return true
+    end
+    return true
+end
+
+function clip_plane!(poly::FlatPolytope{3,T}, plane::Plane{3,T}) where {T}
+    onv = poly.nverts
+    sdists = poly.sdists
+    clipped = poly.clipped
+
+    # Step 1: signed distances
+    smin = T(Inf); smax = T(-Inf)
+    @inbounds for v in 1:onv
+        x = poly.positions[1, v]; y = poly.positions[2, v]; z = poly.positions[3, v]
+        s = plane.d + plane.n[1]*x + plane.n[2]*y + plane.n[3]*z
+        sdists[v] = s
+        s < smin && (smin = s)
+        s > smax && (smax = s)
+    end
+
+    # Step 2: trivial accept/reject
+    smin >= 0 && return true
+    if smax <= 0
+        poly.nverts = 0
+        return true
+    end
+
+    @inbounds for v in 1:onv
+        clipped[v] = sdists[v] < 0 ? Int32(1) : Int32(0)
+    end
+
+    # Step 3: insert new vertices on cut edges
+    @inbounds for vcur in 1:onv
+        clipped[vcur] != 0 && continue
+        for np in 1:3
+            vnext = Int(poly.pnbrs[np, vcur])
+            vnext == 0 && continue
+            clipped[vnext] == 0 && continue
+
+            poly.nverts >= poly.capacity && return false
+            new_idx = (poly.nverts += 1)
+
+            wa = -sdists[vnext]; wb = sdists[vcur]
+            inv = 1 / (wa + wb)
+            poly.positions[1, new_idx] = (wa*poly.positions[1,vcur] + wb*poly.positions[1,vnext]) * inv
+            poly.positions[2, new_idx] = (wa*poly.positions[2,vcur] + wb*poly.positions[2,vnext]) * inv
+            poly.positions[3, new_idx] = (wa*poly.positions[3,vcur] + wb*poly.positions[3,vnext]) * inv
+
+            poly.pnbrs[1, new_idx] = Int32(vcur)
+            poly.pnbrs[2, new_idx] = Int32(0)
+            poly.pnbrs[3, new_idx] = Int32(0)
+            poly.pnbrs[np, vcur] = Int32(new_idx)
+
+            clipped[new_idx] = Int32(0)
+        end
+    end
+
+    # Step 4: link new vertices around faces
+    @inbounds for vstart in (onv+1):poly.nverts
+        vcur = vstart
+        vnext = Int(poly.pnbrs[1, vcur])
+        while true
+            np = find_back3(poly.pnbrs, vnext, vcur)
+            vcur = vnext
+            vnext = Int(poly.pnbrs[next3(np), vcur])
+            vcur <= onv || break
+        end
+        poly.pnbrs[3, vstart] = Int32(vcur)
+        poly.pnbrs[2, vcur]   = Int32(vstart)
+    end
+
+    # Step 5: compact. SoA layout makes this a column-copy with no
+    # mutable-struct aliasing risk — `positions[:, dst] .= positions[:, src]`
+    # is a value copy.
+    numunclipped = 0
+    @inbounds for v in 1:poly.nverts
+        if clipped[v] == 0
+            numunclipped += 1
+            if numunclipped != v
+                poly.positions[1, numunclipped] = poly.positions[1, v]
+                poly.positions[2, numunclipped] = poly.positions[2, v]
+                poly.positions[3, numunclipped] = poly.positions[3, v]
+                poly.pnbrs[1, numunclipped] = poly.pnbrs[1, v]
+                poly.pnbrs[2, numunclipped] = poly.pnbrs[2, v]
+                poly.pnbrs[3, numunclipped] = poly.pnbrs[3, v]
+            end
+            clipped[v] = Int32(numunclipped)
+        else
+            clipped[v] = Int32(0)
+        end
+    end
+    poly.nverts = numunclipped
+    @inbounds for v in 1:poly.nverts, np in 1:3
+        old = Int(poly.pnbrs[np, v])
+        poly.pnbrs[np, v] = old == 0 ? Int32(0) : clipped[old]
+    end
+    return true
+end
+
+# ---------------------------------------------------------------------------
+# moments — same Koehl recursion as R3D.moments!, against flat layout
+# ---------------------------------------------------------------------------
+
+import ..R3D: num_moments
+
+function moments(poly::FlatPolytope{3,T}, order::Integer) where {T}
+    out = zeros(T, num_moments(3, order))
+    moments!(out, poly, order)
+    return out
+end
+
+# Lazily allocate Sm/Dm/Cm to fit the requested order. After the first
+# call at a given order, subsequent calls are zero-alloc.
+@inline function _ensure_moment_scratch!(poly::FlatPolytope{D,T}, order::Int) where {D,T}
+    if order > poly.moment_order
+        np1 = order + 1
+        poly.Sm = Array{T,3}(undef, np1, np1, 2)
+        poly.Dm = Array{T,3}(undef, np1, np1, 2)
+        poly.Cm = Array{T,3}(undef, np1, np1, 2)
+        poly.moment_order = order
+    end
+    return nothing
+end
+
+function moments!(out::AbstractVector{T},
+                  poly::FlatPolytope{3,T},
+                  order::Integer) where {T}
+    @assert length(out) >= num_moments(3, order)
+    fill!(out, zero(T))
+    poly.nverts <= 0 && return out
+
+    nv = poly.nverts
+    _ensure_moment_scratch!(poly, Int(order))
+
+    emarks = poly.emarks
+    @inbounds for k in 1:3, v in 1:nv
+        emarks[v, k] = false
+    end
+
+    np1 = order + 1
+    S = poly.Sm
+    D = poly.Dm
+    C = poly.Cm
+    prevlayer = 1; curlayer = 2
+
+    @inbounds for vstart in 1:nv, pstart in 1:3
+        emarks[vstart, pstart] && continue
+
+        pnext = pstart
+        vcur = vstart
+        emarks[vcur, pnext] = true
+        vnext = Int(poly.pnbrs[pnext, vcur])
+        v0_x = poly.positions[1, vcur]
+        v0_y = poly.positions[2, vcur]
+        v0_z = poly.positions[3, vcur]
+
+        np = find_back3(poly.pnbrs, vnext, vcur)
+        vcur = vnext
+        pnext = next3(np)
+        emarks[vcur, pnext] = true
+        vnext = Int(poly.pnbrs[pnext, vcur])
+
+        while vnext != vstart
+            v2_x = poly.positions[1, vcur]; v2_y = poly.positions[2, vcur]; v2_z = poly.positions[3, vcur]
+            v1_x = poly.positions[1, vnext]; v1_y = poly.positions[2, vnext]; v1_z = poly.positions[3, vnext]
+
+            sixv = (-v2_x*v1_y*v0_z + v1_x*v2_y*v0_z + v2_x*v0_y*v1_z
+                    - v0_x*v2_y*v1_z - v1_x*v0_y*v2_z + v0_x*v1_y*v2_z)
+
+            S[1,1,prevlayer] = one(T)
+            D[1,1,prevlayer] = one(T)
+            C[1,1,prevlayer] = one(T)
+            out[1] += sixv / 6
+
+            m = 1
+            for corder in 1:order
+                for i in corder:-1:0, j in (corder - i):-1:0
+                    k = corder - i - j
+                    m += 1
+                    ci = i + 1; cj = j + 1
+                    Cv = zero(T); Dv = zero(T); Sv = zero(T)
+                    if i > 0
+                        Cv += v2_x * C[ci-1, cj, prevlayer]
+                        Dv += v1_x * D[ci-1, cj, prevlayer]
+                        Sv += v0_x * S[ci-1, cj, prevlayer]
+                    end
+                    if j > 0
+                        Cv += v2_y * C[ci, cj-1, prevlayer]
+                        Dv += v1_y * D[ci, cj-1, prevlayer]
+                        Sv += v0_y * S[ci, cj-1, prevlayer]
+                    end
+                    if k > 0
+                        Cv += v2_z * C[ci, cj, prevlayer]
+                        Dv += v1_z * D[ci, cj, prevlayer]
+                        Sv += v0_z * S[ci, cj, prevlayer]
+                    end
+                    Dv += Cv
+                    Sv += Dv
+                    C[ci, cj, curlayer] = Cv
+                    D[ci, cj, curlayer] = Dv
+                    S[ci, cj, curlayer] = Sv
+                    out[m] += sixv * Sv
+                end
+                curlayer  = 3 - curlayer
+                prevlayer = 3 - prevlayer
+            end
+
+            np = find_back3(poly.pnbrs, vnext, vcur)
+            vcur = vnext
+            pnext = next3(np)
+            emarks[vcur, pnext] = true
+            vnext = Int(poly.pnbrs[pnext, vcur])
+        end
+    end
+
+    @inbounds C[1,1,prevlayer] = one(T)
+    m = 1
+    for corder in 1:order
+        for i in corder:-1:0, j in (corder - i):-1:0
+            k = corder - i - j
+            m += 1
+            ci = i + 1; cj = j + 1
+            Cv = zero(T)
+            i > 0 && (Cv += C[ci-1, cj, prevlayer])
+            j > 0 && (Cv += C[ci, cj-1, prevlayer])
+            k > 0 && (Cv += C[ci, cj, prevlayer])
+            C[ci, cj, curlayer] = Cv
+            out[m] /= Cv * (corder + 1) * (corder + 2) * (corder + 3)
+        end
+        curlayer  = 3 - curlayer
+        prevlayer = 3 - prevlayer
+    end
+    return out
+end
+
+# ---------------------------------------------------------------------------
+# split_coord! — axis-aligned bisection used by voxelize
+# ---------------------------------------------------------------------------
+
+"""
+    split_coord!(in, out0, out1, coord, ax) -> Bool
+
+Split `in` along the axis-aligned plane `x[ax] == coord`. The two halves
+are written into `out0` (negative side, `x[ax] ≤ coord`) and `out1`
+(positive side, `x[ax] > coord`). Mirrors `r3d_split_coord` in
+`src/v3d.c`.
+
+`in` is consumed (its state is undefined after the call). `out0` and
+`out1` must be pre-allocated `FlatPolytope`s with the same `D`, `T`,
+and `capacity` ≥ the number of vertices the split could produce
+(typically `in.capacity` is plenty).
+
+Returns `true` on success, `false` on capacity overflow.
+"""
+function split_coord!(in::FlatPolytope{3,T},
+                      out0::FlatPolytope{3,T}, out1::FlatPolytope{3,T},
+                      coord::T, ax::Int) where {T}
+    if in.nverts <= 0
+        out0.nverts = 0
+        out1.nverts = 0
+        return true
+    end
+
+    sdists = in.sdists
+    side   = in.clipped   # reuse: 0 = left, 1 = right
+
+    # Step 1: signed distances and side classification
+    nright = 0
+    @inbounds for v in 1:in.nverts
+        sd = in.positions[ax, v] - coord
+        sdists[v] = sd
+        if sd > 0
+            side[v] = Int32(1)
+            nright += 1
+        else
+            side[v] = Int32(0)
+        end
+    end
+
+    # Step 2: trivial pass-through cases
+    if nright == 0
+        _copy_polytope!(out0, in)
+        out1.nverts = 0
+        return true
+    elseif nright == in.nverts
+        _copy_polytope!(out1, in)
+        out0.nverts = 0
+        return true
+    end
+
+    # Step 3: insert pairs of new vertices on cut edges
+    onv = in.nverts
+    @inbounds for vcur in 1:onv
+        side[vcur] != 0 && continue
+        for np in 1:3
+            vnext = Int(in.pnbrs[np, vcur])
+            (vnext == 0 || side[vnext] == 0) && continue
+            # cut edge vcur (left) -> vnext (right)
+
+            in.nverts >= in.capacity - 1 && return false   # need 2 new slots
+
+            wa = -sdists[vnext]; wb = sdists[vcur]
+            invw = 1 / (wa + wb)
+            nx = (wa*in.positions[1,vcur] + wb*in.positions[1,vnext]) * invw
+            ny = (wa*in.positions[2,vcur] + wb*in.positions[2,vnext]) * invw
+            nz = (wa*in.positions[3,vcur] + wb*in.positions[3,vnext]) * invw
+
+            # New vertex on the LEFT side, replacing vnext from vcur's POV
+            new_left = (in.nverts += 1)
+            in.positions[1, new_left] = nx
+            in.positions[2, new_left] = ny
+            in.positions[3, new_left] = nz
+            in.pnbrs[1, new_left] = Int32(vcur)
+            in.pnbrs[2, new_left] = Int32(0)
+            in.pnbrs[3, new_left] = Int32(0)
+            in.pnbrs[np, vcur] = Int32(new_left)
+            side[new_left] = Int32(0)
+
+            # New vertex on the RIGHT side, replacing vcur from vnext's POV
+            new_right = (in.nverts += 1)
+            in.positions[1, new_right] = nx
+            in.positions[2, new_right] = ny
+            in.positions[3, new_right] = nz
+            in.pnbrs[1, new_right] = Int32(vnext)
+            in.pnbrs[2, new_right] = Int32(0)
+            in.pnbrs[3, new_right] = Int32(0)
+            side[new_right] = Int32(1)
+
+            for npnxt in 1:3
+                if in.pnbrs[npnxt, vnext] == Int32(vcur)
+                    in.pnbrs[npnxt, vnext] = Int32(new_right)
+                    break
+                end
+            end
+        end
+    end
+
+    # Step 4: walk faces around new vertices to link them. Same structure
+    # as clip_plane!'s linker — original vertices form bridges between
+    # pairs of new vertices on the same face.
+    @inbounds for vstart in (onv+1):in.nverts
+        vcur = vstart
+        vnext = Int(in.pnbrs[1, vcur])
+        while true
+            np = find_back3(in.pnbrs, vnext, vcur)
+            vcur = vnext
+            vnext = Int(in.pnbrs[next3(np), vcur])
+            vcur <= onv || break
+        end
+        in.pnbrs[3, vstart] = Int32(vcur)
+        in.pnbrs[2, vcur]   = Int32(vstart)
+    end
+
+    # Step 5: compact into out0 (side=0) and out1 (side=1). After this
+    # loop side[v] holds the new index of v in whichever output it landed
+    # in — used to reindex pnbrs below.
+    #
+    # The voxelize stack aliases in === out0 (each pushed child reuses
+    # the popped slot). Cache `total_verts` before zeroing the outputs
+    # so the loop bound isn't clobbered. Within the loop, copying
+    # in.positions[:, v] to out0.positions[:, dst] is safe because
+    # `dst ≤ v` always (left-side verts in 1..v-1 are at most v-1).
+    total_verts = in.nverts
+    out0.nverts = 0
+    out1.nverts = 0
+    @inbounds for v in 1:total_verts
+        if side[v] == 0
+            out0.nverts += 1
+            dst = out0.nverts
+            out0.positions[1, dst] = in.positions[1, v]
+            out0.positions[2, dst] = in.positions[2, v]
+            out0.positions[3, dst] = in.positions[3, v]
+            out0.pnbrs[1, dst] = in.pnbrs[1, v]
+            out0.pnbrs[2, dst] = in.pnbrs[2, v]
+            out0.pnbrs[3, dst] = in.pnbrs[3, v]
+            side[v] = Int32(dst)
+        else
+            out1.nverts += 1
+            dst = out1.nverts
+            out1.positions[1, dst] = in.positions[1, v]
+            out1.positions[2, dst] = in.positions[2, v]
+            out1.positions[3, dst] = in.positions[3, v]
+            out1.pnbrs[1, dst] = in.pnbrs[1, v]
+            out1.pnbrs[2, dst] = in.pnbrs[2, v]
+            out1.pnbrs[3, dst] = in.pnbrs[3, v]
+            side[v] = Int32(dst)
+        end
+    end
+
+    @inbounds for v in 1:out0.nverts, np in 1:3
+        old = Int(out0.pnbrs[np, v])
+        out0.pnbrs[np, v] = old == 0 ? Int32(0) : side[old]
+    end
+    @inbounds for v in 1:out1.nverts, np in 1:3
+        old = Int(out1.pnbrs[np, v])
+        out1.pnbrs[np, v] = old == 0 ? Int32(0) : side[old]
+    end
+    return true
+end
+
+# Copy positions/pnbrs/nverts from `src` into `dst`. Used by the
+# split_coord! pass-through cases.
+@inline function _copy_polytope!(dst::FlatPolytope{3,T}, src::FlatPolytope{3,T}) where {T}
+    n = src.nverts
+    @assert dst.capacity >= n
+    @inbounds for v in 1:n, k in 1:3
+        dst.positions[k, v] = src.positions[k, v]
+        dst.pnbrs[k, v]     = src.pnbrs[k, v]
+    end
+    dst.nverts = n
+    return dst
+end
+
+# ---------------------------------------------------------------------------
+# get_ibox — bounding-box index range
+# ---------------------------------------------------------------------------
+
+"""
+    get_ibox(poly, d) -> (ibox_lo, ibox_hi)
+
+Return the integer index range `(ibox_lo, ibox_hi)` of grid cells of
+size `d` covering `poly`. `ibox_lo` is `floor(min/d)` and `ibox_hi` is
+`ceil(max/d)`, both as `NTuple{3,Int}`. The voxel covered by indices
+`(i,j,k)` spans `[i*d, (i+1)*d)` along each axis.
+
+Mirrors `r3d_get_ibox` in `src/v3d.c`. Origin of the grid is at the
+spatial origin.
+"""
+function get_ibox(poly::FlatPolytope{3,T}, d::NTuple{3,T}) where {T}
+    poly.nverts <= 0 && return ((0,0,0), (0,0,0))
+    minx = T(Inf); miny = T(Inf); minz = T(Inf)
+    maxx = T(-Inf); maxy = T(-Inf); maxz = T(-Inf)
+    @inbounds for v in 1:poly.nverts
+        x = poly.positions[1,v]; y = poly.positions[2,v]; z = poly.positions[3,v]
+        x < minx && (minx = x); x > maxx && (maxx = x)
+        y < miny && (miny = y); y > maxy && (maxy = y)
+        z < minz && (minz = z); z > maxz && (maxz = z)
+    end
+    lo = (Int(floor(minx / d[1])),
+          Int(floor(miny / d[2])),
+          Int(floor(minz / d[3])))
+    hi = (Int(ceil(maxx / d[1])),
+          Int(ceil(maxy / d[2])),
+          Int(ceil(maxz / d[3])))
+    return (lo, hi)
+end
+
+# ---------------------------------------------------------------------------
+# voxelize! — grid voxelization via stack-based bisection
+# ---------------------------------------------------------------------------
+
+"""
+    VoxelizeWorkspace{D,T}(capacity = 512)
+
+Pre-allocated workspace for [`voxelize!`](@ref). Owns a stack of
+`FlatPolytope{D,T}`s and a per-leaf moments scratch — sized so that
+`voxelize!` runs allocation-free for grids up to ~256^D.
+
+Construct once, reuse across many `voxelize!` calls. Parametric on
+both dimension `D` (2 or 3) and coordinate type `T`.
+"""
+mutable struct VoxelizeWorkspace{D,T}
+    polys::Vector{FlatPolytope{D,T}}             # depth ≥ ceil(log2 N) per axis × D + 1
+    iboxes::Vector{Tuple{NTuple{D,Int},NTuple{D,Int}}}   # (lo, hi) pair per stack level
+    moment_scratch::Vector{T}                    # nmom-sized leaf-moment buffer
+    moment_order::Int                            # currently allocated order
+    capacity::Int
+end
+
+function VoxelizeWorkspace{D,T}(capacity::Int = 512;
+                                max_depth::Int = 64) where {D,T}
+    polys  = [FlatPolytope{D,T}(capacity) for _ in 1:max_depth]
+    iboxes = Vector{Tuple{NTuple{D,Int},NTuple{D,Int}}}(undef, max_depth)
+    VoxelizeWorkspace{D,T}(polys, iboxes, T[], -1, capacity)
+end
+
+# Ensure the stack can hold at least `n` entries by growing it on demand.
+function _ensure_stack!(ws::VoxelizeWorkspace{D,T}, n::Int) where {D,T}
+    z = ntuple(_ -> 0, Val(D))
+    while length(ws.polys) < n
+        push!(ws.polys, FlatPolytope{D,T}(ws.capacity))
+        push!(ws.iboxes, (z, z))
+    end
+    return ws
+end
+
+@inline function _ensure_voxelize_moment_scratch!(ws::VoxelizeWorkspace{D,T}, order::Int) where {D,T}
+    if order > ws.moment_order
+        resize!(ws.moment_scratch, num_moments(D, order))
+        ws.moment_order = order
+    end
+    return ws.moment_scratch
+end
+
+"""
+    voxelize!(dest_grid, poly, ibox_lo, ibox_hi, d, order;
+              workspace = nothing) -> dest_grid
+
+Voxelize `poly` onto a regular Cartesian grid covering index range
+`(ibox_lo, ibox_hi)` with cell spacing `d`. `dest_grid` is laid out as
+`(nmom, ni, nj, nk)` where `nmom = num_moments(3, order)` and
+`ni = ibox_hi[1] - ibox_lo[1]` etc. Voxel `(i,j,k)` covers the spatial
+region `[i*d_x, (i+1)*d_x) × …` (origin at the spatial origin), with
+moments contiguous along the first axis for fast accumulation.
+
+`poly` is left untouched — the routine copies it into the workspace
+and bisects there.
+
+Mirrors `r3d_voxelize` in `src/v3d.c`. The recursion is iterative via
+an explicit stack (the upstream implementation's variable-length-array
+stack is replaced by a `VoxelizeWorkspace`).
+"""
+function voxelize!(dest_grid::AbstractArray{T,4},
+                   poly::FlatPolytope{3,T},
+                   ibox_lo::NTuple{3,Int}, ibox_hi::NTuple{3,Int},
+                   d::NTuple{3,T}, order::Int;
+                   workspace::Union{Nothing,VoxelizeWorkspace{3,T}} = nothing) where {T}
+    ni = ibox_hi[1] - ibox_lo[1]
+    nj = ibox_hi[2] - ibox_lo[2]
+    nk = ibox_hi[3] - ibox_lo[3]
+    nmom = num_moments(3, order)
+    @assert size(dest_grid, 1) == nmom
+    @assert size(dest_grid, 2) >= ni
+    @assert size(dest_grid, 3) >= nj
+    @assert size(dest_grid, 4) >= nk
+    (poly.nverts <= 0 || ni <= 0 || nj <= 0 || nk <= 0) && return dest_grid
+
+    ws = workspace === nothing ? VoxelizeWorkspace{3,T}(poly.capacity) : workspace
+    # Depth bound: ceil(log2 ni) + ceil(log2 nj) + ceil(log2 nk) + 1
+    log2c(x) = x <= 1 ? 0 : ceil(Int, log2(x))
+    max_depth = log2c(ni) + log2c(nj) + log2c(nk) + 2
+    _ensure_stack!(ws, max_depth)
+    moments_buf = _ensure_voxelize_moment_scratch!(ws, order)
+
+    # Push the original polytope onto the stack.
+    _copy_polytope!(ws.polys[1], poly)
+    ws.iboxes[1] = (ibox_lo, ibox_hi)
+    nstack = 1
+
+    @inbounds while nstack > 0
+        cur = ws.polys[nstack]
+        lo, hi = ws.iboxes[nstack]
+        nstack -= 1
+
+        cur.nverts <= 0 && continue
+
+        # Find the longest axis to split.
+        sx = hi[1] - lo[1]
+        sy = hi[2] - lo[2]
+        sz = hi[3] - lo[3]
+        spax = 1; dmax = sx
+        if sy > dmax; dmax = sy; spax = 2; end
+        if sz > dmax; dmax = sz; spax = 3; end
+
+        if dmax == 1
+            # Leaf: single voxel. Reduce and accumulate.
+            moments!(moments_buf, cur, order)
+            i0 = lo[1] - ibox_lo[1] + 1
+            j0 = lo[2] - ibox_lo[2] + 1
+            k0 = lo[3] - ibox_lo[3] + 1
+            for m in 1:nmom
+                dest_grid[m, i0, j0, k0] += moments_buf[m]
+            end
+            continue
+        end
+
+        # Bisect along spax at the midpoint cell boundary.
+        half = dmax >> 1
+        split_index = lo[spax] + half      # grid index of the splitting plane
+        split_pos = T(split_index) * d[spax]
+
+        if nstack + 2 > length(ws.polys)
+            _ensure_stack!(ws, nstack + 2)
+        end
+        out0 = ws.polys[nstack + 1]
+        out1 = ws.polys[nstack + 2]
+        split_coord!(cur, out0, out1, split_pos, spax)
+
+        hi_left = (spax == 1 ? split_index : hi[1],
+                   spax == 2 ? split_index : hi[2],
+                   spax == 3 ? split_index : hi[3])
+        lo_right = (spax == 1 ? split_index : lo[1],
+                    spax == 2 ? split_index : lo[2],
+                    spax == 3 ? split_index : lo[3])
+        ws.iboxes[nstack + 1] = (lo, hi_left)
+        ws.iboxes[nstack + 2] = (lo_right, hi)
+        nstack += 2
+    end
+    return dest_grid
+end
+
+"""
+    voxelize(poly, d, order; ibox = nothing, workspace = nothing) -> dest_grid
+
+Allocate a fresh `(nmom, ni, nj, nk)` grid sized to `poly`'s
+bounding-box cells (or the supplied `ibox`) and voxelize.
+
+Convenience wrapper around [`voxelize!`](@ref); for hot loops, allocate
+the destination grid once and call `voxelize!` directly.
+"""
+function voxelize(poly::FlatPolytope{3,T}, d::NTuple{3,T}, order::Int;
+                  ibox::Union{Nothing,Tuple{NTuple{3,Int},NTuple{3,Int}}} = nothing,
+                  workspace::Union{Nothing,VoxelizeWorkspace{T}} = nothing) where {T}
+    if ibox === nothing
+        lo, hi = get_ibox(poly, d)
+    else
+        lo, hi = ibox
+    end
+    ni = hi[1] - lo[1]; nj = hi[2] - lo[2]; nk = hi[3] - lo[3]
+    nmom = num_moments(3, order)
+    grid = zeros(T, nmom, max(ni, 1), max(nj, 1), max(nk, 1))
+    voxelize!(grid, poly, lo, hi, d, order; workspace = workspace)
+    return grid, lo, hi
+end
+
+# ===========================================================================
+# D = 2 — same SoA buffer machinery, parallel set of methods mirroring
+# `src/r2d.c` and `src/v2d.c`. Notation in this block follows the 2D code:
+# `pnbrs[k, v]` for k ∈ {1, 2}; pnbrs == 0 is the "unset" sentinel
+# (the upstream C uses -1 in 0-based indexing).
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# init_box! / box (D=2)
+# ---------------------------------------------------------------------------
+
+"""
+    init_box!(poly::FlatPolytope{2,T}, lo, hi)
+
+Initialize as the axis-aligned rectangle with corners `lo` and `hi`.
+Vertex labelling (CCW from lower-left) and pnbrs table mirror
+`r2d_init_box` (`src/r2d.c`):
+
+    4 — 3
+    |   |
+    1 — 2
+"""
+function init_box!(poly::FlatPolytope{2,T},
+                   lo::AbstractVector, hi::AbstractVector) where {T}
+    @assert poly.capacity >= 4
+    poly.nverts = 4
+
+    @inbounds begin
+        poly.positions[1,1] = lo[1]; poly.positions[2,1] = lo[2]
+        poly.positions[1,2] = hi[1]; poly.positions[2,2] = lo[2]
+        poly.positions[1,3] = hi[1]; poly.positions[2,3] = hi[2]
+        poly.positions[1,4] = lo[1]; poly.positions[2,4] = hi[2]
+
+        poly.pnbrs[1,1] = Int32(2); poly.pnbrs[2,1] = Int32(4)
+        poly.pnbrs[1,2] = Int32(3); poly.pnbrs[2,2] = Int32(1)
+        poly.pnbrs[1,3] = Int32(4); poly.pnbrs[2,3] = Int32(2)
+        poly.pnbrs[1,4] = Int32(1); poly.pnbrs[2,4] = Int32(3)
+    end
+    return poly
+end
+
+"Convenience: build a fresh 2D box (axis-aligned rectangle)."
+function box(lo::NTuple{2,Real}, hi::NTuple{2,Real}; capacity::Int = 256)
+    p = FlatPolytope{2,Float64}(capacity)
+    init_box!(p, [lo...], [hi...])
+    return p
+end
+
+# ---------------------------------------------------------------------------
+# clip! (D=2)
+# ---------------------------------------------------------------------------
+
+"""
+    clip!(poly::FlatPolytope{2,T}, planes) -> Bool
+
+Clip a 2D polytope in-place against `planes`. Same algorithm as the 3D
+version but with single-vertex insertion per cut edge and the
+1-D face walk from `r2d.c`.
+"""
+function clip!(poly::FlatPolytope{2,T},
+               planes::AbstractVector{Plane{2,T}}) where {T}
+    poly.nverts <= 0 && return false
+    @inbounds for plane in planes
+        ok = clip_plane!(poly, plane)
+        ok || return false
+        poly.nverts == 0 && return true
+    end
+    return true
+end
+
+function clip_plane!(poly::FlatPolytope{2,T}, plane::Plane{2,T}) where {T}
+    onv = poly.nverts
+    sdists = poly.sdists
+    clipped = poly.clipped
+
+    # Step 1: signed distances
+    smin = T(Inf); smax = T(-Inf)
+    @inbounds for v in 1:onv
+        x = poly.positions[1, v]; y = poly.positions[2, v]
+        s = plane.d + plane.n[1]*x + plane.n[2]*y
+        sdists[v] = s
+        s < smin && (smin = s)
+        s > smax && (smax = s)
+    end
+    smin >= 0 && return true
+    if smax <= 0
+        poly.nverts = 0
+        return true
+    end
+
+    @inbounds for v in 1:onv
+        clipped[v] = sdists[v] < 0 ? Int32(1) : Int32(0)
+    end
+
+    # Step 2: insert ONE new vertex per cut edge. Mirrors r2d.c lines
+    # 80-93 — note the asymmetry: pnbrs[1-np] back-links to vcur, while
+    # pnbrs[np] is left "unset" (0 in our 1-based scheme) for the face
+    # walk to fill in.
+    @inbounds for vcur in 1:onv
+        clipped[vcur] != 0 && continue
+        for np in 1:2
+            vnext = Int(poly.pnbrs[np, vcur])
+            vnext == 0 && continue
+            clipped[vnext] == 0 && continue
+
+            poly.nverts >= poly.capacity && return false
+            new_idx = (poly.nverts += 1)
+
+            wa = -sdists[vnext]; wb = sdists[vcur]
+            invw = 1 / (wa + wb)
+            poly.positions[1, new_idx] = (wa*poly.positions[1,vcur] + wb*poly.positions[1,vnext]) * invw
+            poly.positions[2, new_idx] = (wa*poly.positions[2,vcur] + wb*poly.positions[2,vnext]) * invw
+
+            other = 3 - np         # 1↔2 swap (mirrors C's 1-np with 0/1)
+            poly.pnbrs[other, new_idx] = Int32(vcur)
+            poly.pnbrs[np, new_idx]    = Int32(0)        # unset, filled by Step 3
+            poly.pnbrs[np, vcur]       = Int32(new_idx)
+
+            clipped[new_idx] = Int32(0)
+        end
+    end
+
+    # Step 3: walk pnbrs[1] (the "next around polygon" slot) for each
+    # new vertex whose [2] slot is still unset, find the matching new
+    # vertex on the opposite side of the cut, and double-link them.
+    # See r2d.c lines 97-105.
+    @inbounds for vstart in (onv+1):poly.nverts
+        poly.pnbrs[2, vstart] != 0 && continue
+        vcur = Int(poly.pnbrs[1, vstart])
+        # walk pnbrs[1] from vcur until we hit another new vertex (> onv)
+        while vcur <= onv
+            vcur = Int(poly.pnbrs[1, vcur])
+        end
+        poly.pnbrs[2, vstart] = Int32(vcur)
+        poly.pnbrs[1, vcur]   = Int32(vstart)
+    end
+
+    # Step 4: compact (same pattern as 3D)
+    numunclipped = 0
+    @inbounds for v in 1:poly.nverts
+        if clipped[v] == 0
+            numunclipped += 1
+            if numunclipped != v
+                poly.positions[1, numunclipped] = poly.positions[1, v]
+                poly.positions[2, numunclipped] = poly.positions[2, v]
+                poly.pnbrs[1, numunclipped] = poly.pnbrs[1, v]
+                poly.pnbrs[2, numunclipped] = poly.pnbrs[2, v]
+            end
+            clipped[v] = Int32(numunclipped)
+        else
+            clipped[v] = Int32(0)
+        end
+    end
+    poly.nverts = numunclipped
+    @inbounds for v in 1:poly.nverts, np in 1:2
+        old = Int(poly.pnbrs[np, v])
+        poly.pnbrs[np, v] = old == 0 ? Int32(0) : clipped[old]
+    end
+    return true
+end
+
+# ---------------------------------------------------------------------------
+# moments / moments! (D=2) — Koehl recursion, 2D variant
+# ---------------------------------------------------------------------------
+
+function moments(poly::FlatPolytope{2,T}, order::Integer) where {T}
+    out = zeros(T, num_moments(2, order))
+    moments!(out, poly, order)
+    return out
+end
+
+# In 2D the Koehl recursion uses two 2-layer arrays of size (order+1, 2)
+# rather than the 3D (order+1, order+1, 2) cubes. Reuse the 3D Sm/Dm/Cm
+# fields' first column slice — but the indexing patterns differ enough
+# that we just lazy-allocate fresh 2D scratch (cheap, capacity-bounded).
+@inline function _ensure_moment_scratch_2d!(poly::FlatPolytope{2,T}, order::Int) where {T}
+    if order > poly.moment_order
+        np1 = order + 1
+        # Reuse the same Sm/Cm/Dm fields but with shape (np1, 1, 2). We
+        # ignore the middle axis in 2D; this keeps the struct layout
+        # identical to the 3D path.
+        poly.Sm = Array{T,3}(undef, np1, 1, 2)
+        poly.Dm = Array{T,3}(undef, np1, 1, 2)
+        poly.Cm = Array{T,3}(undef, np1, 1, 2)
+        poly.moment_order = order
+    end
+    return nothing
+end
+
+function moments!(out::AbstractVector{T},
+                  poly::FlatPolytope{2,T},
+                  order::Integer) where {T}
+    @assert length(out) >= num_moments(2, order)
+    fill!(out, zero(T))
+    poly.nverts <= 0 && return out
+
+    _ensure_moment_scratch_2d!(poly, Int(order))
+    D = poly.Dm     # shape (np1, 1, 2)
+    C = poly.Cm
+    prevlayer = 1; curlayer = 2
+
+    nv = poly.nverts
+    @inbounds for vcur in 1:nv
+        vnext = Int(poly.pnbrs[1, vcur])
+        v0x = poly.positions[1, vcur]; v0y = poly.positions[2, vcur]
+        v1x = poly.positions[1, vnext]; v1y = poly.positions[2, vnext]
+
+        twoa = v0x*v1y - v0y*v1x
+
+        D[1,1,prevlayer] = one(T)
+        C[1,1,prevlayer] = one(T)
+        out[1] += 0.5 * twoa
+
+        m = 1
+        for corder in 1:order
+            for i in corder:-1:0
+                j = corder - i
+                m += 1
+                ci = i + 1
+                Cv = zero(T); Dv = zero(T)
+                if i > 0
+                    Cv += v1x * C[ci-1, 1, prevlayer]
+                    Dv += v0x * D[ci-1, 1, prevlayer]
+                end
+                if j > 0
+                    Cv += v1y * C[ci, 1, prevlayer]
+                    Dv += v0y * D[ci, 1, prevlayer]
+                end
+                Dv += Cv
+                C[ci, 1, curlayer] = Cv
+                D[ci, 1, curlayer] = Dv
+                out[m] += twoa * Dv
+            end
+            curlayer  = 3 - curlayer
+            prevlayer = 3 - prevlayer
+        end
+    end
+
+    @inbounds C[1,1,prevlayer] = one(T)
+    m = 1
+    for corder in 1:order
+        for i in corder:-1:0
+            j = corder - i
+            m += 1
+            ci = i + 1
+            Cv = zero(T)
+            i > 0 && (Cv += C[ci-1, 1, prevlayer])
+            j > 0 && (Cv += C[ci, 1, prevlayer])
+            C[ci, 1, curlayer] = Cv
+            out[m] /= Cv * (corder + 1) * (corder + 2)
+        end
+        curlayer  = 3 - curlayer
+        prevlayer = 3 - prevlayer
+    end
+    return out
+end
+
+# ---------------------------------------------------------------------------
+# split_coord! / get_ibox / voxelize! (D=2)
+# ---------------------------------------------------------------------------
+
+"""
+    split_coord!(in::FlatPolytope{2,T}, out0, out1, coord, ax) -> Bool
+
+2D analog of [`split_coord!(::FlatPolytope{3,T}, …)`](@ref). Splits
+along the line `x[ax] == coord` into the negative side `out0` and the
+positive side `out1`. Mirrors `r2d_split_coord` in `src/v2d.c`.
+
+Same `in === out0` aliasing semantics as the 3D version: the voxelize
+stack reuses the popped slot as `out0`, so the compaction caches
+`total_verts` before zeroing the outputs.
+"""
+function split_coord!(in::FlatPolytope{2,T},
+                      out0::FlatPolytope{2,T}, out1::FlatPolytope{2,T},
+                      coord::T, ax::Int) where {T}
+    if in.nverts <= 0
+        out0.nverts = 0
+        out1.nverts = 0
+        return true
+    end
+
+    sdists = in.sdists
+    side   = in.clipped
+
+    nright = 0
+    @inbounds for v in 1:in.nverts
+        sd = in.positions[ax, v] - coord
+        sdists[v] = sd
+        if sd > 0
+            side[v] = Int32(1); nright += 1
+        else
+            side[v] = Int32(0)
+        end
+    end
+
+    if nright == 0
+        _copy_polytope_2d!(out0, in)
+        out1.nverts = 0
+        return true
+    elseif nright == in.nverts
+        _copy_polytope_2d!(out1, in)
+        out0.nverts = 0
+        return true
+    end
+
+    # Step 3: insert TWO new vertices per cut edge (mirrors r2d_split_coord
+    # — one for each side, with the unset slot filled in by the linker).
+    onv = in.nverts
+    @inbounds for vcur in 1:onv
+        side[vcur] != 0 && continue
+        for np in 1:2
+            vnext = Int(in.pnbrs[np, vcur])
+            (vnext == 0 || side[vnext] == 0) && continue
+
+            in.nverts >= in.capacity - 1 && return false
+
+            wa = -sdists[vnext]; wb = sdists[vcur]
+            invw = 1 / (wa + wb)
+            nx = (wa*in.positions[1,vcur] + wb*in.positions[1,vnext]) * invw
+            ny = (wa*in.positions[2,vcur] + wb*in.positions[2,vnext]) * invw
+
+            other = 3 - np
+
+            # LEFT-side new vertex: replaces vnext from vcur's POV.
+            new_left = (in.nverts += 1)
+            in.positions[1, new_left] = nx
+            in.positions[2, new_left] = ny
+            in.pnbrs[other, new_left] = Int32(vcur)
+            in.pnbrs[np,    new_left] = Int32(0)
+            in.pnbrs[np, vcur] = Int32(new_left)
+            side[new_left] = Int32(0)
+
+            # RIGHT-side new vertex: replaces vcur from vnext's POV.
+            new_right = (in.nverts += 1)
+            in.positions[1, new_right] = nx
+            in.positions[2, new_right] = ny
+            in.pnbrs[other, new_right] = Int32(0)
+            in.pnbrs[np,    new_right] = Int32(vnext)
+            in.pnbrs[other, vnext] = Int32(new_right)
+            side[new_right] = Int32(1)
+        end
+    end
+
+    # Step 4: face-walk linker (same as 2D clip)
+    @inbounds for vstart in (onv+1):in.nverts
+        in.pnbrs[2, vstart] != 0 && continue
+        vcur = Int(in.pnbrs[1, vstart])
+        while vcur <= onv
+            vcur = Int(in.pnbrs[1, vcur])
+        end
+        in.pnbrs[2, vstart] = Int32(vcur)
+        in.pnbrs[1, vcur]   = Int32(vstart)
+    end
+
+    # Step 5: compact into out0 and out1. Cache total_verts before
+    # zeroing — the voxelize stack aliases in === out0.
+    total_verts = in.nverts
+    out0.nverts = 0
+    out1.nverts = 0
+    @inbounds for v in 1:total_verts
+        if side[v] == 0
+            out0.nverts += 1; dst = out0.nverts
+            out0.positions[1, dst] = in.positions[1, v]
+            out0.positions[2, dst] = in.positions[2, v]
+            out0.pnbrs[1, dst] = in.pnbrs[1, v]
+            out0.pnbrs[2, dst] = in.pnbrs[2, v]
+            side[v] = Int32(dst)
+        else
+            out1.nverts += 1; dst = out1.nverts
+            out1.positions[1, dst] = in.positions[1, v]
+            out1.positions[2, dst] = in.positions[2, v]
+            out1.pnbrs[1, dst] = in.pnbrs[1, v]
+            out1.pnbrs[2, dst] = in.pnbrs[2, v]
+            side[v] = Int32(dst)
+        end
+    end
+
+    @inbounds for v in 1:out0.nverts, np in 1:2
+        old = Int(out0.pnbrs[np, v])
+        out0.pnbrs[np, v] = old == 0 ? Int32(0) : side[old]
+    end
+    @inbounds for v in 1:out1.nverts, np in 1:2
+        old = Int(out1.pnbrs[np, v])
+        out1.pnbrs[np, v] = old == 0 ? Int32(0) : side[old]
+    end
+    return true
+end
+
+@inline function _copy_polytope_2d!(dst::FlatPolytope{2,T}, src::FlatPolytope{2,T}) where {T}
+    n = src.nverts
+    @assert dst.capacity >= n
+    @inbounds for v in 1:n, k in 1:2
+        dst.positions[k, v] = src.positions[k, v]
+        dst.pnbrs[k, v]     = src.pnbrs[k, v]
+    end
+    dst.nverts = n
+    return dst
+end
+
+"""
+    get_ibox(poly::FlatPolytope{2,T}, d::NTuple{2,T}) -> (lo, hi)
+
+2D analog of [`get_ibox`](@ref). `d` is `(dx, dy)`.
+"""
+function get_ibox(poly::FlatPolytope{2,T}, d::NTuple{2,T}) where {T}
+    poly.nverts <= 0 && return ((0,0), (0,0))
+    minx = T(Inf); miny = T(Inf)
+    maxx = T(-Inf); maxy = T(-Inf)
+    @inbounds for v in 1:poly.nverts
+        x = poly.positions[1,v]; y = poly.positions[2,v]
+        x < minx && (minx = x); x > maxx && (maxx = x)
+        y < miny && (miny = y); y > maxy && (maxy = y)
+    end
+    lo = (Int(floor(minx / d[1])), Int(floor(miny / d[2])))
+    hi = (Int(ceil(maxx / d[1])),  Int(ceil(maxy / d[2])))
+    return (lo, hi)
+end
+
+"""
+    voxelize!(dest_grid::AbstractArray{T,3}, poly::FlatPolytope{2,T},
+              ibox_lo, ibox_hi, d, order; workspace=nothing)
+
+2D rasterization. `dest_grid` is `(nmom, ni, nj)`. Mirrors
+`r2d_rasterize` in `src/v2d.c` (the 2D analog of `r3d_voxelize`).
+"""
+function voxelize!(dest_grid::AbstractArray{T,3},
+                   poly::FlatPolytope{2,T},
+                   ibox_lo::NTuple{2,Int}, ibox_hi::NTuple{2,Int},
+                   d::NTuple{2,T}, order::Int;
+                   workspace::Union{Nothing,VoxelizeWorkspace{2,T}} = nothing) where {T}
+    ni = ibox_hi[1] - ibox_lo[1]
+    nj = ibox_hi[2] - ibox_lo[2]
+    nmom = num_moments(2, order)
+    @assert size(dest_grid, 1) == nmom
+    @assert size(dest_grid, 2) >= ni
+    @assert size(dest_grid, 3) >= nj
+    (poly.nverts <= 0 || ni <= 0 || nj <= 0) && return dest_grid
+
+    ws = workspace === nothing ? VoxelizeWorkspace{2,T}(poly.capacity) : workspace
+    log2c(x) = x <= 1 ? 0 : ceil(Int, log2(x))
+    max_depth = log2c(ni) + log2c(nj) + 2
+    _ensure_stack!(ws, max_depth)
+    moments_buf = _ensure_voxelize_moment_scratch!(ws, order)
+
+    _copy_polytope_2d!(ws.polys[1], poly)
+    ws.iboxes[1] = (ibox_lo, ibox_hi)
+    nstack = 1
+
+    @inbounds while nstack > 0
+        cur = ws.polys[nstack]
+        lo, hi = ws.iboxes[nstack]
+        nstack -= 1
+
+        cur.nverts <= 0 && continue
+
+        sx = hi[1] - lo[1]; sy = hi[2] - lo[2]
+        spax = 1; dmax = sx
+        if sy > dmax; dmax = sy; spax = 2; end
+
+        if dmax == 1
+            moments!(moments_buf, cur, order)
+            i0 = lo[1] - ibox_lo[1] + 1
+            j0 = lo[2] - ibox_lo[2] + 1
+            for m in 1:nmom
+                dest_grid[m, i0, j0] += moments_buf[m]
+            end
+            continue
+        end
+
+        half = dmax >> 1
+        split_index = lo[spax] + half
+        split_pos = T(split_index) * d[spax]
+
+        if nstack + 2 > length(ws.polys)
+            _ensure_stack!(ws, nstack + 2)
+        end
+        out0 = ws.polys[nstack + 1]
+        out1 = ws.polys[nstack + 2]
+        split_coord!(cur, out0, out1, split_pos, spax)
+
+        hi_left  = (spax == 1 ? split_index : hi[1],
+                    spax == 2 ? split_index : hi[2])
+        lo_right = (spax == 1 ? split_index : lo[1],
+                    spax == 2 ? split_index : lo[2])
+        ws.iboxes[nstack + 1] = (lo, hi_left)
+        ws.iboxes[nstack + 2] = (lo_right, hi)
+        nstack += 2
+    end
+    return dest_grid
+end
+
+"""
+    voxelize(poly::FlatPolytope{2,T}, d, order; ibox=nothing, workspace=nothing)
+        -> (grid, ibox_lo, ibox_hi)
+
+2D convenience wrapper around [`voxelize!`](@ref). Returns the grid as
+shape `(nmom, ni, nj)` along with the index range used.
+"""
+function voxelize(poly::FlatPolytope{2,T}, d::NTuple{2,T}, order::Int;
+                  ibox::Union{Nothing,Tuple{NTuple{2,Int},NTuple{2,Int}}} = nothing,
+                  workspace::Union{Nothing,VoxelizeWorkspace{2,T}} = nothing) where {T}
+    if ibox === nothing
+        lo, hi = get_ibox(poly, d)
+    else
+        lo, hi = ibox
+    end
+    ni = hi[1] - lo[1]; nj = hi[2] - lo[2]
+    nmom = num_moments(2, order)
+    grid = zeros(T, nmom, max(ni, 1), max(nj, 1))
+    voxelize!(grid, poly, lo, hi, d, order; workspace = workspace)
+    return grid, lo, hi
+end
+
+# ===========================================================================
+# StaticFlatPolytope — small-cap variant backed by `MMatrix{D,N,…}`.
+# When N is small (≤ 64 or so), the MMatrix data is inline within the
+# struct and the compiler can unroll the per-vertex loops because N is
+# a compile-time constant. `init_box!` drops from ~22 ns → ~10 ns,
+# faster than upstream C. Useful for grid voxelization where each cell
+# starts as a simple box.
+# ===========================================================================
+
+"""
+    StaticFlatPolytope{D,T,N,DN}
+
+Small-cap, type-level-sized FlatPolytope. `N` is the vertex capacity at
+the type level; `DN = D*N` is required by `MMatrix` (StaticArrays).
+
+Each unique `N` produces a fresh specialization of every method —
+**pick one cap per use case**. For most callers, `N = 32` or `N = 64`
+is plenty (a unit cube clipped by a handful of planes rarely exceeds
+24 vertices).
+
+Construct via:
+
+    poly = R3D.Flat.StaticFlatPolytope{3,Float64,32}()
+
+Then use the same `init_box!` / `clip!` / `moments!` API as
+[`FlatPolytope`](@ref).
+"""
+mutable struct StaticFlatPolytope{D,T,N,DN}
+    positions::MMatrix{D,N,T,DN}
+    pnbrs::MMatrix{D,N,Int32,DN}
+    nverts::Int
+    sdists::MVector{N,T}
+    clipped::MVector{N,Int32}
+    emarks::MMatrix{N,D,Bool,DN}
+    Sm::Array{T,3}
+    Dm::Array{T,3}
+    Cm::Array{T,3}
+    moment_order::Int
+end
+
+@inline _capacity(::StaticFlatPolytope{D,T,N,DN}) where {D,T,N,DN} = N
+
+function StaticFlatPolytope{D,T,N}() where {D,T,N}
+    DN = D * N
+    StaticFlatPolytope{D,T,N,DN}(
+        zeros(MMatrix{D,N,T,DN}),
+        zeros(MMatrix{D,N,Int32,DN}),
+        0,
+        zeros(MVector{N,T}),
+        zeros(MVector{N,Int32}),
+        zeros(MMatrix{N,D,Bool,DN}),
+        Array{T,3}(undef, 0, 0, 0),
+        Array{T,3}(undef, 0, 0, 0),
+        Array{T,3}(undef, 0, 0, 0),
+        -1,
+    )
+end
+
+# ---------------------------------------------------------------------------
+# init_box! (D=3)
+# ---------------------------------------------------------------------------
+
+function init_box!(poly::StaticFlatPolytope{3,T,N,DN},
+                   lo::AbstractVector, hi::AbstractVector) where {T,N,DN}
+    @assert N >= 8
+    poly.nverts = 8
+    @inbounds begin
+        poly.positions[1,1] = lo[1]; poly.positions[2,1] = lo[2]; poly.positions[3,1] = lo[3]
+        poly.positions[1,2] = hi[1]; poly.positions[2,2] = lo[2]; poly.positions[3,2] = lo[3]
+        poly.positions[1,3] = hi[1]; poly.positions[2,3] = hi[2]; poly.positions[3,3] = lo[3]
+        poly.positions[1,4] = lo[1]; poly.positions[2,4] = hi[2]; poly.positions[3,4] = lo[3]
+        poly.positions[1,5] = lo[1]; poly.positions[2,5] = lo[2]; poly.positions[3,5] = hi[3]
+        poly.positions[1,6] = hi[1]; poly.positions[2,6] = lo[2]; poly.positions[3,6] = hi[3]
+        poly.positions[1,7] = hi[1]; poly.positions[2,7] = hi[2]; poly.positions[3,7] = hi[3]
+        poly.positions[1,8] = lo[1]; poly.positions[2,8] = hi[2]; poly.positions[3,8] = hi[3]
+
+        poly.pnbrs[1,1]=Int32(2); poly.pnbrs[2,1]=Int32(5); poly.pnbrs[3,1]=Int32(4)
+        poly.pnbrs[1,2]=Int32(3); poly.pnbrs[2,2]=Int32(6); poly.pnbrs[3,2]=Int32(1)
+        poly.pnbrs[1,3]=Int32(4); poly.pnbrs[2,3]=Int32(7); poly.pnbrs[3,3]=Int32(2)
+        poly.pnbrs[1,4]=Int32(1); poly.pnbrs[2,4]=Int32(8); poly.pnbrs[3,4]=Int32(3)
+        poly.pnbrs[1,5]=Int32(8); poly.pnbrs[2,5]=Int32(1); poly.pnbrs[3,5]=Int32(6)
+        poly.pnbrs[1,6]=Int32(5); poly.pnbrs[2,6]=Int32(2); poly.pnbrs[3,6]=Int32(7)
+        poly.pnbrs[1,7]=Int32(6); poly.pnbrs[2,7]=Int32(3); poly.pnbrs[3,7]=Int32(8)
+        poly.pnbrs[1,8]=Int32(7); poly.pnbrs[2,8]=Int32(4); poly.pnbrs[3,8]=Int32(5)
+    end
+    return poly
+end
+
+# ---------------------------------------------------------------------------
+# clip! / clip_plane! (D=3) — same algorithm as FlatPolytope, MMatrix
+# fields. The single shared kernel idea didn't pay off — direct
+# specialization on this type lets LLVM compile its own version.
+# ---------------------------------------------------------------------------
+
+function clip!(poly::StaticFlatPolytope{3,T,N,DN},
+               planes::AbstractVector{Plane{3,T}}) where {T,N,DN}
+    poly.nverts <= 0 && return false
+    @inbounds for plane in planes
+        ok = clip_plane!(poly, plane)
+        ok || return false
+        poly.nverts == 0 && return true
+    end
+    return true
+end
+
+function clip_plane!(poly::StaticFlatPolytope{3,T,N,DN},
+                     plane::Plane{3,T}) where {T,N,DN}
+    onv = poly.nverts
+    sdists = poly.sdists
+    clipped = poly.clipped
+
+    smin = T(Inf); smax = T(-Inf)
+    @inbounds for v in 1:onv
+        x = poly.positions[1, v]; y = poly.positions[2, v]; z = poly.positions[3, v]
+        s = plane.d + plane.n[1]*x + plane.n[2]*y + plane.n[3]*z
+        sdists[v] = s
+        s < smin && (smin = s)
+        s > smax && (smax = s)
+    end
+    smin >= 0 && return true
+    if smax <= 0
+        poly.nverts = 0
+        return true
+    end
+
+    @inbounds for v in 1:onv
+        clipped[v] = sdists[v] < 0 ? Int32(1) : Int32(0)
+    end
+
+    @inbounds for vcur in 1:onv
+        clipped[vcur] != 0 && continue
+        for np in 1:3
+            vnext = Int(poly.pnbrs[np, vcur])
+            vnext == 0 && continue
+            clipped[vnext] == 0 && continue
+
+            poly.nverts >= N && return false
+            new_idx = (poly.nverts += 1)
+
+            wa = -sdists[vnext]; wb = sdists[vcur]
+            invw = 1 / (wa + wb)
+            poly.positions[1, new_idx] = (wa*poly.positions[1,vcur] + wb*poly.positions[1,vnext]) * invw
+            poly.positions[2, new_idx] = (wa*poly.positions[2,vcur] + wb*poly.positions[2,vnext]) * invw
+            poly.positions[3, new_idx] = (wa*poly.positions[3,vcur] + wb*poly.positions[3,vnext]) * invw
+            poly.pnbrs[1, new_idx] = Int32(vcur)
+            poly.pnbrs[2, new_idx] = Int32(0)
+            poly.pnbrs[3, new_idx] = Int32(0)
+            poly.pnbrs[np, vcur] = Int32(new_idx)
+            clipped[new_idx] = Int32(0)
+        end
+    end
+
+    @inbounds for vstart in (onv+1):poly.nverts
+        vcur = vstart
+        vnext = Int(poly.pnbrs[1, vcur])
+        while true
+            np = _find_back3_static(poly.pnbrs, vnext, vcur)
+            vcur = vnext
+            vnext = Int(poly.pnbrs[next3(np), vcur])
+            vcur <= onv || break
+        end
+        poly.pnbrs[3, vstart] = Int32(vcur)
+        poly.pnbrs[2, vcur]   = Int32(vstart)
+    end
+
+    numunclipped = 0
+    @inbounds for v in 1:poly.nverts
+        if clipped[v] == 0
+            numunclipped += 1
+            if numunclipped != v
+                poly.positions[1, numunclipped] = poly.positions[1, v]
+                poly.positions[2, numunclipped] = poly.positions[2, v]
+                poly.positions[3, numunclipped] = poly.positions[3, v]
+                poly.pnbrs[1, numunclipped] = poly.pnbrs[1, v]
+                poly.pnbrs[2, numunclipped] = poly.pnbrs[2, v]
+                poly.pnbrs[3, numunclipped] = poly.pnbrs[3, v]
+            end
+            clipped[v] = Int32(numunclipped)
+        else
+            clipped[v] = Int32(0)
+        end
+    end
+    poly.nverts = numunclipped
+    @inbounds for v in 1:poly.nverts, np in 1:3
+        old = Int(poly.pnbrs[np, v])
+        poly.pnbrs[np, v] = old == 0 ? Int32(0) : clipped[old]
+    end
+    return true
+end
+
+# 3-way unrolled find_back specialized on MMatrix (mirrors find_back3
+# above; separate dispatch keeps the inliner happy with the static
+# pnbrs type).
+@inline function _find_back3_static(pnbrs::MMatrix{3,N,Int32,DN}, vnext::Int, vcur::Int) where {N,DN}
+    @inbounds begin
+        pnbrs[1, vnext] == Int32(vcur) && return 1
+        pnbrs[2, vnext] == Int32(vcur) && return 2
+        return 3
+    end
+end
+
+# ---------------------------------------------------------------------------
+# moments / moments! (D=3) — same Koehl recursion as FlatPolytope
+# ---------------------------------------------------------------------------
+
+function moments(poly::StaticFlatPolytope{3,T,N,DN}, order::Integer) where {T,N,DN}
+    out = zeros(T, num_moments(3, order))
+    moments!(out, poly, order)
+    return out
+end
+
+@inline function _ensure_moment_scratch_static!(poly::StaticFlatPolytope{D,T,N,DN}, order::Int) where {D,T,N,DN}
+    if order > poly.moment_order
+        np1 = order + 1
+        poly.Sm = Array{T,3}(undef, np1, np1, 2)
+        poly.Dm = Array{T,3}(undef, np1, np1, 2)
+        poly.Cm = Array{T,3}(undef, np1, np1, 2)
+        poly.moment_order = order
+    end
+    return nothing
+end
+
+function moments!(out::AbstractVector{T},
+                  poly::StaticFlatPolytope{3,T,N,DN},
+                  order::Integer) where {T,N,DN}
+    @assert length(out) >= num_moments(3, order)
+    fill!(out, zero(T))
+    poly.nverts <= 0 && return out
+
+    nv = poly.nverts
+    _ensure_moment_scratch_static!(poly, Int(order))
+
+    emarks = poly.emarks
+    @inbounds for k in 1:3, v in 1:nv
+        emarks[v, k] = false
+    end
+
+    S = poly.Sm; D = poly.Dm; C = poly.Cm
+    prevlayer = 1; curlayer = 2
+
+    @inbounds for vstart in 1:nv, pstart in 1:3
+        emarks[vstart, pstart] && continue
+
+        pnext = pstart
+        vcur = vstart
+        emarks[vcur, pnext] = true
+        vnext = Int(poly.pnbrs[pnext, vcur])
+        v0_x = poly.positions[1, vcur]
+        v0_y = poly.positions[2, vcur]
+        v0_z = poly.positions[3, vcur]
+
+        np = _find_back3_static(poly.pnbrs, vnext, vcur)
+        vcur = vnext
+        pnext = next3(np)
+        emarks[vcur, pnext] = true
+        vnext = Int(poly.pnbrs[pnext, vcur])
+
+        while vnext != vstart
+            v2_x = poly.positions[1, vcur]; v2_y = poly.positions[2, vcur]; v2_z = poly.positions[3, vcur]
+            v1_x = poly.positions[1, vnext]; v1_y = poly.positions[2, vnext]; v1_z = poly.positions[3, vnext]
+
+            sixv = (-v2_x*v1_y*v0_z + v1_x*v2_y*v0_z + v2_x*v0_y*v1_z
+                    - v0_x*v2_y*v1_z - v1_x*v0_y*v2_z + v0_x*v1_y*v2_z)
+
+            S[1,1,prevlayer] = one(T)
+            D[1,1,prevlayer] = one(T)
+            C[1,1,prevlayer] = one(T)
+            out[1] += sixv / 6
+
+            m = 1
+            for corder in 1:order
+                for i in corder:-1:0, j in (corder - i):-1:0
+                    k = corder - i - j
+                    m += 1
+                    ci = i + 1; cj = j + 1
+                    Cv = zero(T); Dv = zero(T); Sv = zero(T)
+                    if i > 0
+                        Cv += v2_x * C[ci-1, cj, prevlayer]
+                        Dv += v1_x * D[ci-1, cj, prevlayer]
+                        Sv += v0_x * S[ci-1, cj, prevlayer]
+                    end
+                    if j > 0
+                        Cv += v2_y * C[ci, cj-1, prevlayer]
+                        Dv += v1_y * D[ci, cj-1, prevlayer]
+                        Sv += v0_y * S[ci, cj-1, prevlayer]
+                    end
+                    if k > 0
+                        Cv += v2_z * C[ci, cj, prevlayer]
+                        Dv += v1_z * D[ci, cj, prevlayer]
+                        Sv += v0_z * S[ci, cj, prevlayer]
+                    end
+                    Dv += Cv
+                    Sv += Dv
+                    C[ci, cj, curlayer] = Cv
+                    D[ci, cj, curlayer] = Dv
+                    S[ci, cj, curlayer] = Sv
+                    out[m] += sixv * Sv
+                end
+                curlayer  = 3 - curlayer
+                prevlayer = 3 - prevlayer
+            end
+
+            np = _find_back3_static(poly.pnbrs, vnext, vcur)
+            vcur = vnext
+            pnext = next3(np)
+            emarks[vcur, pnext] = true
+            vnext = Int(poly.pnbrs[pnext, vcur])
+        end
+    end
+
+    @inbounds C[1,1,prevlayer] = one(T)
+    m = 1
+    for corder in 1:order
+        for i in corder:-1:0, j in (corder - i):-1:0
+            k = corder - i - j
+            m += 1
+            ci = i + 1; cj = j + 1
+            Cv = zero(T)
+            i > 0 && (Cv += C[ci-1, cj, prevlayer])
+            j > 0 && (Cv += C[ci, cj-1, prevlayer])
+            k > 0 && (Cv += C[ci, cj, prevlayer])
+            C[ci, cj, curlayer] = Cv
+            out[m] /= Cv * (corder + 1) * (corder + 2) * (corder + 3)
+        end
+        curlayer  = 3 - curlayer
+        prevlayer = 3 - prevlayer
+    end
+    return out
+end
+
+# ===========================================================================
+# split!, is_good, shift_moments — additional polytope operations from
+# upstream r3d.c / r2d.c. These are not on the perf-critical path; the
+# implementations follow the C source line-for-line.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# split! (D=3) — single polytope split at an arbitrary plane
+# ---------------------------------------------------------------------------
+
+"""
+    split!(in::FlatPolytope{3,T}, plane, out_pos, out_neg) -> Bool
+
+Split `in` at `plane` into two polytopes:
+
+- `out_pos` receives the half where `plane.n ⋅ x + plane.d ≥ 0`
+  (positive signed distance).
+- `out_neg` receives the half where the signed distance is negative.
+
+Mirrors `r3d_split` in `src/r3d.c`. `in` is consumed (its state is
+undefined after the call). Returns `true` on success, `false` on
+capacity overflow.
+
+Differs from [`split_coord!`](@ref) in two ways:
+1. The cutting plane is general (not axis-aligned).
+2. The "positive" output corresponds to positive signed distance from
+   the plane, not positive coordinate along an axis.
+"""
+function split!(in::FlatPolytope{3,T}, plane::Plane{3,T},
+                out_pos::FlatPolytope{3,T}, out_neg::FlatPolytope{3,T}) where {T}
+    if in.nverts <= 0
+        out_pos.nverts = 0
+        out_neg.nverts = 0
+        return true
+    end
+
+    sdists = in.sdists
+    side   = in.clipped     # 0 = positive side (out_pos), 1 = negative side (out_neg)
+
+    # Step 1: signed distances; vertices with sd < 0 → side = 1 (out_neg).
+    nneg = 0
+    @inbounds for v in 1:in.nverts
+        sd = plane.d + plane.n[1]*in.positions[1,v] +
+             plane.n[2]*in.positions[2,v] + plane.n[3]*in.positions[3,v]
+        sdists[v] = sd
+        if sd < 0
+            side[v] = Int32(1); nneg += 1
+        else
+            side[v] = Int32(0)
+        end
+    end
+
+    if nneg == 0
+        _copy_polytope!(out_pos, in)
+        out_neg.nverts = 0
+        return true
+    elseif nneg == in.nverts
+        _copy_polytope!(out_neg, in)
+        out_pos.nverts = 0
+        return true
+    end
+
+    # Step 2: insert pairs of new vertices on cut edges. Same pattern as
+    # split_coord!; the side-classification is the only thing that
+    # differs.
+    onv = in.nverts
+    @inbounds for vcur in 1:onv
+        side[vcur] != 0 && continue   # vcur on positive side
+        for np in 1:3
+            vnext = Int(in.pnbrs[np, vcur])
+            (vnext == 0 || side[vnext] == 0) && continue   # vnext also positive — no cut
+
+            in.nverts >= in.capacity - 1 && return false
+
+            # Note the reversed weighting compared to clip!: vcur is on
+            # the kept (positive) side here, vnext is being moved to the
+            # negative side. The weighted average is identical because
+            # |sd_neg| / (|sd_neg| + sd_pos) is the parametric offset.
+            wa = -sdists[vnext]; wb = sdists[vcur]
+            invw = 1 / (wa + wb)
+            nx = (wa*in.positions[1,vcur] + wb*in.positions[1,vnext]) * invw
+            ny = (wa*in.positions[2,vcur] + wb*in.positions[2,vnext]) * invw
+            nz = (wa*in.positions[3,vcur] + wb*in.positions[3,vnext]) * invw
+
+            new_pos = (in.nverts += 1)
+            in.positions[1, new_pos] = nx
+            in.positions[2, new_pos] = ny
+            in.positions[3, new_pos] = nz
+            in.pnbrs[1, new_pos] = Int32(vcur)
+            in.pnbrs[2, new_pos] = Int32(0)
+            in.pnbrs[3, new_pos] = Int32(0)
+            in.pnbrs[np, vcur]   = Int32(new_pos)
+            side[new_pos] = Int32(0)
+
+            new_neg = (in.nverts += 1)
+            in.positions[1, new_neg] = nx
+            in.positions[2, new_neg] = ny
+            in.positions[3, new_neg] = nz
+            in.pnbrs[1, new_neg] = Int32(vnext)
+            in.pnbrs[2, new_neg] = Int32(0)
+            in.pnbrs[3, new_neg] = Int32(0)
+            side[new_neg] = Int32(1)
+
+            for npnxt in 1:3
+                if in.pnbrs[npnxt, vnext] == Int32(vcur)
+                    in.pnbrs[npnxt, vnext] = Int32(new_neg)
+                    break
+                end
+            end
+        end
+    end
+
+    # Step 3: face-walk linker (same as clip_plane!).
+    @inbounds for vstart in (onv+1):in.nverts
+        vcur = vstart
+        vnext = Int(in.pnbrs[1, vcur])
+        while true
+            np = find_back3(in.pnbrs, vnext, vcur)
+            vcur = vnext
+            vnext = Int(in.pnbrs[next3(np), vcur])
+            vcur <= onv || break
+        end
+        in.pnbrs[3, vstart] = Int32(vcur)
+        in.pnbrs[2, vcur]   = Int32(vstart)
+    end
+
+    # Step 4: compact into out_pos (side=0) / out_neg (side=1).
+    total_verts = in.nverts
+    out_pos.nverts = 0
+    out_neg.nverts = 0
+    @inbounds for v in 1:total_verts
+        if side[v] == 0
+            out_pos.nverts += 1; dst = out_pos.nverts
+            out_pos.positions[1, dst] = in.positions[1, v]
+            out_pos.positions[2, dst] = in.positions[2, v]
+            out_pos.positions[3, dst] = in.positions[3, v]
+            out_pos.pnbrs[1, dst] = in.pnbrs[1, v]
+            out_pos.pnbrs[2, dst] = in.pnbrs[2, v]
+            out_pos.pnbrs[3, dst] = in.pnbrs[3, v]
+            side[v] = Int32(dst)
+        else
+            out_neg.nverts += 1; dst = out_neg.nverts
+            out_neg.positions[1, dst] = in.positions[1, v]
+            out_neg.positions[2, dst] = in.positions[2, v]
+            out_neg.positions[3, dst] = in.positions[3, v]
+            out_neg.pnbrs[1, dst] = in.pnbrs[1, v]
+            out_neg.pnbrs[2, dst] = in.pnbrs[2, v]
+            out_neg.pnbrs[3, dst] = in.pnbrs[3, v]
+            side[v] = Int32(dst)
+        end
+    end
+    @inbounds for v in 1:out_pos.nverts, np in 1:3
+        old = Int(out_pos.pnbrs[np, v])
+        out_pos.pnbrs[np, v] = old == 0 ? Int32(0) : side[old]
+    end
+    @inbounds for v in 1:out_neg.nverts, np in 1:3
+        old = Int(out_neg.pnbrs[np, v])
+        out_neg.pnbrs[np, v] = old == 0 ? Int32(0) : side[old]
+    end
+    return true
+end
+
+# ---------------------------------------------------------------------------
+# split! (D=2)
+# ---------------------------------------------------------------------------
+
+"""
+    split!(in::FlatPolytope{2,T}, plane, out_pos, out_neg) -> Bool
+
+2D analog of [`split!(::FlatPolytope{3,T}, …)`](@ref). Mirrors
+`r2d_split` in `src/r2d.c`.
+"""
+function split!(in::FlatPolytope{2,T}, plane::Plane{2,T},
+                out_pos::FlatPolytope{2,T}, out_neg::FlatPolytope{2,T}) where {T}
+    if in.nverts <= 0
+        out_pos.nverts = 0
+        out_neg.nverts = 0
+        return true
+    end
+
+    sdists = in.sdists
+    side   = in.clipped
+
+    nneg = 0
+    @inbounds for v in 1:in.nverts
+        sd = plane.d + plane.n[1]*in.positions[1,v] + plane.n[2]*in.positions[2,v]
+        sdists[v] = sd
+        if sd < 0
+            side[v] = Int32(1); nneg += 1
+        else
+            side[v] = Int32(0)
+        end
+    end
+
+    if nneg == 0
+        _copy_polytope_2d!(out_pos, in)
+        out_neg.nverts = 0
+        return true
+    elseif nneg == in.nverts
+        _copy_polytope_2d!(out_neg, in)
+        out_pos.nverts = 0
+        return true
+    end
+
+    onv = in.nverts
+    @inbounds for vcur in 1:onv
+        side[vcur] != 0 && continue
+        for np in 1:2
+            vnext = Int(in.pnbrs[np, vcur])
+            (vnext == 0 || side[vnext] == 0) && continue
+
+            in.nverts >= in.capacity - 1 && return false
+
+            wa = -sdists[vnext]; wb = sdists[vcur]
+            invw = 1 / (wa + wb)
+            nx = (wa*in.positions[1,vcur] + wb*in.positions[1,vnext]) * invw
+            ny = (wa*in.positions[2,vcur] + wb*in.positions[2,vnext]) * invw
+
+            other = 3 - np
+
+            new_pos = (in.nverts += 1)
+            in.positions[1, new_pos] = nx
+            in.positions[2, new_pos] = ny
+            in.pnbrs[other, new_pos] = Int32(vcur)
+            in.pnbrs[np,    new_pos] = Int32(0)
+            in.pnbrs[np, vcur] = Int32(new_pos)
+            side[new_pos] = Int32(0)
+
+            new_neg = (in.nverts += 1)
+            in.positions[1, new_neg] = nx
+            in.positions[2, new_neg] = ny
+            in.pnbrs[other, new_neg] = Int32(0)
+            in.pnbrs[np,    new_neg] = Int32(vnext)
+            in.pnbrs[other, vnext] = Int32(new_neg)
+            side[new_neg] = Int32(1)
+        end
+    end
+
+    @inbounds for vstart in (onv+1):in.nverts
+        in.pnbrs[2, vstart] != 0 && continue
+        vcur = Int(in.pnbrs[1, vstart])
+        while vcur <= onv
+            vcur = Int(in.pnbrs[1, vcur])
+        end
+        in.pnbrs[2, vstart] = Int32(vcur)
+        in.pnbrs[1, vcur]   = Int32(vstart)
+    end
+
+    total_verts = in.nverts
+    out_pos.nverts = 0
+    out_neg.nverts = 0
+    @inbounds for v in 1:total_verts
+        if side[v] == 0
+            out_pos.nverts += 1; dst = out_pos.nverts
+            out_pos.positions[1, dst] = in.positions[1, v]
+            out_pos.positions[2, dst] = in.positions[2, v]
+            out_pos.pnbrs[1, dst] = in.pnbrs[1, v]
+            out_pos.pnbrs[2, dst] = in.pnbrs[2, v]
+            side[v] = Int32(dst)
+        else
+            out_neg.nverts += 1; dst = out_neg.nverts
+            out_neg.positions[1, dst] = in.positions[1, v]
+            out_neg.positions[2, dst] = in.positions[2, v]
+            out_neg.pnbrs[1, dst] = in.pnbrs[1, v]
+            out_neg.pnbrs[2, dst] = in.pnbrs[2, v]
+            side[v] = Int32(dst)
+        end
+    end
+    @inbounds for v in 1:out_pos.nverts, np in 1:2
+        old = Int(out_pos.pnbrs[np, v])
+        out_pos.pnbrs[np, v] = old == 0 ? Int32(0) : side[old]
+    end
+    @inbounds for v in 1:out_neg.nverts, np in 1:2
+        old = Int(out_neg.pnbrs[np, v])
+        out_neg.pnbrs[np, v] = old == 0 ? Int32(0) : side[old]
+    end
+    return true
+end
+
+# ---------------------------------------------------------------------------
+# is_good — connectivity sanity check
+# ---------------------------------------------------------------------------
+
+"""
+    is_good(poly::FlatPolytope{D,T}) -> Bool
+
+Check that every vertex's neighbour list is internally consistent:
+
+- No vertex is its own neighbour, and no vertex's slots are duplicates.
+- Every neighbour index is in `1:nverts`.
+- Every vertex is referenced by exactly `D` other vertices.
+
+Mirrors `r3d_is_good` / `r2d_is_good` (`src/r3d.c`, `src/r2d.c`). Useful
+as a debugging aid; not on the hot path.
+"""
+function is_good(poly::FlatPolytope{D,T}) where {D,T}
+    nv = poly.nverts
+    nv <= 0 && return true   # empty polytope is trivially good
+    refcount = poly.clipped  # reuse capacity-sized scratch as a counter
+    @inbounds for v in 1:nv
+        refcount[v] = Int32(0)
+    end
+    @inbounds for v in 1:nv
+        # No self-loops; no duplicate slots.
+        if D == 3
+            a = poly.pnbrs[1, v]; b = poly.pnbrs[2, v]; c = poly.pnbrs[3, v]
+            (a == b || b == c || a == c) && return false
+            (a == Int32(v) || b == Int32(v) || c == Int32(v)) && return false
+            (a < 1 || a > nv || b < 1 || b > nv || c < 1 || c > nv) && return false
+            refcount[a] += Int32(1)
+            refcount[b] += Int32(1)
+            refcount[c] += Int32(1)
+        else  # D == 2
+            a = poly.pnbrs[1, v]; b = poly.pnbrs[2, v]
+            a == b && return false
+            (a == Int32(v) || b == Int32(v)) && return false
+            (a < 1 || a > nv || b < 1 || b > nv) && return false
+            refcount[a] += Int32(1)
+            refcount[b] += Int32(1)
+        end
+    end
+    @inbounds for v in 1:nv
+        refcount[v] == Int32(D) || return false
+    end
+    return true
+end
+
+function is_good(poly::StaticFlatPolytope{D,T,N,DN}) where {D,T,N,DN}
+    nv = poly.nverts
+    nv <= 0 && return true
+    refcount = poly.clipped
+    @inbounds for v in 1:nv
+        refcount[v] = Int32(0)
+    end
+    @inbounds for v in 1:nv
+        a = poly.pnbrs[1, v]; b = poly.pnbrs[2, v]; c = poly.pnbrs[3, v]
+        (a == b || b == c || a == c) && return false
+        (a == Int32(v) || b == Int32(v) || c == Int32(v)) && return false
+        (a < 1 || a > nv || b < 1 || b > nv || c < 1 || c > nv) && return false
+        refcount[a] += Int32(1)
+        refcount[b] += Int32(1)
+        refcount[c] += Int32(1)
+    end
+    @inbounds for v in 1:nv
+        refcount[v] == Int32(3) || return false
+    end
+    return true
+end
+
+# ---------------------------------------------------------------------------
+# shift_moments — translate moments to a new origin via Pascal's triangle
+# ---------------------------------------------------------------------------
+
+"""
+    shift_moments!(moments, polyorder, shift, ::Val{D})
+
+Translate a polytope's `moments` (about the spatial origin) to the
+moments of a polytope translated by `shift`. Implements
+
+    ∫_{Ω+shift} x^i y^j (z^k) dV
+        = ∫_Ω (x+shift.x)^i (y+shift.y)^j (z+shift.z)^k dV
+
+via the multinomial expansion. The 0th moment (volume / area) is
+unchanged. Mirrors `r3d_shift_moments` (D=3) / `r2d_shift_moments`
+(D=2). `Val{D}` selects the dimensionality.
+
+In the C source the same operation is used to "shift back" central
+moments computed against a translated polytope (numerically more
+accurate for high-order moments) — pass the polytope's centroid as
+`shift` and `moments` as the central moments to recover the raw
+moments. The `moments` vector is updated in place.
+"""
+function shift_moments!(moments::AbstractVector{T}, polyorder::Integer,
+                        vc::NTuple{D,T}, ::Val{D}) where {T,D}
+    @assert D == 2 || D == 3 "shift_moments! only supports D=2 or D=3"
+    nm = num_moments(D, polyorder)
+    @assert length(moments) >= nm
+    polyorder <= 0 && return moments
+
+    # Pascal's triangle B[i, corder] = binom(corder, i), 0 ≤ i ≤ corder
+    Bsz = polyorder + 1
+    B = zeros(T, Bsz, Bsz)
+    B[1, 1] = one(T)
+    @inbounds for corder in 1:polyorder
+        for i in corder:-1:0
+            j = corder - i
+            B[i+1, corder+1] = one(T)
+            if i > 0 && j > 0
+                B[i+1, corder+1] = B[i+1, corder] + B[i, corder]
+            end
+        end
+    end
+
+    # Working copy to avoid reading back updated values.
+    moments2 = zeros(T, nm)
+
+    if D == 3
+        @inbounds for corder in 1:polyorder, i in corder:-1:0, j in (corder - i):-1:0
+            k = corder - i - j
+            m = _moment_index_3d(i, j, k)
+            acc = zero(T)
+            for mcorder in 0:corder, mi in mcorder:-1:0, mj in (mcorder - mi):-1:0
+                mk = mcorder - mi - mj
+                if mi <= i && mj <= j && mk <= k
+                    mm = _moment_index_3d(mi, mj, mk)
+                    acc += B[mi+1, i+1] * B[mj+1, j+1] * B[mk+1, k+1] *
+                           vc[1]^(i-mi) * vc[2]^(j-mj) * vc[3]^(k-mk) *
+                           moments[mm]
+                end
+            end
+            moments2[m] = acc
+        end
+    else  # D == 2
+        @inbounds for corder in 1:polyorder, i in corder:-1:0
+            j = corder - i
+            m = _moment_index_2d(i, j)
+            acc = zero(T)
+            for mcorder in 0:corder, mi in mcorder:-1:0
+                mj = mcorder - mi
+                if mi <= i && mj <= j
+                    mm = _moment_index_2d(mi, mj)
+                    acc += B[mi+1, i+1] * B[mj+1, j+1] *
+                           vc[1]^(i-mi) * vc[2]^(j-mj) *
+                           moments[mm]
+                end
+            end
+            moments2[m] = acc
+        end
+    end
+
+    @inbounds for m in 2:nm
+        moments[m] = moments2[m]
+    end
+    return moments
+end
+
+# Index of moment x^i y^j z^k in the 3D moment vector. The order is
+# row-major over (i, j, k) with corder = i+j+k iterated outer-to-inner
+# and i descending, mirroring the existing reduce loop pattern in
+# `moments!` (`flat.jl`).
+function _moment_index_3d(i::Int, j::Int, k::Int)
+    corder = i + j + k
+    corder == 0 && return 1
+    # 1 + sum_{c=1..corder-1} (c+1)(c+2)/2 + (offset within corder)
+    base = 1
+    for c in 1:corder-1
+        base += (c+1)*(c+2)÷2
+    end
+    # within corder: outer loop i: corder..0; inner loop j: (corder-i)..0
+    off = 0
+    for ii in corder:-1:i+1
+        off += (corder - ii) + 1
+    end
+    off += (corder - i) - j + 1
+    return base + off
+end
+
+function _moment_index_2d(i::Int, j::Int)
+    corder = i + j
+    corder == 0 && return 1
+    base = 1
+    for c in 1:corder-1
+        base += c + 1
+    end
+    off = corder - i + 1
+    return base + off
+end
+
+# ===========================================================================
+# init_tet! / init_simplex! / init_poly! — additional constructors
+# ===========================================================================
+
+"""
+    init_tet!(poly::FlatPolytope{3,T}, v1, v2, v3, v4)
+
+Initialize as a tetrahedron with the four given vertex positions.
+Mirrors `r3d_init_tet` in `src/r3d.c` line-for-line (same pnbrs table,
+1-based here vs 0-based in C).
+"""
+function init_tet!(poly::FlatPolytope{3,T},
+                   v1::AbstractVector, v2::AbstractVector,
+                   v3::AbstractVector, v4::AbstractVector) where {T}
+    @assert poly.capacity >= 4
+    poly.nverts = 4
+    @inbounds begin
+        poly.positions[1,1] = v1[1]; poly.positions[2,1] = v1[2]; poly.positions[3,1] = v1[3]
+        poly.positions[1,2] = v2[1]; poly.positions[2,2] = v2[2]; poly.positions[3,2] = v2[3]
+        poly.positions[1,3] = v3[1]; poly.positions[2,3] = v3[2]; poly.positions[3,3] = v3[3]
+        poly.positions[1,4] = v4[1]; poly.positions[2,4] = v4[2]; poly.positions[3,4] = v4[3]
+
+        poly.pnbrs[1,1]=Int32(2); poly.pnbrs[2,1]=Int32(4); poly.pnbrs[3,1]=Int32(3)
+        poly.pnbrs[1,2]=Int32(3); poly.pnbrs[2,2]=Int32(4); poly.pnbrs[3,2]=Int32(1)
+        poly.pnbrs[1,3]=Int32(1); poly.pnbrs[2,3]=Int32(4); poly.pnbrs[3,3]=Int32(2)
+        poly.pnbrs[1,4]=Int32(2); poly.pnbrs[2,4]=Int32(3); poly.pnbrs[3,4]=Int32(1)
+    end
+    return poly
+end
+
+"Convenience: build a fresh 3D tetrahedron."
+function tet(v1::NTuple{3,Real}, v2::NTuple{3,Real},
+             v3::NTuple{3,Real}, v4::NTuple{3,Real}; capacity::Int = 512)
+    p = FlatPolytope{3,Float64}(capacity)
+    init_tet!(p, [v1...], [v2...], [v3...], [v4...])
+    return p
+end
+
+"""
+    init_simplex!(poly::FlatPolytope{2,T}, v1, v2, v3)
+
+Initialize as a triangle (2D simplex) with the three given vertices in
+CCW order. Equivalent to `init_poly!` on a 3-vertex closed polygon.
+"""
+function init_simplex!(poly::FlatPolytope{2,T},
+                       v1::AbstractVector, v2::AbstractVector,
+                       v3::AbstractVector) where {T}
+    @assert poly.capacity >= 3
+    poly.nverts = 3
+    @inbounds begin
+        poly.positions[1,1] = v1[1]; poly.positions[2,1] = v1[2]
+        poly.positions[1,2] = v2[1]; poly.positions[2,2] = v2[2]
+        poly.positions[1,3] = v3[1]; poly.positions[2,3] = v3[2]
+        poly.pnbrs[1,1] = Int32(2); poly.pnbrs[2,1] = Int32(3)
+        poly.pnbrs[1,2] = Int32(3); poly.pnbrs[2,2] = Int32(1)
+        poly.pnbrs[1,3] = Int32(1); poly.pnbrs[2,3] = Int32(2)
+    end
+    return poly
+end
+
+"Convenience: build a fresh 2D triangle."
+function simplex(v1::NTuple{2,Real}, v2::NTuple{2,Real}, v3::NTuple{2,Real};
+                 capacity::Int = 256)
+    p = FlatPolytope{2,Float64}(capacity)
+    init_simplex!(p, [v1...], [v2...], [v3...])
+    return p
+end
+
+"""
+    init_poly!(poly::FlatPolytope{2,T}, vertices) -> poly
+
+Initialize a 2D polytope as a closed polygon from a CCW-ordered
+iterable of `D=2` vertex positions (`AbstractVector`s, `NTuple`s, or
+`SVector`s). Mirrors `r2d_init_poly` in `src/r2d.c`.
+"""
+function init_poly!(poly::FlatPolytope{2,T}, vertices) where {T}
+    n = length(vertices)
+    @assert n >= 3
+    @assert poly.capacity >= n
+    poly.nverts = n
+    @inbounds for v in 1:n
+        p = vertices[v]
+        poly.positions[1, v] = T(p[1])
+        poly.positions[2, v] = T(p[2])
+        # CCW: pnbrs[1] = next vertex; pnbrs[2] = previous vertex
+        poly.pnbrs[1, v] = Int32(v == n ? 1 : v + 1)
+        poly.pnbrs[2, v] = Int32(v == 1 ? n : v - 1)
+    end
+    return poly
+end
+
+"""
+    init_poly!(poly::FlatPolytope{3,T}, vertices, faces) -> poly
+
+Initialize a 3D polytope from `vertices` (length-`numverts` collection
+of position vectors) and `faces` (a vector of vector-of-1-based
+vertex-indices, one per face, each ordered to form a closed loop).
+Mirrors `r3d_init_poly` in `src/r3d.c`.
+
+Supports both the **simple case** (every vertex has exactly 3 incident
+faces — e.g. tetrahedron) and the **general case** (vertices with > 3
+incident faces — e.g. cube, octahedron) via the same vertex-duplication
+algorithm as the upstream code.
+"""
+function init_poly!(poly::FlatPolytope{3,T}, vertices, faces) where {T}
+    numverts = length(vertices)
+    numfaces = length(faces)
+    @assert numverts >= 4 && numfaces >= 4
+
+    # Edges per vertex
+    eperv = zeros(Int32, numverts)
+    for f in 1:numfaces, v in faces[f]
+        eperv[v] += Int32(1)
+    end
+    minvperf = Int32(numverts); maxvperf = Int32(0)
+    for v in 1:numverts
+        e = eperv[v]
+        e < minvperf && (minvperf = e)
+        e > maxvperf && (maxvperf = e)
+    end
+
+    poly.nverts = 0
+    minvperf < 3 && return poly  # degenerate input
+
+    if maxvperf == 3
+        # Simple case: no vertex duplication needed.
+        @assert poly.capacity >= numverts
+        poly.nverts = numverts
+        sentinel = Int32(0)   # our 1-based "unset"
+        @inbounds for v in 1:numverts
+            p = vertices[v]
+            poly.positions[1, v] = T(p[1])
+            poly.positions[2, v] = T(p[2])
+            poly.positions[3, v] = T(p[3])
+            poly.pnbrs[1, v] = sentinel
+            poly.pnbrs[2, v] = sentinel
+            poly.pnbrs[3, v] = sentinel
+        end
+        @inbounds for f in 1:numfaces
+            face = faces[f]
+            nfv = length(face)
+            for vi in 1:nfv
+                vprev = face[vi]
+                vcur  = face[vi == nfv ? 1 : vi + 1]
+                vnext = face[vi >= nfv - 1 ? vi - nfv + 2 : vi + 2]
+                set = false
+                for np in 1:3
+                    pn = poly.pnbrs[np, vcur]
+                    if pn == Int32(vprev)
+                        # CCW traversal: vnext goes opposite to vprev's slot,
+                        # i.e. (np + 1) (mod 3) in 1-based: (np % 3) + 1
+                        opposite_slot = (np + 1) % 3 + 1   # (np-1+2)%3 + 1
+                        poly.pnbrs[opposite_slot, vcur] = Int32(vnext)
+                        set = true; break
+                    elseif pn == Int32(vnext)
+                        # vprev goes in the slot one CCW from vnext's slot
+                        opposite_slot = np % 3 + 1
+                        poly.pnbrs[opposite_slot, vcur] = Int32(vprev)
+                        set = true; break
+                    end
+                end
+                if !set
+                    # First time touching vcur: arbitrarily place vnext, vprev
+                    poly.pnbrs[1, vcur] = Int32(vnext)
+                    poly.pnbrs[2, vcur] = Int32(vprev)
+                end
+            end
+        end
+        return poly
+    end
+
+    # General case: each vertex with k > 3 incident faces is duplicated
+    # k times; we link the duplicates and then collapse pairs.
+    # Mirrors r3d.c lines 793-904 (port preserves indices in 1-based form;
+    # the upstream `R3D_MAX_VERTS` sentinel is replaced by 0 here).
+    total = sum(eperv)
+    cap_needed = total
+    @assert poly.capacity >= cap_needed "poly.capacity = $(poly.capacity), need ≥ $cap_needed"
+
+    # Working buffers
+    pos_tmp  = zeros(T, 3, total)
+    pnb_tmp  = zeros(Int32, 3, total)
+    util     = zeros(Int32, total)
+    vstart   = zeros(Int, numverts)
+
+    # Read in vertex locations with duplicates; each vertex v lives at
+    # indices vstart[v] .. vstart[v]+eperv[v]-1 (1-based here).
+    nv = 0
+    @inbounds for v in 1:numverts
+        vstart[v] = nv + 1
+        p = vertices[v]
+        for _ in 1:eperv[v]
+            nv += 1
+            pos_tmp[1, nv] = T(p[1])
+            pos_tmp[2, nv] = T(p[2])
+            pos_tmp[3, nv] = T(p[3])
+            pnb_tmp[1, nv] = Int32(0)
+            pnb_tmp[2, nv] = Int32(0)
+            pnb_tmp[3, nv] = Int32(0)
+        end
+    end
+
+    # Fill in connectivity for all duplicates (per-face traversal)
+    @inbounds for f in 1:numfaces
+        face = faces[f]
+        nfv = length(face)
+        for vi in 1:nfv
+            vprev = face[vi]
+            vcur_orig = face[vi == nfv ? 1 : vi + 1]
+            vnext = face[vi >= nfv - 1 ? vi - nfv + 2 : vi + 2]
+            vcur = vstart[vcur_orig] + util[vcur_orig]
+            util[vcur_orig] += Int32(1)
+            pnb_tmp[2, vcur] = Int32(vnext)
+            pnb_tmp[3, vcur] = Int32(vprev)
+        end
+    end
+
+    # Link degenerate duplicates around each original vertex
+    fill!(util, Int32(0))
+    @inbounds for v in 1:numverts
+        for v0 in vstart[v]:vstart[v]+eperv[v]-1
+            for v1 in vstart[v]:vstart[v]+eperv[v]-1
+                if pnb_tmp[3, v0] == pnb_tmp[2, v1] && util[v0] == 0
+                    pnb_tmp[3, v0] = Int32(v1)
+                    pnb_tmp[1, v1] = Int32(v0)
+                    util[v0] = Int32(1)
+                end
+            end
+        end
+    end
+
+    # Complete vertex pairs across distinct original vertices
+    fill!(util, Int32(0))
+    @inbounds for v0 in 1:numverts, v1 in (v0+1):numverts
+        for v00 in vstart[v0]:vstart[v0]+eperv[v0]-1
+            for v11 in vstart[v1]:vstart[v1]+eperv[v1]-1
+                if pnb_tmp[2, v00] == Int32(v1) && pnb_tmp[2, v11] == Int32(v0) &&
+                   util[v00] == 0 && util[v11] == 0
+                    pnb_tmp[2, v00] = Int32(v11)
+                    pnb_tmp[2, v11] = Int32(v00)
+                    util[v00] = Int32(1)
+                    util[v11] = Int32(1)
+                end
+            end
+        end
+    end
+
+    # Remove unnecessary dummy vertices (collapses each duplicate pair).
+    fill!(util, Int32(0))
+    @inbounds for v in 1:numverts
+        v0 = vstart[v]
+        v1 = pnb_tmp[1, v0]
+        v00 = pnb_tmp[3, v0]
+        v11 = pnb_tmp[1, v1]
+        pnb_tmp[1, v00] = pnb_tmp[2, v0]
+        pnb_tmp[3, v11] = pnb_tmp[2, v1]
+        # Patch back-links from v0 / v1's "outside" neighbour
+        target0 = pnb_tmp[2, v0]
+        for np in 1:3
+            if pnb_tmp[np, target0] == Int32(v0)
+                pnb_tmp[np, target0] = v00
+                break
+            end
+        end
+        target1 = pnb_tmp[2, v1]
+        for np in 1:3
+            if pnb_tmp[np, target1] == Int32(v1)
+                pnb_tmp[np, target1] = v11
+                break
+            end
+        end
+        util[v0] = Int32(1)
+        util[v1] = Int32(1)
+    end
+
+    # Compact into the real polytope buffer
+    numunclipped = 0
+    @inbounds for v in 1:nv
+        if util[v] == 0
+            numunclipped += 1
+            poly.positions[1, numunclipped] = pos_tmp[1, v]
+            poly.positions[2, numunclipped] = pos_tmp[2, v]
+            poly.positions[3, numunclipped] = pos_tmp[3, v]
+            poly.pnbrs[1, numunclipped] = pnb_tmp[1, v]
+            poly.pnbrs[2, numunclipped] = pnb_tmp[2, v]
+            poly.pnbrs[3, numunclipped] = pnb_tmp[3, v]
+            util[v] = Int32(numunclipped)
+        end
+    end
+    poly.nverts = numunclipped
+    @inbounds for v in 1:poly.nverts, np in 1:3
+        old = Int(poly.pnbrs[np, v])
+        poly.pnbrs[np, v] = old == 0 ? Int32(0) : util[old]
+    end
+    return poly
+end
+
+# ===========================================================================
+# Affine transformations — translate!, scale!, rotate!, shear!, affine!
+# Mirror upstream `r3d_translate`/`r3d_scale`/`r3d_rotate`/`r3d_shear`/
+# `r3d_affine` (and the 2D variants). All operate in-place on
+# `poly.positions`; no scratch needed.
+# ===========================================================================
+
+"""
+    translate!(poly, shift)
+
+Translate `poly` by `shift` (an `NTuple{D,T}` or `Vec{D,T}`).
+"""
+function translate!(poly::FlatPolytope{D,T},
+                    shift::Union{NTuple{D,<:Real},AbstractVector}) where {D,T}
+    @assert length(shift) == D
+    @inbounds for v in 1:poly.nverts, k in 1:D
+        poly.positions[k, v] += T(shift[k])
+    end
+    return poly
+end
+
+"""
+    scale!(poly, s)
+
+Uniform scale by scalar `s`. Mirrors `r3d_scale` / `r2d_scale`.
+"""
+function scale!(poly::FlatPolytope{D,T}, s::Real) where {D,T}
+    sT = T(s)
+    @inbounds for v in 1:poly.nverts, k in 1:D
+        poly.positions[k, v] *= sT
+    end
+    return poly
+end
+
+"""
+    shear!(poly, shear, axb, axs)
+
+Shear axis `axb` by `shear * x[axs]`. Mirrors `r3d_shear` / `r2d_shear`.
+`axb` and `axs` are 1-based axis indices (1..D).
+"""
+function shear!(poly::FlatPolytope{D,T}, shear::Real, axb::Int, axs::Int) where {D,T}
+    @assert 1 <= axb <= D && 1 <= axs <= D
+    sT = T(shear)
+    @inbounds for v in 1:poly.nverts
+        poly.positions[axb, v] += sT * poly.positions[axs, v]
+    end
+    return poly
+end
+
+"""
+    rotate!(poly::FlatPolytope{2,T}, theta)
+
+Rotate a 2D polytope by angle `theta` (radians, CCW). The upstream
+`r2d_rotate` has a long-standing bug where it writes `pos.x` twice and
+never updates `pos.y`; this implementation does the correct rotation.
+"""
+function rotate!(poly::FlatPolytope{2,T}, theta::Real) where {T}
+    c = T(cos(theta)); s = T(sin(theta))
+    @inbounds for v in 1:poly.nverts
+        x = poly.positions[1, v]; y = poly.positions[2, v]
+        poly.positions[1, v] = c * x - s * y
+        poly.positions[2, v] = s * x + c * y
+    end
+    return poly
+end
+
+"""
+    rotate!(poly::FlatPolytope{3,T}, theta, axis)
+
+Rotate a 3D polytope by angle `theta` (radians, right-hand rule) around
+the given coordinate `axis` ∈ {1, 2, 3}. Mirrors `r3d_rotate(poly, theta, axis-1)`.
+"""
+function rotate!(poly::FlatPolytope{3,T}, theta::Real, axis::Int) where {T}
+    @assert 1 <= axis <= 3
+    c = T(cos(theta)); s = T(sin(theta))
+    # axes orthogonal to `axis`: (axis%3)+1 and ((axis+1)%3)+1, 1-based
+    a = (axis % 3) + 1
+    b = ((axis + 1) % 3) + 1
+    @inbounds for v in 1:poly.nverts
+        u = poly.positions[a, v]; w = poly.positions[b, v]
+        poly.positions[a, v] = c * u - s * w
+        poly.positions[b, v] = s * u + c * w
+    end
+    return poly
+end
+
+"""
+    affine!(poly::FlatPolytope{2,T}, mat::AbstractMatrix)
+
+Apply the 3×3 homogeneous affine matrix `mat` to a 2D polytope.
+Last row is the homogeneous projection; if `w != 1`, divides through.
+"""
+function affine!(poly::FlatPolytope{2,T}, mat::AbstractMatrix) where {T}
+    @assert size(mat) == (3, 3)
+    @inbounds for v in 1:poly.nverts
+        x = poly.positions[1, v]; y = poly.positions[2, v]
+        nx = mat[1,1]*x + mat[1,2]*y + mat[1,3]
+        ny = mat[2,1]*x + mat[2,2]*y + mat[2,3]
+        w  = mat[3,1]*x + mat[3,2]*y + mat[3,3]
+        poly.positions[1, v] = T(nx / w)
+        poly.positions[2, v] = T(ny / w)
+    end
+    return poly
+end
+
+"""
+    affine!(poly::FlatPolytope{3,T}, mat::AbstractMatrix)
+
+Apply the 4×4 homogeneous affine matrix `mat` to a 3D polytope.
+Mirrors `r3d_affine`. Includes the homogeneous-w divide for perspective
+projections.
+"""
+function affine!(poly::FlatPolytope{3,T}, mat::AbstractMatrix) where {T}
+    @assert size(mat) == (4, 4)
+    @inbounds for v in 1:poly.nverts
+        x = poly.positions[1, v]; y = poly.positions[2, v]; z = poly.positions[3, v]
+        nx = mat[1,1]*x + mat[1,2]*y + mat[1,3]*z + mat[1,4]
+        ny = mat[2,1]*x + mat[2,2]*y + mat[2,3]*z + mat[2,4]
+        nz = mat[3,1]*x + mat[3,2]*y + mat[3,3]*z + mat[3,4]
+        w  = mat[4,1]*x + mat[4,2]*y + mat[4,3]*z + mat[4,4]
+        poly.positions[1, v] = T(nx / w)
+        poly.positions[2, v] = T(ny / w)
+        poly.positions[3, v] = T(nz / w)
+    end
+    return poly
+end
+
+# ---------------------------------------------------------------------------
+# Base.show — REPL pretty-printing for FlatPolytope / StaticFlatPolytope
+# ---------------------------------------------------------------------------
+
+function Base.show(io::IO, ::MIME"text/plain", p::FlatPolytope{D,T}) where {D,T}
+    println(io, "R3D.Flat.FlatPolytope{", D, ",", T, "} (capacity = ", p.capacity, ")")
+    println(io, "  nverts = ", p.nverts)
+    if p.nverts > 0
+        nshow = min(p.nverts, 8)
+        println(io, "  positions[:, 1:", nshow, "] =")
+        for v in 1:nshow
+            print(io, "    [", v, "] (")
+            for k in 1:D
+                k > 1 && print(io, ", ")
+                Base.print(io, p.positions[k, v])
+            end
+            print(io, ")  pnbrs = (")
+            for k in 1:D
+                k > 1 && print(io, ", ")
+                print(io, Int(p.pnbrs[k, v]))
+            end
+            println(io, ")")
+        end
+        p.nverts > nshow && println(io, "    … (", p.nverts - nshow, " more)")
+    end
+end
+
+function Base.show(io::IO, p::FlatPolytope{D,T}) where {D,T}
+    print(io, "FlatPolytope{", D, ",", T, "}(nverts=", p.nverts,
+              ", capacity=", p.capacity, ")")
+end
+
+function Base.show(io::IO, ::MIME"text/plain", p::StaticFlatPolytope{D,T,N,DN}) where {D,T,N,DN}
+    println(io, "R3D.Flat.StaticFlatPolytope{", D, ",", T, ",", N, "} (capacity = ", N, ", MMatrix-backed)")
+    println(io, "  nverts = ", p.nverts)
+    if p.nverts > 0
+        nshow = min(p.nverts, 8)
+        println(io, "  positions[:, 1:", nshow, "] =")
+        for v in 1:nshow
+            print(io, "    [", v, "] (")
+            for k in 1:D
+                k > 1 && print(io, ", ")
+                Base.print(io, p.positions[k, v])
+            end
+            print(io, ")  pnbrs = (")
+            for k in 1:D
+                k > 1 && print(io, ", ")
+                print(io, Int(p.pnbrs[k, v]))
+            end
+            println(io, ")")
+        end
+        p.nverts > nshow && println(io, "    … (", p.nverts - nshow, " more)")
+    end
+end
+
+function Base.show(io::IO, p::StaticFlatPolytope{D,T,N,DN}) where {D,T,N,DN}
+    print(io, "StaticFlatPolytope{", D, ",", T, ",", N, "}(nverts=", p.nverts, ")")
+end
+
+end # module Flat

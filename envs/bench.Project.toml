@@ -1,0 +1,7 @@
+# Recreate via:
+#   julia --project=bench_env -e 'using Pkg; Pkg.develop([
+#     PackageSpec(path="../R3D.jl"),
+#     PackageSpec(path="../R3D_C.jl"),
+#     PackageSpec(path="../R3DBenchmarks.jl")]);
+#   Pkg.add("BenchmarkTools")'
+[deps]

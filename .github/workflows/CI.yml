@@ -54,10 +54,27 @@ jobs:
           #endif
           EOF
           if [ "$RUNNER_OS" = "macOS" ]; then EXT=dylib; else EXT=so; fi
+
+          # D = 2 + D = 3 library (single artifact; r3d.c / r2d.c bake
+          # in their own dimension).
           gcc -O3 -fPIC -shared -Ilibr3d -Isrc/src \
               src/src/r3d.c src/src/v3d.c src/src/r2d.c src/src/v2d.c \
               -lm -o "libr3d/libr3d.${EXT}"
           echo "R3D_LIB=$PWD/libr3d/libr3d.${EXT}" >> "$GITHUB_ENV"
+
+          # D ≥ 4 libraries: rNd.c is a single source compiled per-D
+          # via `-DRND_DIM=N`. Upstream's rNd.h hardcodes
+          # `#define RND_DIM 4` — wrap it with an `#ifndef` guard so
+          # the build flag actually takes effect. (Use perl for the
+          # newline-in-replacement so macOS BSD sed and Linux GNU sed
+          # behave identically.)
+          perl -i.bak -pe 's|^#define RND_DIM 4$|#ifndef RND_DIM\n#define RND_DIM 4\n#endif|' src/src/rNd.h
+          for D in 4 5 6; do
+            gcc -O3 -fPIC -shared -DRND_DIM=$D -Ilibr3d -Isrc/src \
+                src/src/rNd.c -lm \
+                -o "libr3d/libr3d_${D}d.${EXT}"
+            echo "R3D_LIB_${D}D=$PWD/libr3d/libr3d_${D}d.${EXT}" >> "$GITHUB_ENV"
+          done
 
       - uses: julia-actions/setup-julia@v2
         with:

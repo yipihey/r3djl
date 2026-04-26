@@ -720,46 +720,75 @@ end
 end
 
 """
-    voxelize!(dest_grid, poly, ibox_lo, ibox_hi, d, order;
-              workspace = nothing) -> dest_grid
+    voxelize_fold!(callback::F, state, poly::FlatPolytope{3,T},
+                   ibox_lo, ibox_hi, d::NTuple{3,T}, order;
+                   workspace = nothing) where {F,T} -> state
 
-Voxelize `poly` onto a regular Cartesian grid covering index range
-`(ibox_lo, ibox_hi)` with cell spacing `d`. `dest_grid` is laid out as
-`(nmom, ni, nj, nk)` where `nmom = num_moments(3, order)` and
-`ni = ibox_hi[1] - ibox_lo[1]` etc. Voxel `(i,j,k)` covers the spatial
-region `[i*d_x, (i+1)*d_x) × …` (origin at the spatial origin), with
-moments contiguous along the first axis for fast accumulation.
+Walk the same `r3d_voxelize` bisection recursion as [`voxelize!`](@ref),
+but at each touched leaf cell `(i, j, k)` (1-based, relative to
+`ibox_lo`) call
 
-`poly` is left untouched — the routine copies it into the workspace
-and bisects there.
+    state = callback(state, i, j, k, m)
 
-Mirrors `r3d_voxelize` in `src/v3d.c`. The recursion is iterative via
-an explicit stack (the upstream implementation's variable-length-array
-stack is replaced by a `VoxelizeWorkspace`).
+where `m` is the per-leaf moment vector of length
+`R3D.num_moments(3, order)`. R3D writes nothing into a destination
+grid — the consumer chooses how to fold the moment vector into
+`state`.
+
+This lets callers fuse downstream contractions (`dot(coeffs, m)`,
+SpMV against a basis-projection matrix, weighted accumulation, etc.)
+into the leaf step at zero overhead — the compiler specializes on the
+callback's type and inlines the closure into R3D's leaf branch. For
+`order ≥ 2` the bandwidth saving over `voxelize! + post-loop` is
+proportional to `num_moments(3, order)` (e.g. 20× at order=3 in 3D).
+
+# Contract for the callback
+
+- Signature: `(state, i, j, k, m::AbstractVector{T}) -> new_state`.
+- `m` is a **view into the workspace's moment scratch** — it's
+  overwritten on the next leaf. Consume `m` within the callback or
+  copy it out; do not retain a reference past the call.
+- Return type should be invariant across calls (same as `Base.foldl`).
+- Leaf visitation order is stack-LIFO from the recursion, **not**
+  lexicographic over `(i,j,k)`. Folds that don't depend on order
+  (`+=`, `max`, `dot-into-cell`) are fine; ordered folds need to
+  sort afterward.
+- Empty-leaf cells (where the polytope didn't intersect) are skipped:
+  the callback is called only for non-empty leaves.
+
+# Example — fused dot product into a scalar grid
+
+```julia
+ws = R3D.Flat.VoxelizeWorkspace{3,Float64}(64)
+coeffs = …                                  # length-`nmom` basis projection
+scalar_grid = zeros(Float64, ni, nj, nk)
+R3D.Flat.voxelize_fold!(scalar_grid, poly, (0,0,0), (ni,nj,nk), d, 3;
+                          workspace = ws) do acc, i, j, k, m
+    @inbounds acc[i, j, k] += dot(coeffs, m)
+    acc
+end
+```
+
+`voxelize!` itself is now a one-liner over `voxelize_fold!`.
 """
-function voxelize!(dest_grid::AbstractArray{T,4},
-                   poly::FlatPolytope{3,T},
-                   ibox_lo::NTuple{3,Int}, ibox_hi::NTuple{3,Int},
-                   d::NTuple{3,T}, order::Int;
-                   workspace::Union{Nothing,VoxelizeWorkspace{3,T}} = nothing) where {T}
+function voxelize_fold!(callback::F,
+                        state,
+                        poly::FlatPolytope{3,T},
+                        ibox_lo::NTuple{3,Int}, ibox_hi::NTuple{3,Int},
+                        d::NTuple{3,T}, order::Int;
+                        workspace::Union{Nothing,VoxelizeWorkspace{3,T}} = nothing
+                        ) where {F,T}
     ni = ibox_hi[1] - ibox_lo[1]
     nj = ibox_hi[2] - ibox_lo[2]
     nk = ibox_hi[3] - ibox_lo[3]
-    nmom = num_moments(3, order)
-    @assert size(dest_grid, 1) == nmom
-    @assert size(dest_grid, 2) >= ni
-    @assert size(dest_grid, 3) >= nj
-    @assert size(dest_grid, 4) >= nk
-    (poly.nverts <= 0 || ni <= 0 || nj <= 0 || nk <= 0) && return dest_grid
+    (poly.nverts <= 0 || ni <= 0 || nj <= 0 || nk <= 0) && return state
 
     ws = workspace === nothing ? VoxelizeWorkspace{3,T}(poly.capacity) : workspace
-    # Depth bound: ceil(log2 ni) + ceil(log2 nj) + ceil(log2 nk) + 1
     log2c(x) = x <= 1 ? 0 : ceil(Int, log2(x))
     max_depth = log2c(ni) + log2c(nj) + log2c(nk) + 2
     _ensure_stack!(ws, max_depth)
     moments_buf = _ensure_voxelize_moment_scratch!(ws, order)
 
-    # Push the original polytope onto the stack.
     _copy_polytope!(ws.polys[1], poly)
     ws.iboxes[1] = (ibox_lo, ibox_hi)
     nstack = 1
@@ -771,7 +800,6 @@ function voxelize!(dest_grid::AbstractArray{T,4},
 
         cur.nverts <= 0 && continue
 
-        # Find the longest axis to split.
         sx = hi[1] - lo[1]
         sy = hi[2] - lo[2]
         sz = hi[3] - lo[3]
@@ -780,20 +808,16 @@ function voxelize!(dest_grid::AbstractArray{T,4},
         if sz > dmax; dmax = sz; spax = 3; end
 
         if dmax == 1
-            # Leaf: single voxel. Reduce and accumulate.
             moments!(moments_buf, cur, order)
             i0 = lo[1] - ibox_lo[1] + 1
             j0 = lo[2] - ibox_lo[2] + 1
             k0 = lo[3] - ibox_lo[3] + 1
-            for m in 1:nmom
-                dest_grid[m, i0, j0, k0] += moments_buf[m]
-            end
+            state = callback(state, i0, j0, k0, moments_buf)
             continue
         end
 
-        # Bisect along spax at the midpoint cell boundary.
         half = dmax >> 1
-        split_index = lo[spax] + half      # grid index of the splitting plane
+        split_index = lo[spax] + half
         split_pos = T(split_index) * d[spax]
 
         if nstack + 2 > length(ws.polys)
@@ -803,15 +827,54 @@ function voxelize!(dest_grid::AbstractArray{T,4},
         out1 = ws.polys[nstack + 2]
         split_coord!(cur, out0, out1, split_pos, spax)
 
-        hi_left = (spax == 1 ? split_index : hi[1],
-                   spax == 2 ? split_index : hi[2],
-                   spax == 3 ? split_index : hi[3])
+        hi_left  = (spax == 1 ? split_index : hi[1],
+                    spax == 2 ? split_index : hi[2],
+                    spax == 3 ? split_index : hi[3])
         lo_right = (spax == 1 ? split_index : lo[1],
                     spax == 2 ? split_index : lo[2],
                     spax == 3 ? split_index : lo[3])
         ws.iboxes[nstack + 1] = (lo, hi_left)
         ws.iboxes[nstack + 2] = (lo_right, hi)
         nstack += 2
+    end
+    return state
+end
+
+"""
+    voxelize!(dest_grid, poly, ibox_lo, ibox_hi, d, order;
+              workspace = nothing) -> dest_grid
+
+Voxelize `poly` onto a regular Cartesian grid covering index range
+`(ibox_lo, ibox_hi)` with cell spacing `d`. `dest_grid` is laid out as
+`(nmom, ni, nj, nk)` where `nmom = num_moments(3, order)` and
+`ni = ibox_hi[1] - ibox_lo[1]` etc. Voxel `(i,j,k)` covers the spatial
+region `[i*d_x, (i+1)*d_x) × …` (origin at the spatial origin), with
+moments contiguous along the first axis for fast accumulation.
+
+Implemented as a thin wrapper over [`voxelize_fold!`](@ref) — the
+fold writes the per-leaf moment vector into the corresponding column
+of `dest_grid`. Use `voxelize_fold!` directly if you can fuse a
+downstream contraction (e.g. `dot(coeffs, m)` for basis projection).
+
+`poly` is left untouched — the routine copies it into the workspace
+and bisects there. Mirrors `r3d_voxelize` in `src/v3d.c`.
+"""
+function voxelize!(dest_grid::AbstractArray{T,4},
+                   poly::FlatPolytope{3,T},
+                   ibox_lo::NTuple{3,Int}, ibox_hi::NTuple{3,Int},
+                   d::NTuple{3,T}, order::Int;
+                   workspace::Union{Nothing,VoxelizeWorkspace{3,T}} = nothing) where {T}
+    nmom = num_moments(3, order)
+    @assert size(dest_grid, 1) == nmom
+    @assert size(dest_grid, 2) >= ibox_hi[1] - ibox_lo[1]
+    @assert size(dest_grid, 3) >= ibox_hi[2] - ibox_lo[2]
+    @assert size(dest_grid, 4) >= ibox_hi[3] - ibox_lo[3]
+    voxelize_fold!(dest_grid, poly, ibox_lo, ibox_hi, d, order;
+                   workspace = workspace) do grid, i, j, k, m
+        @inbounds for mi in 1:length(m)
+            grid[mi, i, j, k] += m[mi]
+        end
+        return grid
     end
     return dest_grid
 end
@@ -1259,24 +1322,32 @@ function get_ibox(poly::FlatPolytope{2,T}, d::NTuple{2,T}) where {T}
 end
 
 """
-    voxelize!(dest_grid::AbstractArray{T,3}, poly::FlatPolytope{2,T},
-              ibox_lo, ibox_hi, d, order; workspace=nothing)
+    voxelize_fold!(callback::F, state, poly::FlatPolytope{2,T},
+                   ibox_lo, ibox_hi, d::NTuple{2,T}, order;
+                   workspace = nothing) where {F,T} -> state
 
-2D rasterization. `dest_grid` is `(nmom, ni, nj)`. Mirrors
-`r2d_rasterize` in `src/v2d.c` (the 2D analog of `r3d_voxelize`).
+2D analog of [`voxelize_fold!(::F, ::Any, ::FlatPolytope{3,T}, …)`](@ref).
+Walks the same `r2d_rasterize` recursion, calling
+`state = callback(state, i, j, m)` at each non-empty leaf cell.
+
+`m` is a length-`R3D.num_moments(2, order)` view into the workspace's
+moment scratch — overwritten on the next leaf, so consume it within
+the callback or copy it out.
+
+Mirrors `r2d_rasterize` in `src/v2d.c`. `voxelize!` for D=2 is a
+thin wrapper that writes `m` into the corresponding column of
+`dest_grid`.
 """
-function voxelize!(dest_grid::AbstractArray{T,3},
-                   poly::FlatPolytope{2,T},
-                   ibox_lo::NTuple{2,Int}, ibox_hi::NTuple{2,Int},
-                   d::NTuple{2,T}, order::Int;
-                   workspace::Union{Nothing,VoxelizeWorkspace{2,T}} = nothing) where {T}
+function voxelize_fold!(callback::F,
+                        state,
+                        poly::FlatPolytope{2,T},
+                        ibox_lo::NTuple{2,Int}, ibox_hi::NTuple{2,Int},
+                        d::NTuple{2,T}, order::Int;
+                        workspace::Union{Nothing,VoxelizeWorkspace{2,T}} = nothing
+                        ) where {F,T}
     ni = ibox_hi[1] - ibox_lo[1]
     nj = ibox_hi[2] - ibox_lo[2]
-    nmom = num_moments(2, order)
-    @assert size(dest_grid, 1) == nmom
-    @assert size(dest_grid, 2) >= ni
-    @assert size(dest_grid, 3) >= nj
-    (poly.nverts <= 0 || ni <= 0 || nj <= 0) && return dest_grid
+    (poly.nverts <= 0 || ni <= 0 || nj <= 0) && return state
 
     ws = workspace === nothing ? VoxelizeWorkspace{2,T}(poly.capacity) : workspace
     log2c(x) = x <= 1 ? 0 : ceil(Int, log2(x))
@@ -1303,9 +1374,7 @@ function voxelize!(dest_grid::AbstractArray{T,3},
             moments!(moments_buf, cur, order)
             i0 = lo[1] - ibox_lo[1] + 1
             j0 = lo[2] - ibox_lo[2] + 1
-            for m in 1:nmom
-                dest_grid[m, i0, j0] += moments_buf[m]
-            end
+            state = callback(state, i0, j0, moments_buf)
             continue
         end
 
@@ -1327,6 +1396,37 @@ function voxelize!(dest_grid::AbstractArray{T,3},
         ws.iboxes[nstack + 1] = (lo, hi_left)
         ws.iboxes[nstack + 2] = (lo_right, hi)
         nstack += 2
+    end
+    return state
+end
+
+"""
+    voxelize!(dest_grid::AbstractArray{T,3}, poly::FlatPolytope{2,T},
+              ibox_lo, ibox_hi, d, order; workspace=nothing)
+
+2D rasterization. `dest_grid` is `(nmom, ni, nj)`. Mirrors
+`r2d_rasterize` in `src/v2d.c` (the 2D analog of `r3d_voxelize`).
+
+Implemented as a thin wrapper over [`voxelize_fold!`](@ref) — the
+fold writes the per-leaf moment vector into the corresponding column
+of `dest_grid`. Use `voxelize_fold!` directly if you can fuse a
+downstream contraction.
+"""
+function voxelize!(dest_grid::AbstractArray{T,3},
+                   poly::FlatPolytope{2,T},
+                   ibox_lo::NTuple{2,Int}, ibox_hi::NTuple{2,Int},
+                   d::NTuple{2,T}, order::Int;
+                   workspace::Union{Nothing,VoxelizeWorkspace{2,T}} = nothing) where {T}
+    nmom = num_moments(2, order)
+    @assert size(dest_grid, 1) == nmom
+    @assert size(dest_grid, 2) >= ibox_hi[1] - ibox_lo[1]
+    @assert size(dest_grid, 3) >= ibox_hi[2] - ibox_lo[2]
+    voxelize_fold!(dest_grid, poly, ibox_lo, ibox_hi, d, order;
+                   workspace = workspace) do grid, i, j, m
+        @inbounds for mi in 1:length(m)
+            grid[mi, i, j] += m[mi]
+        end
+        return grid
     end
     return dest_grid
 end

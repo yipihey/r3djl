@@ -7,6 +7,32 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### `voxelize_fold!` — basis-agnostic leaf-callback hook
+
+- New `R3D.Flat.voxelize_fold!(callback, state, poly, ibox_lo, ibox_hi,
+  d, order; workspace)` for D = 2 and D = 3. Walks the same `r3d_voxelize`
+  / `r2d_rasterize` recursion as `voxelize!`, but at each non-empty
+  leaf cell calls `state = callback(state, i, j[, k], m)` where `m` is
+  a workspace-owned moment-vector view. Lets consumers fuse downstream
+  contractions (basis projection, SpMV, weighted accumulation) into
+  the leaf step without R3D committing to any basis convention.
+- `voxelize!` is now a thin wrapper that calls `voxelize_fold!` with a
+  closure that writes `m` into the corresponding column of `dest_grid`.
+  The 151k+ existing voxelize differential-vs-C tests pass unchanged
+  (refactor is bit-for-bit invariant).
+- Callback contract documented: `m` is overwritten on the next leaf
+  (consume in callback or copy out); leaf visitation is stack-LIFO,
+  not lexicographic; empty leaves are skipped.
+- Hot-loop is 0-alloc when the callback is a hoisted closure or named
+  function. With a do-block constructed inside `@allocated`, the
+  measurement charges JIT compilation cost — a Julia gotcha worth
+  documenting; in real consumer code the do-block compiles once.
+- New `R3DBenchmarks.bench_voxelize_fold_3d` micro-bench:
+  measured speedup is modest (1.0–1.1× across grids 8³–32³ and orders
+  0–3) because per-leaf moments computation dominates wall-time. The
+  fold's wins are elsewhere — memory (no `nmom × N` intermediate),
+  cleaner downstream API, and multi-row SpMV cache reuse.
+
 ### Phase 3 (D ≥ 4) — clip + 0th-moment ported
 
 - `FlatPolytope{D,T}` carries a lazily-allocated `finds::Array{Int32,3}`

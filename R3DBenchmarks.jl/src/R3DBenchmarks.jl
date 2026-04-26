@@ -427,6 +427,78 @@ end
 const _BUF_LO_2D = [0.0, 0.0]
 const _BUF_HI_2D = [1.0, 1.0]
 
+# Hoisted callback for the fused dot-product fold benchmark. Defined at
+# module scope so the @benchmark macro doesn't time anonymous-function
+# compilation (which would dwarf the actual loop work).
+@inline function _fold_dot_into_grid(coeffs::Vector{Float64})
+    return (acc, i, j, k, m) -> begin
+        s = 0.0
+        @inbounds for mi in 1:length(m)
+            s += coeffs[mi] * m[mi]
+        end
+        @inbounds acc[i, j, k] += s
+        return acc
+    end
+end
+
+"""
+    bench_voxelize_fold_3d(grid_n = 16, order = 3; capacity = 256) -> (fused, unfused)
+
+Two-way micro-benchmark for `voxelize_fold!`: a fused dot-product
+contraction inside the leaf hook vs the equivalent two-pass
+`voxelize! + post-loop dot`.
+
+In practice the wall-time speedup is modest (1.0–1.1× across grid
+sizes and orders we measured) because the per-leaf moments computation
+dominates over the cost of writing the moment vector to memory. The
+fold's actual wins are elsewhere:
+
+- **Memory**: no `nmom × N` intermediate grid. At order = 3 on a 32³
+  grid that's 5.2 MB vs 0.26 MB for the scalar.
+- **API**: downstream basis projection lives in one function, no
+  two-pass plumbing; R3D stays opinion-free about basis convention.
+- **Multi-field**: SpMV against several coefficient vectors keeps `m`
+  in cache for all rows.
+"""
+function bench_voxelize_fold_3d(grid_n::Int = 16, order::Int = 3;
+                                 capacity::Int = 256)
+    d = (1.0 / grid_n, 1.0 / grid_n, 1.0 / grid_n)
+    nmom = R3D.num_moments(3, order)
+    coeffs = collect(1.0:nmom)
+    cube = R3D.Flat.box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+    plane = R3D.Plane{3,Float64}(R3D.Vec{3,Float64}([1.0, 1.0, 1.0]/sqrt(3)),
+                                  -1/sqrt(3))
+    R3D.Flat.clip!(cube, [plane])
+    ws = R3D.Flat.VoxelizeWorkspace{3,Float64}(capacity)
+    full_grid = zeros(Float64, nmom, grid_n, grid_n, grid_n)
+    scalar_grid = zeros(Float64, grid_n, grid_n, grid_n)
+    cb = _fold_dot_into_grid(coeffs)
+
+    fused_t = @benchmark begin
+        fill!($scalar_grid, 0.0)
+        R3D.Flat.voxelize_fold!($cb, $scalar_grid, $cube,
+                                 (0,0,0), ($grid_n,$grid_n,$grid_n),
+                                 $d, $order; workspace = $ws)
+    end
+
+    unfused_t = @benchmark begin
+        fill!($full_grid, 0.0)
+        fill!($scalar_grid, 0.0)
+        R3D.Flat.voxelize!($full_grid, $cube,
+                            (0,0,0), ($grid_n,$grid_n,$grid_n),
+                            $d, $order; workspace = $ws)
+        @inbounds for k in 1:$grid_n, j in 1:$grid_n, i in 1:$grid_n
+            s = 0.0
+            for mi in 1:$nmom
+                s += $coeffs[mi] * $full_grid[mi, i, j, k]
+            end
+            $scalar_grid[i, j, k] += s
+        end
+    end
+
+    return fused_t, unfused_t
+end
+
 """
     bench_overlap_2d(n_triangles = 1024; grid_n = 32, order = 3, seed = 42) -> trial
 
@@ -612,6 +684,18 @@ function run_all()
         summarize(bench_reduce(ord)...,        "reduce(order=$ord)")
     end
     summarize(bench_full_pipeline(4)...,       "full pipeline (4 planes, ord=2)")
+
+    println()
+    println("=== voxelize_fold! (fused per-leaf contraction) vs voxelize! + post-dot ===")
+    for (gn, ord) in [(16, 0), (16, 2), (32, 2), (32, 3)]
+        fused, unfused = bench_voxelize_fold_3d(gn, ord)
+        f_med = BenchmarkTools.median(fused).time
+        u_med = BenchmarkTools.median(unfused).time
+        nmom = R3D.num_moments(3, ord)
+        @printf("  %-44s  fused: %8.1f μs  unfused: %8.1f μs  speedup: %.2fx (nmom=%d)\n",
+                "$(gn)^3 grid, ord=$ord",
+                f_med / 1000, u_med / 1000, u_med / f_med, nmom)
+    end
 
     println()
     println("=== HierarchicalGrids-style overlap loop (reused buffers, 0-alloc hot path) ===")

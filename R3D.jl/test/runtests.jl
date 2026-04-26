@@ -271,6 +271,126 @@ end
 # Voxelization (R3D.Flat.voxelize!) — closed-form + differential vs C.
 @testset "R3D.Flat voxelize" begin
 
+    @testset "voxelize_fold! basis-agnostic leaf hook (D=3)" begin
+        # 1. Sum-fold equals voxelize! exactly. The point of refactoring
+        #    voxelize! over voxelize_fold! is that this round-trips bit
+        #    for bit, but assert it explicitly so future regressions
+        #    show up here rather than buried in the diff-vs-C testset.
+        cube = R3D.Flat.box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+        plane = R3D.Plane{3,Float64}(R3D.Vec{3,Float64}([1.0, 1.0, 1.0]/sqrt(3)),
+                                      -1/sqrt(3))
+        R3D.Flat.clip!(cube, [plane])
+        d = (0.1, 0.1, 0.1)
+        lo, hi = R3D.Flat.get_ibox(cube, d)
+
+        ws = R3D.Flat.VoxelizeWorkspace{3,Float64}(64)
+        grid_via_voxelize = zeros(Float64, R3D.num_moments(3, 2),
+                                   hi[1]-lo[1], hi[2]-lo[2], hi[3]-lo[3])
+        R3D.Flat.voxelize!(grid_via_voxelize, cube, lo, hi, d, 2; workspace = ws)
+
+        grid_via_fold = zeros(Float64, R3D.num_moments(3, 2),
+                               hi[1]-lo[1], hi[2]-lo[2], hi[3]-lo[3])
+        R3D.Flat.voxelize_fold!(grid_via_fold, cube, lo, hi, d, 2;
+                                  workspace = ws) do g, i, j, k, m
+            @inbounds for mi in 1:length(m)
+                g[mi, i, j, k] += m[mi]
+            end
+            return g
+        end
+        @test grid_via_voxelize == grid_via_fold
+
+        # 2. Total volume from a fold matches the polytope's analytic
+        #    volume. Sums independent of leaf order.
+        cube2 = R3D.Flat.box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+        total = R3D.Flat.voxelize_fold!(0.0, cube2, (0,0,0), (4,4,4),
+                                          (0.25, 0.25, 0.25), 0;
+                                          workspace = ws) do acc, i, j, k, m
+            return acc + m[1]
+        end
+        @test isapprox(total, 1.0; atol=1e-12)
+
+        # 3. Fused dot-product fold equals two-pass voxelize! + post-dot.
+        cube3 = R3D.Flat.box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+        R3D.Flat.clip!(cube3, [plane])
+        nmom = R3D.num_moments(3, 3)
+        coeffs = collect(1.0:nmom)
+        # Two-pass reference
+        full_grid = zeros(Float64, nmom, hi[1]-lo[1], hi[2]-lo[2], hi[3]-lo[3])
+        R3D.Flat.voxelize!(full_grid, cube3, lo, hi, d, 3; workspace = ws)
+        scalar_ref = zeros(Float64, hi[1]-lo[1], hi[2]-lo[2], hi[3]-lo[3])
+        for k in 1:size(full_grid, 4), j in 1:size(full_grid, 3), i in 1:size(full_grid, 2)
+            s = 0.0
+            for mi in 1:nmom
+                s += coeffs[mi] * full_grid[mi, i, j, k]
+            end
+            scalar_ref[i, j, k] = s
+        end
+        # Fused
+        cube3b = R3D.Flat.box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+        R3D.Flat.clip!(cube3b, [plane])
+        scalar_fused = zeros(Float64, hi[1]-lo[1], hi[2]-lo[2], hi[3]-lo[3])
+        R3D.Flat.voxelize_fold!(scalar_fused, cube3b, lo, hi, d, 3;
+                                  workspace = ws) do acc, i, j, k, m
+            s = 0.0
+            @inbounds for mi in 1:length(m)
+                s += coeffs[mi] * m[mi]
+            end
+            @inbounds acc[i, j, k] += s
+            return acc
+        end
+        @test all(isapprox.(scalar_fused, scalar_ref; atol=1e-12))
+
+        # 4. Hot-loop allocation check: warmed-up fold is 0-alloc.
+        # The callback must be hoisted out of the @allocated expression
+        # — a do-block evaluated INSIDE @allocated would create a new
+        # anonymous-function type at that source location and trigger
+        # compilation, which @allocated charges to the call. In real
+        # consumer code the do-block's type is fixed at the call site
+        # and compiled only once, so the per-call cost is what we
+        # measure here.
+        cube4 = R3D.Flat.box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
+        scalar2 = zeros(Float64, 4, 4, 4)
+        sum_first_moment = (acc, i, j, k, m) -> (@inbounds acc[i,j,k] += m[1]; acc)
+        R3D.Flat.voxelize_fold!(sum_first_moment, scalar2, cube4, (0,0,0), (4,4,4),
+                                 (0.25,0.25,0.25), 1; workspace = ws)   # warmup
+        fill!(scalar2, 0.0)
+        a = @allocated R3D.Flat.voxelize_fold!(sum_first_moment, scalar2, cube4,
+                                                (0,0,0), (4,4,4), (0.25,0.25,0.25), 1;
+                                                workspace = ws)
+        @test a <= 64   # one tiny boxed return tuple from the kernel; not the
+                        # 3 MB compilation cost a do-block would charge here
+    end
+
+    @testset "voxelize_fold! basis-agnostic leaf hook (D=2)" begin
+        sq = R3D.Flat.box((0.0, 0.0), (1.0, 1.0))
+        d2 = (0.25, 0.25)
+        ws = R3D.Flat.VoxelizeWorkspace{2,Float64}(64)
+        grid_via_voxelize = zeros(Float64, R3D.num_moments(2, 1), 4, 4)
+        R3D.Flat.voxelize!(grid_via_voxelize, sq, (0,0), (4,4), d2, 1;
+                            workspace = ws)
+        grid_via_fold = zeros(Float64, R3D.num_moments(2, 1), 4, 4)
+        R3D.Flat.voxelize_fold!(grid_via_fold, sq, (0,0), (4,4), d2, 1;
+                                  workspace = ws) do g, i, j, m
+            @inbounds for mi in 1:length(m)
+                g[mi, i, j] += m[mi]
+            end
+            return g
+        end
+        @test grid_via_voxelize == grid_via_fold
+
+        # 0-alloc fused fold for D=2 too. Same gotcha as D=3: hoist the
+        # callback so @allocated doesn't time the closure's compile.
+        sq2 = R3D.Flat.box((0.0, 0.0), (1.0, 1.0))
+        scalar = zeros(Float64, 4, 4)
+        sum_first_2d = (acc, i, j, m) -> (@inbounds acc[i,j] += m[1]; acc)
+        R3D.Flat.voxelize_fold!(sum_first_2d, scalar, sq2, (0,0), (4,4), d2, 0;
+                                 workspace = ws)   # warmup
+        fill!(scalar, 0.0)
+        a = @allocated R3D.Flat.voxelize_fold!(sum_first_2d, scalar, sq2,
+                                                (0,0), (4,4), d2, 0; workspace = ws)
+        @test a <= 64
+    end
+
     @testset "Aligned cube tiles its grid exactly" begin
         cube = R3D.Flat.box((0.0, 0.0, 0.0), (1.0, 1.0, 1.0))
         d = (0.25, 0.25, 0.25)

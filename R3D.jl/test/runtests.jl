@@ -824,6 +824,53 @@ using LinearAlgebra: I
         end
     end
 
+    @testset "voxelize_fold! / voxelize! for D ≥ 4 (order = 0)" begin
+        # Closed-form: unit D-box voxelized over an N^D grid sums to 1
+        # and every cell equals 1 / N^D.
+        for (D, N) in [(4, 4), (5, 2), (6, 2)]
+            buf = R3D.Flat.FlatPolytope{D,Float64}(128)
+            R3D.Flat.init_box!(buf, zeros(D), ones(D))
+            ws = R3D.Flat.VoxelizeWorkspace{D,Float64}(128)
+            d = ntuple(_ -> 1.0 / N, D)
+            ibox_lo = ntuple(_ -> 0, D)
+            ibox_hi = ntuple(_ -> N, D)
+            grid = zeros(Float64, 1, ntuple(_ -> N, D)...)
+            R3D.Flat.voxelize!(grid, buf, ibox_lo, ibox_hi, d, 0; workspace = ws)
+            cell_vol = inv(N^D)
+            @test isapprox(sum(grid), 1.0; atol=1e-12, rtol=1e-10)
+            @test all(isapprox.(grid, cell_vol; atol=1e-12, rtol=1e-10))
+        end
+
+        # Higher orders are stubbed.
+        buf = R3D.Flat.FlatPolytope{4,Float64}(64)
+        R3D.Flat.init_box!(buf, zeros(4), ones(4))
+        ws = R3D.Flat.VoxelizeWorkspace{4,Float64}(64)
+        @test_throws AssertionError R3D.Flat.voxelize_fold!(0.0, buf, (0,0,0,0),
+            (4,4,4,4), (0.25,0.25,0.25,0.25), 1; workspace = ws) do acc, idx, m
+            acc + m[1]
+        end
+    end
+
+    @testset "D ≥ 4 sequential clips don't corrupt finds[][]" begin
+        # Regression for the linker bug found while wiring voxelize_fold!:
+        # earlier the inside-loop branch incremented `nfaces` per cross
+        # instead of per walk, leaving finds[][] in a state that broke
+        # the next clip. Three sequential clips reduce volume by 2× each
+        # — so vol = 1 → 0.5 → 0.25 → 0.125 across three orthogonal
+        # half-space clips of a unit D-box.
+        for D in 4:6
+            buf = R3D.Flat.FlatPolytope{D,Float64}(128)
+            R3D.Flat.init_box!(buf, zeros(D), ones(D))
+            for axis in 1:3
+                R3D.Flat.clip!(buf, [R3D.Plane{D,Float64}(
+                    R3D.Vec{D,Float64}(ntuple(k -> k == axis ? 1.0 : 0.0, D)),
+                    -0.5)])
+                @test isapprox(R3D.Flat.volume(buf), 1.0 / 2^axis;
+                               atol=1e-12, rtol=1e-10)
+            end
+        end
+    end
+
     @testset "Phase 3 groundwork: D ≥ 4 constructors + num_moments" begin
         # init_box for D = 4, 5, 6 — bit-hack vertex enumeration
         for D in 4:6

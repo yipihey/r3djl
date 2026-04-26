@@ -7,6 +7,41 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### `voxelize_fold!` / `voxelize!` extended to D ≥ 4 (order = 0)
+
+- D-generic `get_ibox`, `voxelize_fold!`, and `voxelize!` for D = 4, 5, 6.
+  Same callback contract as the lower-dimension versions:
+  `state = callback(state, idx::NTuple{D,Int}, m::AbstractVector{T})`
+  per non-empty leaf cell.
+- Per-split implementation uses a "two-clips" shortcut (copy `cur`
+  to `out1`, then in-place clip `cur` for `out0` with the negative-half
+  plane and clip `out1` with the positive-half plane) instead of
+  porting `split_coord!` to D ≥ 4. ~2× the per-split work of a true
+  in-place split, but reuses the already-debugged D ≥ 4 `clip!`
+  kernel. Trivial to swap in a real `split_coord!` later.
+- Order limitation: only `order = 0` (volume) at D ≥ 4 today —
+  higher-order moments need the deferred Lasserre / D-generic Koehl
+  port. `order ≥ 1` raises a clear `AssertionError`.
+- Closed-form tests at D = 4, 5, 6: unit D-box voxelized over an
+  N^D grid sums to 1.0 and every cell equals 1/N^D.
+
+### Bug fix: D ≥ 4 `clip!` linker corrupted `finds[][]` on sequential clips
+
+- The inside-loop branch in the 2-face boundary walker was
+  incrementing `nfaces` per traversal step rather than per walk. Each
+  walk should commit ONE new face ID and assign it to all the
+  patches along the boundary; the upstream C version increments
+  `*nfaces` only after the do-while loop. The Julia port now caches
+  the new face ID before the walk and increments only at the end.
+- Symptom: a single clip on a fresh polytope produced correct results
+  (the existing 100-trial diff-vs-C testset stayed green), but a
+  second clip on the resulting polytope raised
+  `_find_face_in_finds_row: face not in row of vertex`. Voxelization
+  exposed this because it does many sequential clips on copies of
+  the same polytope.
+- New regression test: three orthogonal half-space clips of a unit
+  D-box at D = 4, 5, 6 give the expected volumes (0.5, 0.25, 0.125).
+
 ### `voxelize_fold!` — basis-agnostic leaf-callback hook
 
 - New `R3D.Flat.voxelize_fold!(callback, state, poly, ibox_lo, ibox_hi,

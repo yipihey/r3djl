@@ -904,6 +904,200 @@ function voxelize(poly::FlatPolytope{3,T}, d::NTuple{3,T}, order::Int;
 end
 
 # ===========================================================================
+# D ≥ 4 voxelize_fold! / voxelize! / get_ibox.
+#
+# Implementation note: the per-split step uses the "two-clips" pattern
+# (copy `cur` into `out0` then `clip!` it with the kept-side plane;
+# repeat for `out1` with the negated plane) instead of porting
+# `split_coord!` to D ≥ 4. This costs ~2× the per-split work compared
+# to a true `split_coord!` port (~250 LOC of finds[][] propagation),
+# but reuses the already-debugged D ≥ 4 `clip!` kernel and ships
+# correctness immediately. Swap in a real `split_coord!` later if perf
+# matters.
+#
+# Leaf moment vector at D ≥ 4 has length 1 (only order = 0 is supported
+# today via `_reduce_nd_zeroth!`); higher orders raise the same
+# informative error as elsewhere. Useful operations the consumer can
+# fold include "sum polytope volume into each cell", "histogram cells
+# by polytope mass", "max-fold for visualization", etc.
+# ===========================================================================
+
+# Copy positions + pnbrs + finds + nverts. Used by the D ≥ 4 voxelize
+# split step when copying `cur` into the two output halves before
+# clipping each.
+@inline function _copy_polytope_nd!(dst::FlatPolytope{D,T},
+                                     src::FlatPolytope{D,T}) where {D,T}
+    @assert D >= 4 "use _copy_polytope! / _copy_polytope_2d! for lower dimensions"
+    n = src.nverts
+    @assert dst.capacity >= n
+    @inbounds for v in 1:n
+        for k in 1:D
+            dst.positions[k, v] = src.positions[k, v]
+            dst.pnbrs[k, v]     = src.pnbrs[k, v]
+        end
+        for j in 1:D, i in 1:D
+            dst.finds[i, j, v] = src.finds[i, j, v]
+        end
+    end
+    dst.nverts = n
+    dst.nfaces = src.nfaces
+    return dst
+end
+
+"""
+    get_ibox(poly::FlatPolytope{D,T}, d::NTuple{D,T}) -> (lo, hi) where {D ≥ 4}
+
+D-generic bounding-box index range. Returns `NTuple{D,Int}` corners
+`floor.(min_pos ./ d)` and `ceil.(max_pos ./ d)`.
+"""
+function get_ibox(poly::FlatPolytope{D,T}, d::NTuple{D,T}) where {D,T}
+    @assert D >= 4 "use the D=2 / D=3 get_ibox methods for those dimensions"
+    poly.nverts <= 0 && return (ntuple(_ -> 0, Val(D)), ntuple(_ -> 0, Val(D)))
+    lo = ntuple(_ -> T(Inf),  Val(D))
+    hi = ntuple(_ -> T(-Inf), Val(D))
+    @inbounds for v in 1:poly.nverts
+        lo = ntuple(k -> min(lo[k], poly.positions[k, v]), Val(D))
+        hi = ntuple(k -> max(hi[k], poly.positions[k, v]), Val(D))
+    end
+    lo_i = ntuple(k -> Int(floor(lo[k] / d[k])), Val(D))
+    hi_i = ntuple(k -> Int(ceil(hi[k]  / d[k])), Val(D))
+    return (lo_i, hi_i)
+end
+
+"""
+    voxelize_fold!(callback::F, state, poly::FlatPolytope{D,T},
+                   ibox_lo::NTuple{D,Int}, ibox_hi::NTuple{D,Int},
+                   d::NTuple{D,T}, order::Int;
+                   workspace = nothing) where {F,D,T} -> state
+
+D-generic (D ≥ 4) leaf-callback voxelization. At each non-empty leaf
+cell with index tuple `idx::NTuple{D,Int}` (1-based, relative to
+`ibox_lo`), calls
+
+    state = callback(state, idx, m)
+
+where `m` is the per-leaf moment vector of length `num_moments(D, order)`.
+
+**Order limitation at D ≥ 4**: only `order = 0` is supported today
+(higher-order moments need Lasserre or a D-generic Koehl port — see
+`docs/phase3_status.md`). At order = 0, `m` has length 1 and
+`m[1]` is the polytope's intersection volume in the leaf cell.
+
+The recursion uses a two-clips-per-split shortcut instead of a true
+`split_coord!` port to D ≥ 4 — correct but ~2× the per-split work
+of an in-place split. Performance-tune if a real use case needs it.
+"""
+function voxelize_fold!(callback::F,
+                        state,
+                        poly::FlatPolytope{D,T},
+                        ibox_lo::NTuple{D,Int}, ibox_hi::NTuple{D,Int},
+                        d::NTuple{D,T}, order::Int;
+                        workspace::Union{Nothing,VoxelizeWorkspace{D,T}} = nothing
+                        ) where {F,D,T}
+    @assert D >= 4 "use the D=2 / D=3 voxelize_fold! methods for those dimensions"
+    @assert order == 0 "voxelize_fold! at D = $D currently supports only order = 0; " *
+                       "higher-order moments are tracked in docs/phase3_status.md"
+    poly.nverts <= 0 && return state
+    sizes = ntuple(k -> ibox_hi[k] - ibox_lo[k], Val(D))
+    any(s -> s <= 0, sizes) && return state
+
+    ws = workspace === nothing ? VoxelizeWorkspace{D,T}(poly.capacity) : workspace
+    log2c(x) = x <= 1 ? 0 : ceil(Int, log2(x))
+    max_depth = sum(log2c, sizes) + 2
+    _ensure_stack!(ws, max_depth)
+    moments_buf = _ensure_voxelize_moment_scratch!(ws, order)
+
+    _copy_polytope_nd!(ws.polys[1], poly)
+    ws.iboxes[1] = (ibox_lo, ibox_hi)
+    nstack = 1
+
+    @inbounds while nstack > 0
+        cur = ws.polys[nstack]
+        lo, hi = ws.iboxes[nstack]
+        nstack -= 1
+
+        cur.nverts <= 0 && continue
+
+        # Find the longest axis to split.
+        spax = 1; dmax = hi[1] - lo[1]
+        for k in 2:D
+            s = hi[k] - lo[k]
+            if s > dmax
+                dmax = s; spax = k
+            end
+        end
+
+        if dmax == 1
+            moments!(moments_buf, cur, order)
+            idx = ntuple(k -> lo[k] - ibox_lo[k] + 1, Val(D))
+            state = callback(state, idx, moments_buf)
+            continue
+        end
+
+        # Bisect along spax at the midpoint cell boundary; allocate two
+        # output slots and use two clips instead of a true split_coord!.
+        half = dmax >> 1
+        split_index = lo[spax] + half
+        split_pos = T(split_index) * d[spax]
+
+        if nstack + 2 > length(ws.polys)
+            _ensure_stack!(ws, nstack + 2)
+        end
+        # `cur === ws.polys[nstack+1]` because the workspace stack reuses
+        # the popped slot. Save `cur` into `out1` (a fresh slot) BEFORE
+        # we clip `cur` in place to become `out0`.
+        out0 = ws.polys[nstack + 1]   # alias of cur — becomes negative half
+        out1 = ws.polys[nstack + 2]   # fresh slot — gets positive half
+
+        n_pos = ntuple(k -> k == spax ? T(1) : T(0), Val(D))
+        n_neg = ntuple(k -> k == spax ? T(-1) : T(0), Val(D))
+        plane_pos = Plane{D,T}(Vec{D,T}(n_pos), -split_pos)
+        plane_neg = Plane{D,T}(Vec{D,T}(n_neg),  split_pos)
+
+        _copy_polytope_nd!(out1, cur)
+        clip!(out0, [plane_neg])     # cur (=out0) clipped in place
+        clip!(out1, [plane_pos])
+
+        hi_left  = ntuple(k -> k == spax ? split_index : hi[k], Val(D))
+        lo_right = ntuple(k -> k == spax ? split_index : lo[k], Val(D))
+        ws.iboxes[nstack + 1] = (lo, hi_left)
+        ws.iboxes[nstack + 2] = (lo_right, hi)
+        nstack += 2
+    end
+    return state
+end
+
+"""
+    voxelize!(dest_grid::AbstractArray{T,DG}, poly::FlatPolytope{D,T},
+              ibox_lo::NTuple{D,Int}, ibox_hi::NTuple{D,Int},
+              d::NTuple{D,T}, order::Int; workspace = nothing) where {D ≥ 4}
+
+D-generic voxelization (D ≥ 4). `dest_grid` is shape `(nmom, n1, n2, …, nD)`
+with `DG = D + 1`; only `order = 0` is supported today, so `nmom = 1`.
+
+Implemented as a thin wrapper over [`voxelize_fold!`](@ref).
+"""
+function voxelize!(dest_grid::AbstractArray{T},
+                   poly::FlatPolytope{D,T},
+                   ibox_lo::NTuple{D,Int}, ibox_hi::NTuple{D,Int},
+                   d::NTuple{D,T}, order::Int;
+                   workspace::Union{Nothing,VoxelizeWorkspace{D,T}} = nothing
+                   ) where {D,T}
+    @assert D >= 4 "use the D=2 / D=3 voxelize! methods for those dimensions"
+    @assert ndims(dest_grid) == D + 1 "voxelize! D=$D needs a $(D+1)-dim grid"
+    nmom = num_moments(D, order)
+    @assert size(dest_grid, 1) == nmom
+    voxelize_fold!(dest_grid, poly, ibox_lo, ibox_hi, d, order;
+                   workspace = workspace) do grid, idx, m
+        @inbounds for mi in 1:length(m)
+            grid[mi, idx...] += m[mi]
+        end
+        return grid
+    end
+    return dest_grid
+end
+
+# ===========================================================================
 # D = 2 — same SoA buffer machinery, parallel set of methods mirroring
 # `src/r2d.c` and `src/v2d.c`. Notation in this block follows the 2D code:
 # `pnbrs[k, v]` for k ∈ {1, 2}; pnbrs == 0 is the "unset" sentinel
@@ -3321,34 +3515,29 @@ function _clip_plane_nd!(poly::FlatPolytope{D,T}, plane::Plane{D,T}) where {D,T}
                                                 # was inserted onto.
         prevnewvert = vstart
 
-        # Walk until we return to vstart.
+        # Walk until we return to vstart. The new-face ID for this walk
+        # is `nfaces + 1`; every patch along the walk (both inside-loop
+        # at intermediate new vertices AND the final close-loop patch)
+        # uses the SAME ID — they all belong to the single 2-face the
+        # walk is tracing. Only after the walk completes do we increment
+        # `nfaces` once to make this ID committed and pick a fresh one
+        # for the next walk.
+        new_fid = Int32(nfaces + 1)
         while true
             if vcur > onv
-                # Reached another new vertex along the boundary.
-                # Find which slot of vcur (in row 0 / column 0) carries
-                # `fcur`, and similarly for prevnewvert; then `np` is
-                # the slot in vcur whose finds[0][np] = fadj.
                 pprev = _find_face_in_row0(poly, vcur, fcur, D)
                 pnext = _find_face_in_row0(poly, prevnewvert, fcur, D)
                 npx   = _find_face_in_row0(poly, vcur, fadj, D)
-                # Patch the new pnbrs link (vcur ↔ prevnewvert) and the
-                # new face ID into both vertices' finds.
                 poly.pnbrs[pprev, vcur]            = Int32(prevnewvert)
                 poly.pnbrs[pnext, prevnewvert]     = Int32(vcur)
-                nfaces += 1
-                poly.finds[pprev, npx, vcur]       = Int32(nfaces)
-                poly.finds[npx, pprev, vcur]       = Int32(nfaces)
-                # Swap fcur ↔ fadj.
+                poly.finds[pprev, npx, vcur]       = new_fid
+                poly.finds[npx, pprev, vcur]       = new_fid
+                # Swap fcur ↔ fadj for the next leg.
                 fcur, fadj = fadj, fcur
                 prevnewvert = vcur
                 vprev = vcur
                 vcur  = Int(poly.pnbrs[1, vcur])
             end
-            # Now vcur is an original (kept) vertex. Find:
-            #  pprev = slot of vcur pointing back to vprev
-            #  pnext = slot of vcur such that finds[pprev][pnext] == fcur
-            #  npx   = slot of vcur such that finds[npx][pprev] == fadj
-            # Then advance fadj := finds[npx][pnext], walk to pnbrs[pnext].
             pprev = _find_pnbr_slot_or0(poly, vcur, vprev, D)
             pnext = _find_face_in_finds_row(poly, vcur, pprev, fcur, D)
             npx   = _find_face_in_finds_col(poly, vcur, pprev, fadj, D)
@@ -3357,16 +3546,16 @@ function _clip_plane_nd!(poly::FlatPolytope{D,T}, plane::Plane{D,T}) where {D,T}
             vcur  = Int(poly.pnbrs[pnext, vcur])
             vcur == vstart && break
         end
-        # Close the loop: same patch as the inside-loop "new vertex"
-        # branch, but executed once at the end with vcur == vstart.
+        # Final close patch (same shape as inside-loop branch, with the
+        # same `new_fid`).
         pprev = _find_face_in_row0(poly, vcur, fcur, D)
         pnext = _find_face_in_row0(poly, prevnewvert, fcur, D)
         npx   = _find_face_in_row0(poly, vcur, fadj, D)
         poly.pnbrs[pprev, vcur]        = Int32(prevnewvert)
         poly.pnbrs[pnext, prevnewvert] = Int32(vcur)
+        poly.finds[pprev, npx, vcur]   = new_fid
+        poly.finds[npx, pprev, vcur]   = new_fid
         nfaces += 1
-        poly.finds[pprev, npx, vcur]   = Int32(nfaces)
-        poly.finds[npx, pprev, vcur]   = Int32(nfaces)
     end
     poly.nfaces = nfaces
 

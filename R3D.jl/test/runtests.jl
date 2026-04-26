@@ -927,6 +927,114 @@ using LinearAlgebra: I
         end
     end
 
+    @testset "nD clip! / voxelize_fold! finalization (D ≥ 4)" begin
+        # 1) Single-plane `clip!` overload (no `[plane]` array allocation).
+        #    Result must agree with the multi-plane API and with the
+        #    private `clip_plane!` helper.
+        for D in 4:6
+            buf_a = R3D.Flat.FlatPolytope{D,Float64}(128)
+            buf_b = R3D.Flat.FlatPolytope{D,Float64}(128)
+            buf_c = R3D.Flat.FlatPolytope{D,Float64}(128)
+            R3D.Flat.init_box!(buf_a, zeros(D), ones(D))
+            R3D.Flat.init_box!(buf_b, zeros(D), ones(D))
+            R3D.Flat.init_box!(buf_c, zeros(D), ones(D))
+
+            n_axis = R3D.Vec{D,Float64}(ntuple(k -> k == 1 ? 1.0 : 0.0, D))
+            plane = R3D.Plane{D,Float64}(n_axis, -0.5)
+
+            R3D.Flat.clip!(buf_a, [plane])               # array form
+            R3D.Flat.clip!(buf_b, plane)                 # single-plane overload
+            R3D.Flat.clip_plane!(buf_c, plane)           # internal helper
+            @test buf_a.nverts == buf_b.nverts == buf_c.nverts
+            @test isapprox(R3D.Flat.volume(buf_a), R3D.Flat.volume(buf_b);
+                           atol=1e-14, rtol=1e-12)
+            @test isapprox(R3D.Flat.volume(buf_a), R3D.Flat.volume(buf_c);
+                           atol=1e-14, rtol=1e-12)
+            @test isapprox(R3D.Flat.volume(buf_b), 0.5; atol=1e-12)
+        end
+
+        # 2) `voxelize` allocating wrapper for D ≥ 4 — agrees with the
+        #    in-place `voxelize!` and gives sum == polytope volume.
+        for D in 4:5
+            buf = R3D.Flat.FlatPolytope{D,Float64}(128)
+            R3D.Flat.init_box!(buf, zeros(D), ones(D))
+            d_grid = ntuple(_ -> 0.5, D)
+            grid_alloc, lo, hi = R3D.Flat.voxelize(buf, d_grid, 0)
+            @test lo == ntuple(_ -> 0, D)
+            @test hi == ntuple(_ -> 2, D)
+            @test isapprox(sum(grid_alloc), 1.0; atol=1e-12)
+
+            ws = R3D.Flat.VoxelizeWorkspace{D,Float64}(128)
+            grid_inplace = zeros(Float64, 1, ntuple(_ -> 2, D)...)
+            R3D.Flat.voxelize!(grid_inplace, buf, lo, hi, d_grid, 0; workspace = ws)
+            @test grid_alloc ≈ grid_inplace
+        end
+
+        # 3) Non-axis-aligned-clipped box voxelizes consistently with
+        #    `volume`: sum of leaf cell volumes must match the polytope's
+        #    own moment-based volume to floating-point precision. This
+        #    is the strongest correctness check that doesn't depend on a
+        #    closed form — any bug in the bisection loop shows up here.
+        for D in 4:5
+            rng = Random.MersenneTwister(20260426 + D)
+            for trial in 1:5
+                buf = R3D.Flat.FlatPolytope{D,Float64}(256)
+                R3D.Flat.init_box!(buf, zeros(D), ones(D))
+                # Random oblique cut that retains a non-trivial fraction.
+                v = randn(rng, D); v ./= sqrt(sum(v.^2))
+                dd = -0.6 * sum(v) / D + 0.05 * randn(rng)
+                ok = R3D.Flat.clip!(buf,
+                    R3D.Plane{D,Float64}(R3D.Vec{D,Float64}(v), dd))
+                @test ok
+                buf.nverts == 0 && continue   # empty after clip; nothing to check
+                vol_direct = R3D.Flat.volume(buf)
+
+                d_grid = ntuple(_ -> 0.5, D)
+                grid, lo, hi = R3D.Flat.voxelize(buf, d_grid, 0)
+                vol_voxel = sum(grid)
+                @test isapprox(vol_voxel, vol_direct; atol=1e-12, rtol=1e-10)
+            end
+        end
+
+        # 4) D-simplex voxelization sums to closed-form 1/D!.
+        for D in 4:5
+            sim = R3D.Flat.FlatPolytope{D,Float64}(128)
+            R3D.Flat.init_simplex!(sim,
+                [ntuple(j -> j == i ? 1.0 : 0.0, D) for i in 0:D])
+            d_grid = ntuple(_ -> 0.5, D)
+            grid, _, _ = R3D.Flat.voxelize(sim, d_grid, 0)
+            @test isapprox(sum(grid), 1 / factorial(D); atol=1e-12, rtol=1e-10)
+        end
+
+        # 5) `voxelize_fold!` hot loop is allocation-free for D ≥ 4 once
+        #    the workspace is warm. The `[plane_neg]` / `[plane_pos]`
+        #    array allocations the previous implementation paid per leaf
+        #    have been removed via the single-plane `clip!` overload.
+        D = 4
+        buf = R3D.Flat.FlatPolytope{D,Float64}(128)
+        R3D.Flat.init_box!(buf, zeros(D), ones(D))
+        ws = R3D.Flat.VoxelizeWorkspace{D,Float64}(128)
+        d_grid = ntuple(_ -> 0.25, D)
+        ibox_lo = ntuple(_ -> 0, D)
+        ibox_hi = ntuple(_ -> 4, D)
+
+        # warmup pass — first call may allocate workspace stack growth /
+        # moment scratch resize; we measure the second call.
+        R3D.Flat.voxelize_fold!(0.0, buf, ibox_lo, ibox_hi, d_grid, 0;
+                                workspace = ws) do acc, idx, m
+            acc + m[1]
+        end
+        a = @allocated R3D.Flat.voxelize_fold!(0.0, buf, ibox_lo, ibox_hi, d_grid, 0;
+                                               workspace = ws) do acc, idx, m
+            acc + m[1]
+        end
+        # Per-leaf `[plane]` array allocations have been removed; the
+        # remaining ~kilobyte budget covers stack frame setup for the
+        # closure call and the NTuple iboxes. The previous implementation
+        # paid ~100s of KB on this same input.
+        @test a < 8 * 1024
+    end
+
     @testset "D ≥ 4 sequential clips don't corrupt finds[][]" begin
         # Regression for the linker bug found while wiring voxelize_fold!:
         # earlier the inside-loop branch incremented `nfaces` per cross

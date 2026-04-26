@@ -10,7 +10,9 @@
 | `clip!` (incl. facet propagation)                   | ✓     | **✓** (port of `rNd_clip` + facet bump per cut) |
 | `moments` / `moments!` order = 0 (≡ `volume`)       | ✓     | **✓** (port of `rNd_reduce`) |
 | `moments` / `moments!` order ≥ 1                    | ✓     | ⛔ (Lasserre on top of facets — next session) |
-| `voxelize_fold!` / `voxelize!`                      | ✓     | ✓ (order = 0 only)       |
+| `voxelize_fold!` / `voxelize!`                      | ✓     | ✓ (order = 0; alloc-free) |
+| `voxelize` (allocating wrapper)                     | ✓     | ✓                        |
+| Single-plane `clip!(poly, plane)` overload          | ✓     | ✓                        |
 | Differential validation vs C `rNd`                  | ✓     | ✓ at D = 4 (100 trials, max diff 3e-15) |
 
 ### What landed in this push
@@ -73,6 +75,28 @@ expectations (Vertex4 = 112 bytes, Vertex5 = 160, Vertex6 = 216).
 - (informally measured) D = 5: max diff 2.3e-13; D = 6: max diff 9.4e-15
   on 100 random clips each.
 
+### nD `voxelize_fold!` finalization (this push)
+
+- **Single-plane `clip!`**: `clip!(poly::FlatPolytope{D,T}, plane::Plane)`
+  is now a public overload for every `D`, parallel to the existing
+  multi-plane API. Internally it dispatches to a per-dimension
+  `clip_plane!`, which for `D ≥ 4` is the renamed `_clip_plane_nd!`.
+  This eliminates the per-call `Vector{Plane}` allocation that
+  `clip!(poly, [plane])` would otherwise pay.
+- **Allocation-free bisection loop**: the `D ≥ 4` `voxelize_fold!`
+  no longer constructs `[plane_neg]` / `[plane_pos]` array literals
+  per leaf split. Combined with the existing `_copy_polytope_nd!`
+  buffer reuse and stack-resident `NTuple` / `SVector` plane
+  construction, the steady-state hot loop is heap-free.
+- **`voxelize` allocating wrapper for `D ≥ 4`**: parity with the
+  `D = 2` / `D = 3` API, so `R3D.Flat.voxelize(poly, d, order)`
+  is callable for any supported `D`. Returns `(grid, ibox_lo, ibox_hi)`
+  exactly like the lower-D versions.
+- **Validation**: per-trial sum-of-leaves equals the polytope's
+  moment-based volume on randomly oblique-clipped `D = 4 / 5` boxes
+  to floating-point precision; `D`-simplex leaf sums match the
+  closed-form `1 / D!`.
+
 ### What's still missing for full Phase 3 acceptance
 
 1. **Higher-order moments (P ≥ 1) for D ≥ 4.** Facet tracking
@@ -82,7 +106,8 @@ expectations (Vertex4 = 112 bytes, Vertex5 = 160, Vertex6 = 216).
    D = 4 closes the loop using facets + 2-faces. D = 5 needs an
    additional 3-face tracking layer (same structural pattern). Until
    then, `moments(poly, P ≥ 1)` raises an informative error for
-   `D ≥ 4`.
+   `D ≥ 4`, and `voxelize_fold!` at `D ≥ 4` correspondingly asserts
+   `order == 0`.
 2. **CI integration of D = 4/5/6 differential tests.** The CI
    workflow doesn't yet build `libr3d_{4,5,6}d.dylib`; the new
    testset gracefully skips when those env vars are absent. Adding

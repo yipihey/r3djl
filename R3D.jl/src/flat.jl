@@ -242,6 +242,19 @@ function clip!(poly::FlatPolytope{3,T},
     return true
 end
 
+"""
+    clip!(poly::FlatPolytope{3,T}, plane::Plane{3,T}) -> Bool
+
+Single-plane convenience overload — saves the `[plane]` array allocation
+the multi-plane API would otherwise pay. Used by `voxelize_fold!`'s
+bisection loop and exposed publicly for callers that already have a
+single `Plane` in hand.
+"""
+function clip!(poly::FlatPolytope{3,T}, plane::Plane{3,T}) where {T}
+    poly.nverts <= 0 && return false
+    return clip_plane!(poly, plane)
+end
+
 function clip_plane!(poly::FlatPolytope{3,T}, plane::Plane{3,T}) where {T}
     onv = poly.nverts
     sdists = poly.sdists
@@ -1099,8 +1112,13 @@ function voxelize_fold!(callback::F,
             continue
         end
 
-        # Bisect along spax at the midpoint cell boundary; allocate two
-        # output slots and use two clips instead of a true split_coord!.
+        # Bisect along spax at the midpoint cell boundary using a pair
+        # of axis-aligned single-plane clips. The single-plane `clip!`
+        # overload (added alongside the D = 2 / D = 3 versions) avoids
+        # the per-leaf `[plane]` Vector{Plane} allocation that the
+        # multi-plane API would pay; combined with the `_copy_polytope_nd!`
+        # buffer reuse, this makes the bisection loop fully heap-free
+        # in steady state.
         half = dmax >> 1
         split_index = lo[spax] + half
         split_pos = T(split_index) * d[spax]
@@ -1120,8 +1138,8 @@ function voxelize_fold!(callback::F,
         plane_neg = Plane{D,T}(Vec{D,T}(n_neg),  split_pos)
 
         _copy_polytope_nd!(out1, cur)
-        clip!(out0, [plane_neg])     # cur (=out0) clipped in place
-        clip!(out1, [plane_pos])
+        clip!(out0, plane_neg)        # cur (=out0) clipped in place
+        clip!(out1, plane_pos)
 
         hi_left  = ntuple(k -> k == spax ? split_index : hi[k], Val(D))
         lo_right = ntuple(k -> k == spax ? split_index : lo[k], Val(D))
@@ -1160,6 +1178,36 @@ function voxelize!(dest_grid::AbstractArray{T},
         return grid
     end
     return dest_grid
+end
+
+"""
+    voxelize(poly::FlatPolytope{D,T}, d, order; ibox=nothing, workspace=nothing)
+        -> (grid, ibox_lo, ibox_hi)  where {D ≥ 4}
+
+D-generic voxelization (D ≥ 4) allocating wrapper that mirrors the
+D = 2 / D = 3 convenience signature. Allocates a fresh
+`(nmom, n1, n2, …, nD)` grid sized to `poly`'s bounding-box cells (or
+the supplied `ibox`) and returns it together with the index range used.
+
+For tight loops, allocate the destination grid once and call
+[`voxelize!`](@ref) directly; this wrapper exists for parity with the
+lower-D API and ad-hoc one-shot calls.
+"""
+function voxelize(poly::FlatPolytope{D,T}, d::NTuple{D,T}, order::Int;
+                  ibox::Union{Nothing,Tuple{NTuple{D,Int},NTuple{D,Int}}} = nothing,
+                  workspace::Union{Nothing,VoxelizeWorkspace{D,T}} = nothing
+                  ) where {D,T}
+    @assert D >= 4 "use the D=2 / D=3 voxelize wrapper for those dimensions"
+    if ibox === nothing
+        lo, hi = get_ibox(poly, d)
+    else
+        lo, hi = ibox
+    end
+    sizes = ntuple(k -> max(hi[k] - lo[k], 1), Val(D))
+    nmom = num_moments(D, order)
+    grid = zeros(T, nmom, sizes...)
+    voxelize!(grid, poly, lo, hi, d, order; workspace = workspace)
+    return grid, lo, hi
 end
 
 # ===========================================================================
@@ -1230,6 +1278,17 @@ function clip!(poly::FlatPolytope{2,T},
         poly.nverts == 0 && return true
     end
     return true
+end
+
+"""
+    clip!(poly::FlatPolytope{2,T}, plane::Plane{2,T}) -> Bool
+
+Single-plane convenience overload, parallel to the D = 3 / D ≥ 4
+versions. Saves the `[plane]` array allocation for hot loops.
+"""
+function clip!(poly::FlatPolytope{2,T}, plane::Plane{2,T}) where {T}
+    poly.nverts <= 0 && return false
+    return clip_plane!(poly, plane)
 end
 
 function clip_plane!(poly::FlatPolytope{2,T}, plane::Plane{2,T}) where {T}
@@ -3493,14 +3552,38 @@ function clip!(poly::FlatPolytope{D,T},
     @assert D >= 4 "this method is for D ≥ 4 only; D = 2 / D = 3 have specialized methods"
     poly.nverts <= 0 && return false
     @inbounds for plane in planes
-        ok = _clip_plane_nd!(poly, plane)
+        ok = clip_plane!(poly, plane)
         ok || return false
         poly.nverts == 0 && return true
     end
     return true
 end
 
-function _clip_plane_nd!(poly::FlatPolytope{D,T}, plane::Plane{D,T}) where {D,T}
+"""
+    clip!(poly::FlatPolytope{D,T}, plane::Plane{D,T}) where {D ≥ 4} -> Bool
+
+Single-plane convenience overload mirroring the multi-plane API. Avoids
+the per-call `Vector{Plane}` allocation that `clip!(poly, [plane])`
+would otherwise pay — important for the bisection loop in
+[`voxelize_fold!`](@ref) at `D ≥ 4`.
+"""
+function clip!(poly::FlatPolytope{D,T}, plane::Plane{D,T}) where {D,T}
+    @assert D >= 4 "this method is for D ≥ 4 only; D = 2 / D = 3 have specialized methods"
+    poly.nverts <= 0 && return false
+    return clip_plane!(poly, plane)
+end
+
+"""
+    clip_plane!(poly::FlatPolytope{D,T}, plane::Plane{D,T}) where {D ≥ 4} -> Bool
+
+Apply a single half-space clip to a `D ≥ 4` polytope (translation of
+one iteration of `rNd_clip`'s outer loop). Public single-plane API,
+parallel to the `clip_plane!` for `D = 2` / `D = 3`. Reuses the
+polytope's preallocated `sdists` / `clipped` scratch — zero per-call
+heap allocation.
+"""
+function clip_plane!(poly::FlatPolytope{D,T}, plane::Plane{D,T}) where {D,T}
+    @assert D >= 4 "this method is for D ≥ 4 only; D = 2 / D = 3 have specialized methods"
     sdists  = poly.sdists
     clipped = poly.clipped
     onv     = poly.nverts

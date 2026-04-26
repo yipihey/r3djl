@@ -117,12 +117,30 @@ mutable struct FlatPolytope{D,T}
     # `_reduce_helper_nd` call boundary). Empty for D ≤ 3, which use
     # `Sm`/`Dm`/`Cm` for moment integration instead.
     ltd_scratch::Matrix{T}
+
+    # Per-facet outward unit normal and signed distance (`d` in
+    # `n·x = d`) for D ≥ 4. Together they parameterize the facet's
+    # supporting hyperplane. Lasserre's higher-order moment recursion
+    # reads `(n_i · c_i)` for each facet — equivalently `d_i`, since
+    # any point `c_i` on the facet satisfies `n_i · c_i = d_i`.
+    # Shape: `D × facet_capacity` and `facet_capacity` respectively
+    # for D ≥ 4; empty for D ≤ 3 which don't use Lasserre. Indexed by
+    # facet ID 1..nfacets (slot 0 in `facets[k, v]` means "unset").
+    facet_normals::Matrix{T}
+    facet_distances::Vector{T}
 end
+
+# Initial allocation size for per-facet metadata (normals + distances)
+# at D ≥ 4. Grows lazily via `_grow_facet_metadata!` if a polytope
+# accumulates more facet IDs than this through clipping.
+const _FACET_INITIAL_CAPACITY = 64
 
 function FlatPolytope{D,T}(capacity::Int = 512) where {D,T}
     finds  = D >= 4 ? zeros(Int32, D, D, capacity) : Array{Int32,3}(undef, 0, 0, 0)
     facets = D >= 4 ? zeros(Int32, D,    capacity) : Matrix{Int32}(undef, 0, 0)
     ltd    = D >= 4 ? zeros(T,     D, D)           : Matrix{T}(undef, 0, 0)
+    fnormals = D >= 4 ? zeros(T, D, _FACET_INITIAL_CAPACITY) : Matrix{T}(undef, 0, 0)
+    fdistances = D >= 4 ? zeros(T,    _FACET_INITIAL_CAPACITY) : Vector{T}(undef, 0)
     FlatPolytope{D,T}(zeros(T, D, capacity),
                       zeros(Int32, D, capacity),
                       0, capacity,
@@ -137,7 +155,31 @@ function FlatPolytope{D,T}(capacity::Int = 512) where {D,T}
                       0,
                       facets,
                       0,
-                      ltd)
+                      ltd,
+                      fnormals,
+                      fdistances)
+end
+
+# Ensure `poly`'s facet-metadata storage holds at least `nfacets`
+# entries. Used by `_clip_plane_nd!` when a clip would push
+# `nfacets + 1` past the current allocation. Grows by doubling, like
+# `_ensure_stack!`.
+@inline function _grow_facet_metadata!(poly::FlatPolytope{D,T}, n::Int) where {D,T}
+    D >= 4 || return poly
+    cur_cap = size(poly.facet_normals, 2)
+    n <= cur_cap && return poly
+    new_cap = max(2 * cur_cap, n)
+    new_normals  = zeros(T, D, new_cap)
+    new_distances = zeros(T, new_cap)
+    @inbounds for j in 1:cur_cap, i in 1:D
+        new_normals[i, j] = poly.facet_normals[i, j]
+    end
+    @inbounds for j in 1:cur_cap
+        new_distances[j] = poly.facet_distances[j]
+    end
+    poly.facet_normals  = new_normals
+    poly.facet_distances = new_distances
+    return poly
 end
 
 """
@@ -989,6 +1031,15 @@ end
     dst.nverts  = n
     dst.nfaces  = src.nfaces
     dst.nfacets = src.nfacets
+
+    # Per-facet metadata: grow dst's storage to fit, then copy.
+    _grow_facet_metadata!(dst, src.nfacets)
+    @inbounds for j in 1:src.nfacets
+        for i in 1:D
+            dst.facet_normals[i, j] = src.facet_normals[i, j]
+        end
+        dst.facet_distances[j] = src.facet_distances[j]
+    end
     return dst
 end
 
@@ -3179,6 +3230,22 @@ function init_box!(poly::FlatPolytope{D,T},
         poly.facets[k, v + 1] = Int32(on_hi ? 2k : 2k - 1)
     end
     poly.nfacets = 2D
+
+    # Per-facet outward normals + signed distances (n · x = d).
+    # Facet 2k-1 ("x[k] = lo[k]") has outward normal -e_k and signed
+    # distance d = -lo[k]; facet 2k ("x[k] = hi[k]") has outward normal
+    # +e_k and signed distance d = hi[k]. Used by Lasserre's
+    # higher-order moments recursion at D ≥ 4.
+    _grow_facet_metadata!(poly, 2D)
+    @inbounds for j in 1:(2D), i in 1:D
+        poly.facet_normals[i, j] = zero(T)
+    end
+    @inbounds for k in 1:D
+        poly.facet_normals[k, 2k - 1]  = T(-1)
+        poly.facet_distances[2k - 1]   = -T(lo[k])
+        poly.facet_normals[k, 2k]      = T( 1)
+        poly.facet_distances[2k]       =  T(hi[k])
+    end
     return poly
 end
 
@@ -3241,6 +3308,100 @@ function init_simplex!(poly::FlatPolytope{D,T}, vertices) where {D,T}
         poly.facets[k, v] = poly.pnbrs[k, v]
     end
     poly.nfacets = nv
+
+    # Per-facet outward normals + signed distances. Facet `u` is opposite
+    # vertex u, so its supporting hyperplane is the affine span of the
+    # other D vertices. Compute the outward unit normal by Gram-Schmidt
+    # against (D − 1) facet edges, signed so n · v_u < n · (anything on
+    # facet u). Then d_u = n · (any point on facet u), e.g. the first
+    # non-u vertex.
+    _grow_facet_metadata!(poly, nv)
+    _init_simplex_facet_normals_nd!(poly, vertices, Val(D))
+    return poly
+end
+
+# Compute outward facet normals + signed distances for a freshly
+# initialized D-simplex. Each facet u is opposite vertex u; its
+# supporting hyperplane passes through every other vertex. Algorithm:
+# orthonormalize D − 1 edge vectors spanning facet u's tangent space
+# via classical Gram–Schmidt, then orthogonalize a candidate direction
+# (`base → v_u`) against the orthonormal basis, and normalize. Finally
+# orient outward by flipping sign (the residual of the base→v_u
+# projection points from the facet TOWARD v_u, which is INTO the
+# simplex; outward is the opposite).
+function _init_simplex_facet_normals_nd!(poly::FlatPolytope{D,T},
+                                          vertices, ::Val{D}) where {D,T}
+    nv = D + 1
+    work = MVector{D,T}(ntuple(_ -> zero(T), Val(D)))
+    edges = MMatrix{D, D, T}(zeros(T, D, D))   # columns 1..D-1 used
+    @inbounds for u in 1:nv
+        # Gather D−1 edges from a base facet vertex to the other facet
+        # vertices.
+        base_idx = (u == 1) ? 2 : 1
+        base = vertices[base_idx]
+        col = 0
+        for w in 1:nv
+            (w == u || w == base_idx) && continue
+            col += 1
+            for i in 1:D
+                edges[i, col] = T(vertices[w][i]) - T(base[i])
+            end
+        end
+
+        # Orthonormalize the edges: classical Gram–Schmidt.
+        for c in 1:(D - 1)
+            for cprev in 1:(c - 1)
+                dotp = zero(T)
+                for i in 1:D
+                    dotp += edges[i, c] * edges[i, cprev]
+                end
+                for i in 1:D
+                    edges[i, c] -= dotp * edges[i, cprev]
+                end
+            end
+            len2 = zero(T)
+            for i in 1:D
+                len2 += edges[i, c] * edges[i, c]
+            end
+            len = sqrt(len2)
+            @assert len > eps(T) "degenerate D-simplex facet at vertex $u: edges are linearly dependent"
+            for i in 1:D
+                edges[i, c] /= len
+            end
+        end
+
+        # Candidate direction: base → v_u. After projecting out the
+        # tangent components, `work` is orthogonal to facet u and
+        # points from base toward v_u — i.e., INWARD across the facet.
+        for i in 1:D
+            work[i] = T(vertices[u][i]) - T(base[i])
+        end
+        for c in 1:(D - 1)
+            dotp = zero(T)
+            for i in 1:D
+                dotp += work[i] * edges[i, c]
+            end
+            for i in 1:D
+                work[i] -= dotp * edges[i, c]
+            end
+        end
+
+        # Normalize and flip sign for outward orientation.
+        len2 = zero(T)
+        for i in 1:D
+            len2 += work[i] * work[i]
+        end
+        len = sqrt(len2)
+        @assert len > eps(T)
+        for i in 1:D
+            poly.facet_normals[i, u] = -work[i] / len
+        end
+        d_u = zero(T)
+        for i in 1:D
+            d_u += poly.facet_normals[i, u] * T(base[i])
+        end
+        poly.facet_distances[u] = d_u
+    end
     return poly
 end
 
@@ -3818,8 +3979,27 @@ function clip_plane!(poly::FlatPolytope{D,T}, plane::Plane{D,T}) where {D,T}
     # If we got past the trivial accept/reject checks, at least one
     # edge was cut (the polytope is connected and has vertices on both
     # sides), so we have inserted at least one new vertex onto the cut
-    # facet. Commit the new facet ID.
+    # facet. Commit the new facet ID and stash its supporting hyperplane
+    # for Lasserre's higher-order moments recursion. The clip-plane's
+    # `n` and `d` already give the cut hyperplane: `n · x + d = 0` ⇒
+    # `n · x = -d`, but our convention stores facet normals pointing
+    # OUTWARD of the kept half-space. Plane `n` points INTO the kept
+    # half-space (positive sdists are kept), so the outward facet
+    # normal is `-n` and the matching signed distance is `-(-d) = d`?
+    # Re-derive carefully: the kept set is {x : n·x + d ≥ 0}, i.e.,
+    # {x : n·x ≥ -d}. The outward normal of the cut facet (pointing
+    # AWAY from kept) is `-n`, and any point on the facet satisfies
+    # `(-n) · x = -(-d) = d`... no, `n · x = -d` ⇒ `(-n) · x = d`.
+    # So outward_n · x = d for points on the cut, i.e., the signed
+    # distance is `d`. (Equivalently, the new facet's outward
+    # half-space is the discarded side.)
     poly.nfacets += 1
+    new_id = poly.nfacets
+    _grow_facet_metadata!(poly, new_id)
+    @inbounds for i in 1:D
+        poly.facet_normals[i, new_id] = -plane.n[i]
+    end
+    @inbounds poly.facet_distances[new_id] = plane.d
 
     # --- Step 4: walk 2-face boundaries to close all new 2-faces.
     # For each new vertex `vstart` and each pair of unset slot-pairs

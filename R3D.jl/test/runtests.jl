@@ -856,6 +856,118 @@ using LinearAlgebra: I
         end
     end
 
+    @testset "R3D.Flat facet normals + signed distances (D ≥ 4, Phase A foundation)" begin
+        # Box facets: outward axis-aligned, signed-distance matches
+        # the corresponding lo/hi coordinate.
+        for D in 4:6
+            lo = ntuple(k -> 0.1 * k, D)
+            hi = ntuple(k -> 1.0 + 0.1 * k, D)
+            buf = R3D.Flat.FlatPolytope{D,Float64}(256)
+            R3D.Flat.init_box!(buf, [lo...], [hi...])
+            for k in 1:D
+                # Facet 2k-1: x[k] = lo[k], outward normal -e_k, d = -lo[k]
+                @test buf.facet_normals[k, 2k - 1]   == -1.0
+                @test buf.facet_distances[2k - 1]    == -lo[k]
+                for j in 1:D
+                    j == k && continue
+                    @test buf.facet_normals[j, 2k - 1] == 0.0
+                end
+                # Facet 2k: x[k] = hi[k], outward normal +e_k, d = hi[k]
+                @test buf.facet_normals[k, 2k]       ==  1.0
+                @test buf.facet_distances[2k]        ==  hi[k]
+            end
+            # Sanity: every facet vertex satisfies n·v == d; non-facet
+            # vertices satisfy n·v < d (outward).
+            for f in 1:buf.nfacets, v in 1:buf.nverts
+                np = sum(buf.facet_normals[k, f] * buf.positions[k, v] for k in 1:D)
+                on_facet = any(k -> buf.facets[k, v] == f, 1:D)
+                if on_facet
+                    @test isapprox(np, buf.facet_distances[f]; atol = 1e-12)
+                else
+                    @test np < buf.facet_distances[f] - 1e-12
+                end
+            end
+        end
+
+        # Simplex facets: opposite vertex u, outward unit normal computed
+        # via Gram-Schmidt against the D − 1 in-facet edges.
+        for D in 4:6
+            verts = [ntuple(j -> j == i ? 1.0 : 0.0, D) for i in 0:D]
+            sim = R3D.Flat.FlatPolytope{D,Float64}(64)
+            R3D.Flat.init_simplex!(sim, verts)
+            for f in 1:sim.nfacets
+                # Unit length
+                norm2 = sum(sim.facet_normals[k, f]^2 for k in 1:D)
+                @test isapprox(norm2, 1.0; atol = 1e-12)
+                # On-facet vertices satisfy n·v == d; the opposite vertex
+                # (vertex f, since facet u is opposite vertex u) is
+                # strictly inside the kept half-space (n·v < d).
+                for v in 1:sim.nverts
+                    np = sum(sim.facet_normals[k, f] * sim.positions[k, v] for k in 1:D)
+                    on_facet = any(k -> sim.facets[k, v] == f, 1:D)
+                    if on_facet
+                        @test isapprox(np, sim.facet_distances[f]; atol = 1e-12)
+                    else
+                        @test np < sim.facet_distances[f] - 1e-12
+                    end
+                end
+            end
+            # Spot check the unit D-simplex (origin + D unit basis vectors):
+            # the facet OPPOSITE the origin (vertex 1 in our 1-indexed
+            # convention) is `x_1 + x_2 + ... + x_D = 1`, so its outward
+            # unit normal is (1,1,…,1)/√D and d = 1/√D.
+            invsqrtD = 1.0 / sqrt(Float64(D))
+            for k in 1:D
+                @test isapprox(sim.facet_normals[k, 1], invsqrtD; atol = 1e-12)
+            end
+            @test isapprox(sim.facet_distances[1], invsqrtD; atol = 1e-12)
+        end
+
+        # `clip!` propagation: a single cut on a unit D-box adds one
+        # facet whose stored (n, d) matches the clip plane's
+        # outward-normal-of-discarded-side / signed-distance pair.
+        # For `n·x + d ≥ 0` (kept set), the cut facet's outward
+        # normal is `-n` and its signed distance is `d` (since the
+        # facet sits at `n·x = -d`, equivalently `(-n)·x = d`).
+        for D in 4:6
+            buf = R3D.Flat.FlatPolytope{D,Float64}(256)
+            R3D.Flat.init_box!(buf, zeros(D), ones(D))
+            n = R3D.Vec{D,Float64}(ntuple(k -> k == 1 ? 1.0 : 0.0, D))
+            R3D.Flat.clip!(buf, [R3D.Plane{D,Float64}(n, -0.5)])
+            new_id = buf.nfacets
+            # Outward normal points to the discarded side (x[1] < 0.5),
+            # i.e. `-e_1`. Signed distance of facet at x[1] = 0.5 in
+            # outward direction: (-1) * 0.5 = -0.5. That matches
+            # plane.d = -0.5 by our convention.
+            @test buf.facet_normals[1, new_id] == -1.0
+            for k in 2:D
+                @test buf.facet_normals[k, new_id] == 0.0
+            end
+            @test buf.facet_distances[new_id] == -0.5
+            # Sanity: all post-clip vertices satisfy
+            # outward_n · v ≤ d_new (kept side).
+            for v in 1:buf.nverts
+                np = sum(buf.facet_normals[k, new_id] * buf.positions[k, v]
+                         for k in 1:D)
+                @test np <= buf.facet_distances[new_id] + 1e-12
+            end
+        end
+
+        # `_copy_polytope_nd!` carries facet metadata across copies
+        # (used by voxelize_fold!'s two-clips-per-split pattern).
+        src = R3D.Flat.box((0.0, 0.0, 0.0, 0.0), (1.0, 1.0, 1.0, 1.0))
+        R3D.Flat.clip!(src, [R3D.Plane{4,Float64}(R3D.Vec{4,Float64}(1.0, 0, 0, 0), -0.5)])
+        dst = R3D.Flat.FlatPolytope{4,Float64}(256)
+        R3D.Flat.copy!(dst, src)
+        @test dst.nfacets == src.nfacets
+        for f in 1:src.nfacets
+            for k in 1:4
+                @test dst.facet_normals[k, f] == src.facet_normals[k, f]
+            end
+            @test dst.facet_distances[f] == src.facet_distances[f]
+        end
+    end
+
     @testset "R3D.Flat ND (D ≥ 4) — clip + 0th-moment closed forms + diff vs C" begin
         # Closed-form: unit D-simplex volume = 1/D!, unit D-box volume = 1.
         for D in 4:6

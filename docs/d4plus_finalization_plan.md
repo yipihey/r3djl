@@ -11,7 +11,9 @@
 | `755060d` | **Phase A foundation** — `facet_normals` + `facet_distances` fields on `FlatPolytope` populated by `init_box!` / `init_simplex!` / `_clip_plane_nd!` / `_copy_polytope_nd!`. |
 | `bd3e0d2` | **Phase A** — Lasserre higher-order moments at D = 4 (P ≥ 1), validated to closed-form on simplex + box for P ∈ {1, 2, 3}. |
 | `a955ce4` | Symmetric companion to the c4496ab clip!-on-boundary-vertex fix, surfaced via voxelize_fold! at non-power-of-2 grid sizes. |
-| `(this push)` | **Phase B.1** — `split_coord!` D ≥ 4 public API (wrapper over `clip_plane!`). voxelize_fold! D ≥ 4 refactored to use it. |
+| `86e51da` | **Phase B.1** — `split_coord!` D ≥ 4 public API (wrapper over `clip_plane!`). voxelize_fold! D ≥ 4 refactored to use it. |
+| `dc0c056` | **Phase C** — `affine!` and `rotate!` for D ≥ 4 (D × D linear and (D+1) × (D+1) homogeneous forms). Per-D `@eval` dispatch for Aqua hygiene. |
+| `(this push)` | **Phase A at D = 5** — Lasserre recursion lifted one level, validated to closed-form on D = 5 simplex + box for P ∈ {1, 2, 3} (all 56 multi-indices). dfmm cubic-edge dimension lifting at D = 5 is now fully unblocked. |
 
 This document closes the remaining gaps so D ≥ 4 reaches feature
 parity with the D = 2 / D = 3 surface area, in priority order.

@@ -1016,6 +1016,78 @@ using LinearAlgebra: I
         end
     end
 
+    @testset "Phase A: D = 5 Lasserre moments (P ≥ 1) closed-form validation" begin
+        # Same closed forms as the D = 4 Lasserre testset above, but at
+        # D = 5. Each per-facet integral now reduces to a 4D moment
+        # problem handed off to `_reduce_nd_higher_d4!`.
+        factorial_int(n) = prod(1:n; init = 1)
+        function expected_simplex(α::NTuple{5,Int})
+            num = prod(factorial_int(a) for a in α; init = 1)
+            return num / factorial_int(5 + sum(α))
+        end
+        expected_box(α::NTuple{5,Int}) = prod(1.0 / (a + 1) for a in α; init = 1.0)
+
+        for P in 1:3
+            sim = R3D.Flat.simplex((0.0, 0.0, 0.0, 0.0, 0.0),
+                                    (1.0, 0.0, 0.0, 0.0, 0.0),
+                                    (0.0, 1.0, 0.0, 0.0, 0.0),
+                                    (0.0, 0.0, 1.0, 0.0, 0.0),
+                                    (0.0, 0.0, 0.0, 1.0, 0.0),
+                                    (0.0, 0.0, 0.0, 0.0, 1.0))
+            m_sim = R3D.Flat.moments(sim, P)
+            box = R3D.Flat.box((0.0, 0.0, 0.0, 0.0, 0.0),
+                               (1.0, 1.0, 1.0, 1.0, 1.0))
+            m_box = R3D.Flat.moments(box, P)
+            for (i, α) in enumerate(R3D.Flat._enumerate_moments_d5(P))
+                @test isapprox(m_sim[i], expected_simplex(α); atol = 1e-10)
+                @test isapprox(m_box[i], expected_box(α); atol = 1e-10)
+            end
+        end
+
+        # Coordinate-permutation symmetry on the unit hypercube: any α
+        # invariant under a coordinate swap must give the same moment.
+        let
+            box = R3D.Flat.box((0.0, 0.0, 0.0, 0.0, 0.0),
+                               (1.0, 1.0, 1.0, 1.0, 1.0))
+            m = R3D.Flat.moments(box, 2)
+            alphas = R3D.Flat._enumerate_moments_d5(2)
+            idx = Dict(α => i for (i, α) in enumerate(alphas))
+            for α in alphas
+                α_swap = (α[2], α[1], α[3], α[4], α[5])
+                @test isapprox(m[idx[α]], m[idx[α_swap]]; atol = 1e-12)
+            end
+        end
+
+        # Voxelize-fold consistency at order = 1, n = 2.
+        let
+            poly = R3D.Flat.simplex((0.0, 0.0, 0.0, 0.0, 0.0),
+                                     (1.0, 0.0, 0.0, 0.0, 0.0),
+                                     (0.0, 1.0, 0.0, 0.0, 0.0),
+                                     (0.0, 0.0, 1.0, 0.0, 0.0),
+                                     (0.0, 0.0, 0.0, 1.0, 0.0),
+                                     (0.0, 0.0, 0.0, 0.0, 1.0))
+            whole = R3D.Flat.moments(poly, 1)
+            ws = R3D.Flat.VoxelizeWorkspace{5,Float64}(64)
+            d_grid  = ntuple(_ -> 0.5, Val(5))
+            ibox_lo = ntuple(_ -> 0,   Val(5))
+            ibox_hi = ntuple(_ -> 2,   Val(5))
+            sum_cells = zeros(Float64, length(whole))
+            R3D.Flat.voxelize_fold!(sum_cells, poly, ibox_lo, ibox_hi, d_grid,
+                                    1; workspace = ws) do acc, idx, m
+                @inbounds for k in eachindex(acc)
+                    acc[k] += m[k]
+                end
+                acc
+            end
+            # Tolerance reflects deeper FP accumulation at D = 5 — each
+            # cell's moment chains through Lasserre at D = 5 → recurse
+            # to D = 4 → recurse to D = 3, with rounding at each level.
+            for k in eachindex(whole)
+                @test isapprox(sum_cells[k], whole[k]; atol = 1e-8, rtol = 1e-7)
+            end
+        end
+    end
+
     @testset "R3D.Flat facet normals + signed distances (D ≥ 4, Phase A foundation)" begin
         # Box facets: outward axis-aligned, signed-distance matches
         # the corresponding lo/hi coordinate.
@@ -1159,11 +1231,20 @@ using LinearAlgebra: I
         for i in 2:5
             @test isapprox(m4[i], 0.5; atol = 1e-12)
         end
-        for D in 5:6
-            buf = R3D.Flat.FlatPolytope{D,Float64}(64)
-            R3D.Flat.init_box!(buf, zeros(D), ones(D))
-            @test_throws ErrorException R3D.Flat.moments(buf, 1)
-            @test_throws ErrorException R3D.Flat.moments!(zeros(D + 1), buf, 1)
+        # D = 5 also lands via Lasserre (Phase A); D = 6 stays stubbed.
+        buf5 = R3D.Flat.FlatPolytope{5,Float64}(64)
+        R3D.Flat.init_box!(buf5, zeros(5), ones(5))
+        m5 = R3D.Flat.moments(buf5, 1)
+        @test length(m5) == R3D.num_moments(5, 1)
+        @test isapprox(m5[1], 1.0; atol = 1e-12)
+        for i in 2:6
+            @test isapprox(m5[i], 0.5; atol = 1e-12)
+        end
+        let
+            buf6 = R3D.Flat.FlatPolytope{6,Float64}(64)
+            R3D.Flat.init_box!(buf6, zeros(6), ones(6))
+            @test_throws ErrorException R3D.Flat.moments(buf6, 1)
+            @test_throws ErrorException R3D.Flat.moments!(zeros(7), buf6, 1)
         end
 
         # Differential vs C (only when the per-dimension rNd library is loaded).
@@ -1235,16 +1316,37 @@ using LinearAlgebra: I
         for k in 1:5
             @test isapprox(sum_over_cells[k], whole[k]; atol = 1e-10, rtol = 1e-10)
         end
-        # D = 5 / D = 6 still throw on order ≥ 1 (no Lasserre yet).
-        for D in 5:6
-            buf = R3D.Flat.FlatPolytope{D,Float64}(64)
-            R3D.Flat.init_box!(buf, zeros(D), ones(D))
-            ws = R3D.Flat.VoxelizeWorkspace{D,Float64}(64)
-            d_grid = ntuple(_ -> 0.5, D)
-            ibox_lo = ntuple(_ -> 0, D)
-            ibox_hi = ntuple(_ -> 2, D)
-            @test_throws AssertionError R3D.Flat.voxelize_fold!(0.0, buf, ibox_lo,
-                ibox_hi, d_grid, 1; workspace = ws) do acc, idx, m
+        # D = 5 voxelize_fold! at order ≥ 1 also lands via Lasserre.
+        let
+            buf5 = R3D.Flat.FlatPolytope{5,Float64}(64)
+            R3D.Flat.init_box!(buf5, zeros(5), ones(5))
+            ws5 = R3D.Flat.VoxelizeWorkspace{5,Float64}(64)
+            d_grid5  = ntuple(_ -> 0.5, Val(5))
+            ibox_lo5 = ntuple(_ -> 0, Val(5))
+            ibox_hi5 = ntuple(_ -> 2, Val(5))
+            whole5 = R3D.Flat.moments(buf5, 1)
+            sum_cells5 = zeros(Float64, length(whole5))
+            R3D.Flat.voxelize_fold!(sum_cells5, buf5, ibox_lo5, ibox_hi5,
+                d_grid5, 1; workspace = ws5) do acc, idx, m
+                @inbounds for k in eachindex(acc)
+                    acc[k] += m[k]
+                end
+                acc
+            end
+            for k in eachindex(whole5)
+                @test isapprox(sum_cells5[k], whole5[k]; atol = 1e-10, rtol = 1e-10)
+            end
+        end
+        # D = 6 still throws on order ≥ 1 (no Lasserre yet).
+        let
+            buf6 = R3D.Flat.FlatPolytope{6,Float64}(64)
+            R3D.Flat.init_box!(buf6, zeros(6), ones(6))
+            ws6 = R3D.Flat.VoxelizeWorkspace{6,Float64}(64)
+            d_grid6 = ntuple(_ -> 0.5, 6)
+            ibox_lo6 = ntuple(_ -> 0, 6)
+            ibox_hi6 = ntuple(_ -> 2, 6)
+            @test_throws AssertionError R3D.Flat.voxelize_fold!(0.0, buf6, ibox_lo6,
+                ibox_hi6, d_grid6, 1; workspace = ws6) do acc, idx, m
                 acc + m[1]
             end
         end
@@ -1682,14 +1784,16 @@ using LinearAlgebra: I
 
         # `clip!` and `moments(., 0)` are now real for D ≥ 4 (Phase 3c
         # + 3d). D = 4 higher-order moments now via Lasserre (Phase A);
-        # D = 5 / D = 6 still stubbed.
-        buf4 = R3D.Flat.FlatPolytope{4,Float64}(64)
-        R3D.Flat.init_box!(buf4, zeros(4), ones(4))
-        @test isapprox(R3D.Flat.moments(buf4, 0)[1], 1.0; atol=1e-12)
-        @test isapprox(R3D.Flat.moments(buf4, 1)[1], 1.0; atol=1e-12)
-        for D in 5:6
+        # D = 4 / D = 5 land via Lasserre; D = 6 still stubbed.
+        for D in 4:5
             buf = R3D.Flat.FlatPolytope{D,Float64}(64)
             R3D.Flat.init_box!(buf, zeros(D), ones(D))
+            @test isapprox(R3D.Flat.moments(buf, 0)[1], 1.0; atol = 1e-12)
+            @test isapprox(R3D.Flat.moments(buf, 1)[1], 1.0; atol = 1e-12)
+        end
+        let
+            buf = R3D.Flat.FlatPolytope{6,Float64}(64)
+            R3D.Flat.init_box!(buf, zeros(6), ones(6))
             @test_throws ErrorException R3D.Flat.moments(buf, 1)
         end
     end

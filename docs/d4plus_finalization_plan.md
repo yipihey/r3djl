@@ -1,12 +1,14 @@
 # D ≥ 4 Finalization Plan
 
-Status as of `ad0e230` (2026-04-26): D ≥ 4 has the core hot path
-working — `init_box!`, `init_simplex!`, `clip!`, `clip_plane!`,
-`moments(., 0)`, `voxelize_fold!`, `voxelize!`, `voxelize`,
-`get_ibox`, `aabb`, `volume`, `is_empty`, `walk_facets`,
-`walk_facet_vertices`, plus differential validation against C
-`rNd_clip` / `rNd_reduce`. The dfmm cubic-edge dimension lifting is
-unblocked at order = 0.
+## Progress log
+
+| commit | what landed |
+|---|---|
+| `ad0e230` (2026-04-26) | Pre-plan baseline: D ≥ 4 core hot path working — `init_box!`, `init_simplex!`, `clip!`, `clip_plane!`, `moments(., 0)`, `voxelize_fold!`, `voxelize!`, `voxelize`, `get_ibox`, `aabb`, `volume`, `is_empty`, `walk_facets`, `walk_facet_vertices`, plus differential validation against C `rNd_clip` / `rNd_reduce`. dfmm cubic-edge lifting unblocked at order = 0. |
+| `e55931f` | This document. |
+| `33daa27` | **Phase B.2 / B.3 / B.4 / B.5** — D ≥ 4 API parity for `box`, `simplex`, `aabb`, `box_planes`, `box_planes!`, `copy!`. |
+| `b4975bf` | **Phase E.1** — CI builds `libr3d_4d/5d/6d.dylib`; D ≥ 4 differential testset now actually exercises C upstream (was silently skipping). |
+| `755060d` | **Phase A foundation** — `facet_normals` + `facet_distances` fields on `FlatPolytope` populated by `init_box!` / `init_simplex!` / `_clip_plane_nd!` / `_copy_polytope_nd!`. |
 
 This document closes the remaining gaps so D ≥ 4 reaches feature
 parity with the D = 2 / D = 3 surface area, in priority order.
@@ -16,6 +18,66 @@ parity with the D = 2 / D = 3 surface area, in priority order.
 The headline blocker. `moments(poly, P ≥ 1)` currently raises an
 informative error for D ≥ 4. dfmm's full pipeline (cubic-edge
 remap with order ≥ 1 polynomials) needs this.
+
+**Status (post `755060d`)**: foundation in place — every facet
+carries an outward-unit normal `n_F` and signed distance `d_F`
+through `init_box!` / `init_simplex!` / `clip!` / `copy!`. The
+formula's outer sum can be evaluated; what remains is the inner
+`∫_{F} x^α dA` term.
+
+**Remaining work (next session)**:
+
+1. **Multinomial expansion helper.** Compute coefficient of `y^β`
+   in `(c + B y)^α` for given α (4D multi-index, |α| ≤ P), β (3D
+   multi-index, |β| ≤ |α|), c ∈ ℝ⁴, B ∈ ℝ^{4×3}. ~80 LOC. Pre-
+   computes the `K_4 × K_3` mixing matrix once per facet, where
+   `K_D = num_moments(D, P)`.
+
+2. **(D−1)-dim facet moments.** Two viable paths:
+   - **(a) Reconstruct a CCW-oriented 3D polytope** from each 4D
+     facet — extract the in-facet vertices, build a 3D `pnbrs`
+     table from the 3-of-4 in-facet slots at each vertex with
+     CCW orientation matching the facet's outward normal, project
+     positions via `B^T (x − c)`, then call existing `moments!`
+     `D = 3`. The CCW orientation is the hard part: `pnbrs[k, u]`
+     for the 3D facet must visit the in-facet edges in the order
+     induced by the facet's tangent-space orientation, which the
+     existing 4D `finds[][]` 2-face data implicitly encodes but
+     needs a careful walk to recover.
+   - **(b) Direct recursive Lasserre.** At codim 1, compute a
+     facet's moments by recursing into its (codim-1-of-facet =
+     codim-2-of-polytope = our `finds`) faces. At codim 2, recurse
+     into 1-dim edges (vertex pairs); 1-D moments are closed
+     form. ~300 LOC but uses only existing connectivity machinery
+     and avoids the orientation problem.
+   - Recommendation: do (b) — uses what we have, generalizes
+     cleanly to D = 5 (we'd recurse one more level using a
+     3-face tracking layer), and dodges the "rebuild a 3D
+     polytope from a 4D facet with correct CCW pnbrs" problem
+     which is non-trivial in its own right.
+
+3. **`moments!` dispatch update.** Replace the `error("order ≥ 1
+   not yet implemented")` path in `moments!(::FlatPolytope{D,T})`
+   with a call to a new `_reduce_nd_higher!` for `D ≥ 4`, `P ≥ 1`.
+   Keep the order-0 fast path (`_reduce_nd_zeroth!`) untouched.
+
+4. **`voxelize_fold!` D ≥ 4** lifts its `@assert order == 0` once
+   `_reduce_nd_higher!` is in place.
+
+5. **Validation.** Upstream C `rNd_reduce` only computes
+   moments[0] — the higher-moments code in `src/rNd.c` is
+   `#if 1 ... #else (no-op) #endif` blocked off — so we have NO
+   C oracle for D ≥ 4 P ≥ 1. Instead validate against:
+   - **Closed-form unit D-simplex moments**: `∫_{Δ_D} x^α dV =
+     α! / (D + |α|)!` where `α! = α_1! α_2! ... α_D!`.
+   - **Closed-form unit D-box moments**: `∫_{[0,1]^D} x^α dV =
+     ∏_j 1 / (α_j + 1)`.
+   - **Symmetry under coordinate swap**: any moment with α
+     invariant under a coordinate permutation must equal the
+     same moment with the permuted α (e.g. ∫ x_1 dV =
+     ∫ x_2 dV on a coordinate-symmetric polytope).
+   - **voxelize-fold consistency**: sum-over-voxels of per-cell
+     moments equals whole-polytope moment within fp precision.
 
 ### Approach: Lasserre's recursive face-decomposition formula
 

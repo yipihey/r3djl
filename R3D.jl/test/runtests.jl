@@ -1563,3 +1563,196 @@ end
         end
     end
 end
+
+@testset "R3D.IntExact (D=3 integer-coordinate polytopes)" begin
+
+    @testset "init_box! / volume_exact closed forms" begin
+        # Unit cube: volume == 1
+        for T in (Int64, Int128, BigInt)
+            buf = R3D.IntExact.IntFlatPolytope{3,T}(64)
+            R3D.IntExact.init_box!(buf, [0, 0, 0], [1, 1, 1])
+            @test R3D.IntExact.volume_exact(buf) == 1 // 1
+            @test R3D.IntExact.volume_exact(buf) isa Rational{T}
+        end
+
+        # 2 × 3 × 4 box: volume == 24
+        buf = R3D.IntExact.IntFlatPolytope{3,Int64}(64)
+        R3D.IntExact.init_box!(buf, [0, 0, 0], [2, 3, 4])
+        @test R3D.IntExact.volume_exact(buf) == 24 // 1
+
+        # Translated box: same volume
+        buf2 = R3D.IntExact.IntFlatPolytope{3,Int64}(64)
+        R3D.IntExact.init_box!(buf2, [-5, -5, -5], [-4, -4, -4])
+        @test R3D.IntExact.volume_exact(buf2) == 1 // 1
+    end
+
+    @testset "init_tet! closed forms" begin
+        # Standard unit tet (origin + axis vertices): volume == 1/6
+        for T in (Int64, Int128, BigInt)
+            buf = R3D.IntExact.IntFlatPolytope{3,T}(64)
+            R3D.IntExact.init_tet!(buf,
+                ([0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]))
+            @test R3D.IntExact.volume_exact(buf) == 1 // 6
+            @test R3D.IntExact.volume_exact(buf) isa Rational{T}
+        end
+
+        # Scaled tet: corners at origin + (k,0,0), (0,k,0), (0,0,k) →
+        # volume = k³ / 6.
+        for k in 1:5
+            buf = R3D.IntExact.IntFlatPolytope{3,Int64}(64)
+            R3D.IntExact.init_tet!(buf,
+                ([0, 0, 0], [k, 0, 0], [0, k, 0], [0, 0, k]))
+            @test R3D.IntExact.volume_exact(buf) == (k^3) // 6
+        end
+    end
+
+    @testset "Single integer-plane clip is exact" begin
+        # Cut unit cube with x[1] ≥ 1//2 plane (rep'd as 2x[1] - 1 ≥ 0):
+        #   plane.n = (2, 0, 0), plane.d = -1.
+        # Result has rational vertices with denominator 2; volume = 1//2.
+        buf = R3D.IntExact.IntFlatPolytope{3,Int64}(64)
+        R3D.IntExact.init_box!(buf, [0, 0, 0], [1, 1, 1])
+        plane = R3D.Plane{3,Int64}(R3D.Vec{3,Int64}(2, 0, 0), -1)
+        @test R3D.IntExact.clip_plane!(buf, plane)
+        @test R3D.IntExact.volume_exact(buf) == 1 // 2
+
+        # Three orthogonal half-cuts of the unit cube → volume 1/8.
+        buf = R3D.IntExact.IntFlatPolytope{3,Int64}(64)
+        R3D.IntExact.init_box!(buf, [0, 0, 0], [1, 1, 1])
+        for axis in 1:3
+            n = R3D.Vec{3,Int64}(ntuple(k -> k == axis ? 2 : 0, 3))
+            @test R3D.IntExact.clip_plane!(buf, R3D.Plane{3,Int64}(n, -1))
+        end
+        @test R3D.IntExact.volume_exact(buf) == 1 // 8
+
+        # Diagonal cut x+y+z ≥ 1 of the unit cube → volume 5/6
+        # (cube minus the corner-tet at origin of edge-length 1).
+        buf = R3D.IntExact.IntFlatPolytope{3,Int64}(64)
+        R3D.IntExact.init_box!(buf, [0, 0, 0], [1, 1, 1])
+        plane = R3D.Plane{3,Int64}(R3D.Vec{3,Int64}(1, 1, 1), -1)
+        @test R3D.IntExact.clip_plane!(buf, plane)
+        @test R3D.IntExact.volume_exact(buf) == 5 // 6
+    end
+
+    @testset "Trivial accept / reject" begin
+        # Plane that doesn't touch the polytope at all (entirely inside).
+        buf = R3D.IntExact.IntFlatPolytope{3,Int64}(64)
+        R3D.IntExact.init_box!(buf, [0, 0, 0], [1, 1, 1])
+        nverts_before = buf.nverts
+        plane_in = R3D.Plane{3,Int64}(R3D.Vec{3,Int64}(1, 0, 0), 100)
+        @test R3D.IntExact.clip_plane!(buf, plane_in)
+        @test buf.nverts == nverts_before
+        @test R3D.IntExact.volume_exact(buf) == 1 // 1
+
+        # Plane that fully discards the polytope.
+        buf2 = R3D.IntExact.IntFlatPolytope{3,Int64}(64)
+        R3D.IntExact.init_box!(buf2, [0, 0, 0], [1, 1, 1])
+        plane_out = R3D.Plane{3,Int64}(R3D.Vec{3,Int64}(1, 0, 0), -100)
+        @test R3D.IntExact.clip_plane!(buf2, plane_out)
+        @test buf2.nverts == 0
+        @test R3D.IntExact.volume_exact(buf2) == 0 // 1
+    end
+
+    @testset "Cross-check exact volume vs Float64 oracle" begin
+        # Random clip sequence: same integer cube + same integer planes,
+        # solved both via R3D.Flat (Float64) and R3D.IntExact (Int128).
+        # The exact rational, converted to Float64, must match the
+        # Float64 oracle to within machine epsilon.
+        rng = Random.MersenneTwister(20260427)
+        for trial in 1:100
+            v = (rand(rng, -3:3), rand(rng, -3:3), rand(rng, -3:3))
+            v == (0, 0, 0) && continue
+            d = rand(rng, -2:2)
+
+            bi = R3D.IntExact.IntFlatPolytope{3,Int128}(128)
+            R3D.IntExact.init_box!(bi, [0, 0, 0], [4, 4, 4])
+            ok_i = R3D.IntExact.clip_plane!(bi,
+                R3D.Plane{3,Int128}(R3D.Vec{3,Int128}(v[1], v[2], v[3]),
+                                    Int128(d)))
+            @test ok_i
+
+            bf = R3D.Flat.box((0.0, 0.0, 0.0), (4.0, 4.0, 4.0); capacity=128)
+            R3D.Flat.clip!(bf,
+                R3D.Plane{3,Float64}(R3D.Vec{3,Float64}(v[1], v[2], v[3]),
+                                     Float64(d)))
+
+            vex = R3D.IntExact.volume_exact(bi)
+            vfl = bf.nverts == 0 ? 0.0 : R3D.Flat.moments(bf, 0)[1]
+            @test isapprox(Float64(vex), vfl; atol=1e-10, rtol=1e-10)
+        end
+    end
+
+    @testset "Sequential clips don't drift" begin
+        # 10-step iterative clipping with random integer planes; the
+        # exact rational result must track the Float64 oracle to within
+        # float precision. BigInt accumulator so overflow can't happen.
+        rng = Random.MersenneTwister(20260428)
+        bi = R3D.IntExact.IntFlatPolytope{3,BigInt}(256)
+        R3D.IntExact.init_box!(bi, [0, 0, 0], [8, 8, 8])
+        bf = R3D.Flat.box((0.0, 0.0, 0.0), (8.0, 8.0, 8.0); capacity=256)
+        for step in 1:10
+            v = (rand(rng, -2:2), rand(rng, -2:2), rand(rng, -2:2))
+            v == (0, 0, 0) && (v = (1, 0, 0))
+            d = rand(rng, -3:0)
+
+            R3D.IntExact.clip_plane!(bi,
+                R3D.Plane{3,BigInt}(R3D.Vec{3,BigInt}(v[1], v[2], v[3]),
+                                    BigInt(d)))
+            R3D.Flat.clip!(bf,
+                R3D.Plane{3,Float64}(R3D.Vec{3,Float64}(v[1], v[2], v[3]),
+                                     Float64(d)))
+
+            vex = R3D.IntExact.volume_exact(bi)
+            vfl = bf.nverts == 0 ? 0.0 : R3D.Flat.moments(bf, 0)[1]
+            @test isapprox(Float64(vex), vfl; atol=1e-9, rtol=1e-9)
+
+            bi.nverts == 0 && break
+        end
+    end
+
+    @testset "Buffered Int64 clip is allocation-free on the hot path" begin
+        # `clip_plane!` reuses the polytope's preallocated scratch and
+        # writes into the existing position matrices. With no Rational
+        # construction, no GMP calls (Int64 path), and the lazy GCD
+        # reduce being branchy-but-ALU-only, there is no heap allocation
+        # per call after warmup.
+        buf = R3D.IntExact.IntFlatPolytope{3,Int64}(64)
+        plane = R3D.Plane{3,Int64}(R3D.Vec{3,Int64}(2, 1, 1), -3)
+
+        R3D.IntExact.init_box!(buf, [0, 0, 0], [4, 4, 4])
+        R3D.IntExact.clip_plane!(buf, plane)
+
+        R3D.IntExact.init_box!(buf, [0, 0, 0], [4, 4, 4])
+        a_init = @allocated R3D.IntExact.init_box!(buf, [0, 0, 0], [4, 4, 4])
+        a_clip = @allocated R3D.IntExact.clip_plane!(buf, plane)
+        @test a_init <= 256   # only the literal-array call-site cost
+        @test a_clip == 0
+    end
+
+    @testset "Lazy GCD keeps denominators small on axis-aligned cuts" begin
+        # Axis-aligned cuts at integer offsets through integer-vertex
+        # inputs produce integer-vertex outputs (the lazy GCD reduce
+        # collapses the trivial factor introduced by `Sa * 1 - Sb * 1`).
+        # All denominators remain `== 1` after a sequence of cuts.
+        buf = R3D.IntExact.IntFlatPolytope{3,Int64}(256)
+        R3D.IntExact.init_box!(buf, [0, 0, 0], [16, 16, 16])
+        cuts = [
+            (R3D.Vec{3,Int64}(1, 0, 0),  -8),
+            (R3D.Vec{3,Int64}(0, 1, 0),  -5),
+            (R3D.Vec{3,Int64}(0, 0, 1),  -2),
+            (R3D.Vec{3,Int64}(1, 0, 0),  -6),
+            (R3D.Vec{3,Int64}(0, 1, 0),  -5),
+        ]
+        for (n, d) in cuts
+            R3D.IntExact.clip_plane!(buf, R3D.Plane{3,Int64}(n, d))
+        end
+        for v in 1:buf.nverts
+            @test buf.positions_den[v] == 1
+        end
+
+        # Surviving region is [8,16] × [5,16] × [2,16] (the x-cut at 6
+        # is dominated by the earlier x-cut at 8). Volume = 8·11·14
+        # = 1232.
+        @test R3D.IntExact.volume_exact(buf) == 1232 // 1
+    end
+end

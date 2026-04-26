@@ -46,6 +46,7 @@ include("clip.jl")
 include("init.jl")
 include("moments.jl")
 include("flat.jl")
+include("intexact.jl")
 
 # Public API
 export Polytope, Vertex, Vec, Plane

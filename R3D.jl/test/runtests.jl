@@ -1055,6 +1055,80 @@ using LinearAlgebra: I
         end
     end
 
+    @testset "D ≥ 4 sequential simplex clips preserve volume + symmetry" begin
+        # Regression for the boundary-vertex degenerate cut bug: when a
+        # second clip plane passes exactly through a vertex created by
+        # the first clip (sdists[vcur] == 0), the cut-position formula
+        # collapsed to vcur, creating duplicate vertices that broke the
+        # LTD moments recursion. Repro from the bug report: two-axis
+        # quadrant decomposition of a unit D = 4 simplex must respect
+        # coordinate symmetry and sum to 1/24.
+        function clip2_simplex(planes)
+            poly = R3D.Flat.FlatPolytope{4, Float64}(512)
+            verts = [[0.0, 0.0, 0.0, 0.0],
+                     [1.0, 0.0, 0.0, 0.0],
+                     [0.0, 1.0, 0.0, 0.0],
+                     [0.0, 0.0, 1.0, 0.0],
+                     [0.0, 0.0, 0.0, 1.0]]
+            R3D.Flat.init_simplex!(poly, verts)
+            for p in planes
+                R3D.Flat.clip!(poly, p)
+            end
+            R3D.Flat.volume(poly)
+        end
+        plane_neg(axis, c) = R3D.Plane{4, Float64}(
+            R3D.Vec{4, Float64}(ntuple(k -> k == axis ? -1.0 : 0.0, Val(4))), c)
+        plane_pos(axis, c) = R3D.Plane{4, Float64}(
+            R3D.Vec{4, Float64}(ntuple(k -> k == axis ?  1.0 : 0.0, Val(4))), -c)
+
+        # Two-axis quadrant volumes for axis pair (1, 2). The four
+        # quadrants must tile the simplex and obey coordinate symmetry
+        # under x ↔ y swap.
+        v_nn = clip2_simplex((plane_neg(1, 0.5), plane_neg(2, 0.5)))
+        v_np = clip2_simplex((plane_neg(1, 0.5), plane_pos(2, 0.5)))
+        v_pn = clip2_simplex((plane_pos(1, 0.5), plane_neg(2, 0.5)))
+        v_pp = clip2_simplex((plane_pos(1, 0.5), plane_pos(2, 0.5)))
+        @test isapprox(v_np, v_pn; atol = 1e-10)
+        @test isapprox(v_nn + v_np + v_pn + v_pp, 1/24; atol = 1e-10)
+        # Geometrically: v_pp = ∅ (x ≥ 0.5 + y ≥ 0.5 forces x + y ≥ 1
+        # which leaves no interior of the unit simplex), v_np = v_pn =
+        # 1/384 (one-corner sub-simplex), v_nn = 1/24 - 2/384.
+        @test isapprox(v_pp, 0.0;        atol = 1e-12)
+        @test isapprox(v_np, 1/384;      atol = 1e-10)
+        @test isapprox(v_nn, 1/24 - 2/384; atol = 1e-10)
+
+        # voxelize_fold! over a 2^D grid recovers the per-cell volumes
+        # with correct symmetry: the four "single-axis" corner cells
+        # (2,1,1,1), (1,2,1,1), (1,1,2,1), (1,1,1,2) all equal 1/384,
+        # the origin cell (1,1,1,1) holds the bulk 1/24 - 4/384, and
+        # all other cells are empty. Pre-fix this returned an
+        # increasing 0, 1/384, 2/384, 3/384, 4/384 sequence and a 0
+        # origin cell.
+        poly = R3D.Flat.FlatPolytope{4, Float64}(512)
+        verts = [[0.0, 0.0, 0.0, 0.0],
+                 [1.0, 0.0, 0.0, 0.0],
+                 [0.0, 1.0, 0.0, 0.0],
+                 [0.0, 0.0, 1.0, 0.0],
+                 [0.0, 0.0, 0.0, 1.0]]
+        R3D.Flat.init_simplex!(poly, verts)
+        d_grid  = ntuple(_ -> 0.5, Val(4))
+        ibox_lo = ntuple(_ -> 0,   Val(4))
+        ibox_hi = ntuple(_ -> 2,   Val(4))
+        cells = Tuple{NTuple{4, Int}, Float64}[]
+        R3D.Flat.voxelize_fold!(cells, poly, ibox_lo, ibox_hi,
+                                d_grid, 0) do acc, idx, m
+            push!(acc, (idx, m[1]))
+            acc
+        end
+        cellvol = Dict(idx => v for (idx, v) in cells)
+        for axis in 1:4
+            idx = ntuple(k -> k == axis ? 2 : 1, Val(4))
+            @test isapprox(cellvol[idx], 1/384; atol = 1e-10)
+        end
+        @test isapprox(cellvol[(1, 1, 1, 1)], 1/24 - 4/384; atol = 1e-10)
+        @test isapprox(sum(values(cellvol)), 1/24; atol = 1e-10)
+    end
+
     @testset "Phase 3 groundwork: D ≥ 4 constructors + num_moments" begin
         # init_box for D = 4, 5, 6 — bit-hack vertex enumeration
         for D in 4:6

@@ -7,6 +7,47 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Bug fix: D ≥ 4 sequential `clip!` corrupts simplex polytopes
+
+Sequential `clip!` calls on a D ≥ 4 simplex (or any polytope whose
+vertices happen to land exactly on a later cut plane) produced wrong
+volumes — symmetry-related quadrants disagreed and the four-quadrant
+decomposition of a unit D = 4 simplex summed to ~94 % of 1/24
+instead of exactly 1/24. The same workflow on a D ≥ 4 box was
+correct, so single `clip!` calls and box-only sequential clips were
+unaffected.
+
+The root cause is in `_clip_plane_nd!` Step 3: when a kept vertex
+`vcur` lies exactly on the cut plane (`sdists[vcur] == 0`), the
+weighted-average cut-position formula
+`(vnext * sd_vcur - vcur * sd_vnext) / (sd_vcur - sd_vnext)`
+collapses to `vcur`. New vertices coincident with `vcur` break the
+simple-polytope invariant that the LTD moments recursion in
+`_reduce_helper_nd` depends on (each vertex must have D linearly
+independent outgoing edges). The upstream C `rNd_reduce` has the
+same issue and produces NaN on the same inputs.
+
+The fix nudges `sd_vcur` up by a tiny tolerance
+(`eps(T) * 256 * span`) for the cut-position computation only,
+shifting the new vertex ε-close-but-distinct from `vcur`. The
+combinatorial topology is unchanged; the volume error is O(eps(T))
+per cut, well below floating-point precision in any realistic
+moments computation. Random clip planes never trigger the nudge
+(measure-zero `sd_vcur == 0` event), so the existing 100-trial
+differential tests against the C library remain bit-exact.
+
+This also fixes the corresponding `voxelize_fold!` / `voxelize!`
+path: pre-fix, voxelizing a unit D = 4 simplex over a 2^4 grid
+returned a strictly increasing 0, 1/384, 2/384, 3/384, 4/384
+volumes for the five non-empty cells, summing to 0.026 ≠ 1/24.
+Post-fix the four corner cells all equal 1/384 and the origin cell
+holds the bulk, summing to exactly 1/24.
+
+Regression test: `D ≥ 4 sequential simplex clips preserve volume +
+symmetry` (11 assertions covering the four-quadrant decomposition
+of a unit D = 4 simplex plus the corresponding 2^4 voxelize_fold!
+cells).
+
 ### Facet ((D−1)-face) tracking foundation for D ≥ 4
 
 Universal building block for the deferred higher-order moments work.

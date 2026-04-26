@@ -2,6 +2,34 @@
 
 ## Status (2026-04-25)
 
+### Sequential-clip-on-simplex bug fix (this push)
+
+Sequential `clip!` calls on a D ≥ 4 simplex produced wrong volumes
+(reported by the dfmm team while exploring cubic-edge dimension
+lifting). Root cause: when the cut plane passes exactly through a
+kept vertex (`sdists[vcur] == 0`), the cut-position formula in
+`_clip_plane_nd!` Step 3 collapses to `vcur`'s position, creating
+duplicate vertices that break the simple-polytope invariant the LTD
+moments recursion (`_reduce_helper_nd`) assumes. Upstream C
+`rNd_reduce` has the same bug and produces NaN.
+
+Fix: ε-nudge `sd_vcur` up by `eps(T) * 256 * span` (where `span =
+max(|smin|, |smax|, 1)`) for the cut-position formula only when
+it's near zero. New vertices end up ε-close-but-distinct from
+`vcur`; combinatorial topology unchanged; volume error O(eps(T))
+per cut, only triggered on the measure-zero `sd_vcur == 0` event so
+existing diff-tests against C remain bit-exact.
+
+Verified:
+- Two-axis quadrant decomposition of a unit D = 4 simplex: all four
+  quadrants now respect coordinate symmetry and sum to exactly
+  1/24 (was 0.039 = ~94 % of 1/24).
+- `voxelize_fold!` of a unit D = 4 simplex over a 2^4 grid: the
+  four single-axis corner cells equal 1/384 each, origin cell holds
+  the bulk 1/24 - 4/384 (was a strictly increasing 0..4/384
+  sequence with origin cell = 0).
+- All 33,961 existing tests still pass.
+
 | Capability                                          | D=2,3 | D=4,5,6                  |
 |-----------------------------------------------------|:-----:|:--------------------------|
 | `init_box!` / `init_simplex!` (incl. `finds[][]`)   | ✓     | ✓                        |

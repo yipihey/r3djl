@@ -3623,8 +3623,24 @@ function clip_plane!(poly::FlatPolytope{D,T}, plane::Plane{D,T}) where {D,T}
     # using the same k_new → k_orig mapping as the finds row-0 fill
     # above (i.e., vcur's non-np slots in order).
     new_facet_id = Int32(poly.nfacets + 1)
+    # ε-nudge for the cut-position formula. When sdists[vcur] is exactly
+    # zero (vcur lies on the cut plane), the formula
+    # (vnext * sd_vcur - vcur * sd_vnext) / (sd_vcur - sd_vnext)
+    # collapses to vcur, creating duplicate vertices that break the
+    # simple-polytope invariant the LTD moments recursion assumes.
+    # That manifested as wrong volumes for D ≥ 4 sequential `clip!` on
+    # simplex-like polytopes (e.g. axis-aligned half-plane clips at 0.5
+    # of a unit D = 4 simplex; the upstream C `rNd` has the same bug,
+    # producing NaN). Nudging sd_vcur up by `tol_nudge` shifts the new
+    # vertex ε-close-but-distinct from vcur, preserving simplicity. The
+    # volume error is O(eps(T)) — well below floating-point precision
+    # in any realistic moments computation, and only triggered on the
+    # measure-zero case sd_vcur == 0 (random clip planes never hit it,
+    # so existing diff-tests against C remain bit-exact).
+    tol_nudge = eps(T) * max(abs(smin), abs(smax), one(T)) * 256
     @inbounds for vcur in 1:onv
         clipped[vcur] != 0 && continue
+        sd_vcur = sdists[vcur] < tol_nudge ? tol_nudge : sdists[vcur]
         for np in 1:D
             vnext = Int(poly.pnbrs[np, vcur])
             (vnext == 0 || clipped[vnext] == 0) && continue
@@ -3637,9 +3653,9 @@ function clip_plane!(poly::FlatPolytope{D,T}, plane::Plane{D,T}) where {D,T}
             # floating-point precision: (vnext * sd_vcur - vcur * sd_vnext) / (sd_vcur - sd_vnext)
             for i in 1:D
                 poly.positions[i, new_v] =
-                    (poly.positions[i, vnext] * sdists[vcur] -
+                    (poly.positions[i, vnext] * sd_vcur -
                      poly.positions[i, vcur]  * sdists[vnext]) /
-                    (sdists[vcur] - sdists[vnext])
+                    (sd_vcur - sdists[vnext])
             end
 
             # pnbrs[1] = vcur (the kept vertex side); rest sentinel-zero.
@@ -3872,10 +3888,9 @@ function _reduce_nd_zeroth!(out::AbstractVector{T},
     poly.nverts <= 0 && return out
     # Pre-allocate scratch on stack (small D guarantees this is fine).
     processed = MVector{D,Bool}(ntuple(_ -> false, Val(D)))
-    ltd = MMatrix{D,D,T}(zeros(T, D, D))   # ltd[:, dd] is the dd-th orthonormal vector
+    ltd = MMatrix{D,D,T}(zeros(T, D, D))
     s = zero(T)
     @inbounds for v in 1:poly.nverts
-        # Reset processed flags
         for k in 1:D
             processed[k] = false
         end

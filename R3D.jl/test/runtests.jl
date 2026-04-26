@@ -613,6 +613,69 @@ using LinearAlgebra: I
         @test isapprox(R3D.Flat.moments(cube, 0)[1], 1.0; atol=1e-12)
     end
 
+    @testset "Affine ops D ≥ 4" begin
+        # Identity transform on a unit 4-cube must preserve volume.
+        b4 = R3D.Flat.FlatPolytope{4,Float64}(1 << 4)
+        R3D.Flat.init_box!(b4, [0.0, 0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0])
+        R3D.Flat.affine!(b4, Matrix{Float64}(I, 4, 4))
+        @test isapprox(R3D.Flat.moments(b4, 0)[1], 1.0; atol=1e-12)
+
+        # Axis-permutation matrix has det = ±1 and preserves volume of any
+        # symmetric box. We use a cyclic shift (rows permuted) which has
+        # det = +1 for D = 4 (even number of transpositions).
+        b4 = R3D.Flat.FlatPolytope{4,Float64}(1 << 4)
+        R3D.Flat.init_box!(b4, [0.0, 0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0])
+        Pmat = zeros(Float64, 4, 4)
+        # Cyclic shift: row i gets column ((i mod 4) + 1).
+        for i in 1:4
+            Pmat[i, (i % 4) + 1] = 1.0
+        end
+        R3D.Flat.affine!(b4, Pmat)
+        @test isapprox(R3D.Flat.moments(b4, 0)[1], 1.0; atol=1e-12)
+
+        # 90° rotation in (x_1, x_2) plane, identity on (x_3, x_4). Acts on
+        # a centered hypercube => volume invariant.
+        b4 = R3D.Flat.FlatPolytope{4,Float64}(1 << 4)
+        R3D.Flat.init_box!(b4, [-0.5, -0.5, -0.5, -0.5], [0.5, 0.5, 0.5, 0.5])
+        Rmat = Matrix{Float64}(I, 4, 4)
+        Rmat[1, 1] = 0.0; Rmat[1, 2] = -1.0
+        Rmat[2, 1] = 1.0; Rmat[2, 2] =  0.0
+        R3D.Flat.rotate!(b4, Rmat)
+        @test isapprox(R3D.Flat.moments(b4, 0)[1], 1.0; atol=1e-12)
+
+        # Anisotropic scaling via affine! with diag(2, 1, 1, 1) doubles vol.
+        b4 = R3D.Flat.FlatPolytope{4,Float64}(1 << 4)
+        R3D.Flat.init_box!(b4, [0.0, 0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0])
+        Dmat = Matrix{Float64}(I, 4, 4)
+        Dmat[1, 1] = 2.0
+        R3D.Flat.affine!(b4, Dmat)
+        @test isapprox(R3D.Flat.moments(b4, 0)[1], 2.0; atol=1e-12)
+
+        # rotate! must reject non-orthogonal matrices.
+        b4 = R3D.Flat.FlatPolytope{4,Float64}(1 << 4)
+        R3D.Flat.init_box!(b4, [0.0, 0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0])
+        bad = Matrix{Float64}(I, 4, 4); bad[1, 1] = 2.0
+        @test_throws AssertionError R3D.Flat.rotate!(b4, bad)
+
+        # D = 5: a coordinate cycle preserves volume on a unit 5-cube.
+        b5 = R3D.Flat.FlatPolytope{5,Float64}(1 << 5)
+        R3D.Flat.init_box!(b5, [0.0, 0.0, 0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0, 1.0])
+        P5 = zeros(Float64, 5, 5)
+        for i in 1:5
+            P5[i, (i % 5) + 1] = 1.0
+        end
+        R3D.Flat.affine!(b5, P5)
+        @test isapprox(R3D.Flat.moments(b5, 0)[1], 1.0; atol=1e-12)
+
+        # Steady-state allocation check: after a warmup, a single affine!
+        # call on a 4-cube must not allocate.
+        b4w = R3D.Flat.FlatPolytope{4,Float64}(1 << 4)
+        R3D.Flat.init_box!(b4w, [0.0, 0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0])
+        Mw = Matrix{Float64}(I, 4, 4)
+        R3D.Flat.affine!(b4w, Mw)  # warmup
+        @test (@allocated R3D.Flat.affine!(b4w, Mw)) <= ALLOC_TOLERANCE
+    end
+
     @testset "Affine ops differential vs C r3d" begin
         if !HAVE_C
             @info "skipping affine differential; ENV[R3D_LIB] not set"

@@ -9,6 +9,9 @@
 | `33daa27` | **Phase B.2 / B.3 / B.4 / B.5** — D ≥ 4 API parity for `box`, `simplex`, `aabb`, `box_planes`, `box_planes!`, `copy!`. |
 | `b4975bf` | **Phase E.1** — CI builds `libr3d_4d/5d/6d.dylib`; D ≥ 4 differential testset now actually exercises C upstream (was silently skipping). |
 | `755060d` | **Phase A foundation** — `facet_normals` + `facet_distances` fields on `FlatPolytope` populated by `init_box!` / `init_simplex!` / `_clip_plane_nd!` / `_copy_polytope_nd!`. |
+| `bd3e0d2` | **Phase A** — Lasserre higher-order moments at D = 4 (P ≥ 1), validated to closed-form on simplex + box for P ∈ {1, 2, 3}. |
+| `a955ce4` | Symmetric companion to the c4496ab clip!-on-boundary-vertex fix, surfaced via voxelize_fold! at non-power-of-2 grid sizes. |
+| `(this push)` | **Phase B.1** — `split_coord!` D ≥ 4 public API (wrapper over `clip_plane!`). voxelize_fold! D ≥ 4 refactored to use it. |
 
 This document closes the remaining gaps so D ≥ 4 reaches feature
 parity with the D = 2 / D = 3 surface area, in priority order.
@@ -148,13 +151,18 @@ dfmm's call-site code doesn't need per-D forks.
 
 ### B.1 `split_coord!(poly, out0, out1, split_pos, axis)` for D ≥ 4
 
-3D version splits a polytope by an axis-aligned plane into two
-output polytopes in a single pass (avoids the
-`copy_polytope` + two `clip!` shortcut the D ≥ 4 `voxelize_fold!`
-currently uses). Same boundary-walker structure as
-`_clip_plane_nd!`, but produces both half-spaces in one traversal.
-~150 LOC. Drops the `_copy_polytope_nd!` call in
-`voxelize_fold!`'s hot loop, halving its memory footprint.
+**Status: shipped as a wrapper over `clip_plane!`.** Public API
+parity with the lower-D versions (same signature, same aliasing
+contract), and `voxelize_fold!` D ≥ 4 now delegates to it.
+
+A true single-pass split (sharing the boundary walker between the
+two halves) would shave 10–20 % off per-split CPU at D ≥ 4 by
+avoiding redundant facet-traversal work, but adds ~250 LOC of
+careful 2-face linker code. The wrapper matches the existing
+voxelize_fold! cost (no copy is added when `in === out0`) and the
+underlying `clip_plane!` is already heap-free and tuned. Replace
+with a true single-pass implementation if a future benchmark
+shows the linker work is bottlenecking.
 
 ### B.2 `box_planes` / `box_planes!` for D ≥ 4
 

@@ -1320,6 +1320,63 @@ using LinearAlgebra: I
         end
     end
 
+    @testset "D ≥ 4 split_coord! API parity + voxelize_fold! integration" begin
+        # split_coord! at D ≥ 4 — public API parity with the lower-D
+        # versions. Internally a wrapper over `clip_plane!` (Phase B.1).
+        # voxelize_fold! D ≥ 4 now uses this wrapper, so any bug here
+        # would fail the existing voxelize tests too.
+        for D in 4:6
+            poly = R3D.Flat.box(ntuple(_ -> 0.0, Val(D)),
+                                ntuple(_ -> 1.0, Val(D)))
+            out0 = R3D.Flat.FlatPolytope{D,Float64}(256)
+            out1 = R3D.Flat.FlatPolytope{D,Float64}(256)
+            ok = R3D.Flat.split_coord!(poly, out0, out1, 0.5, 1)
+            @test ok
+            @test isapprox(R3D.Flat.volume(out0), 0.5; atol = 1e-12)
+            @test isapprox(R3D.Flat.volume(out1), 0.5; atol = 1e-12)
+            @test isapprox(R3D.Flat.volume(out0) + R3D.Flat.volume(out1),
+                           1.0; atol = 1e-12)
+        end
+
+        # Aliasing pattern: in === out0. Same result, no extra copy.
+        let
+            poly = R3D.Flat.box((0.0, 0.0, 0.0, 0.0), (1.0, 1.0, 1.0, 1.0))
+            out1 = R3D.Flat.FlatPolytope{4,Float64}(256)
+            ok = R3D.Flat.split_coord!(poly, poly, out1, 0.25, 3)
+            @test ok
+            # poly itself is now the "x_3 ≤ 0.25" half.
+            @test isapprox(R3D.Flat.volume(poly), 0.25; atol = 1e-12)
+            @test isapprox(R3D.Flat.volume(out1), 0.75; atol = 1e-12)
+        end
+
+        # Simplex split: volume conservation.
+        for c in (0.5, 1/3, 0.25, 0.7)
+            sim = R3D.Flat.simplex((0.0, 0.0, 0.0, 0.0),
+                                    (1.0, 0.0, 0.0, 0.0),
+                                    (0.0, 1.0, 0.0, 0.0),
+                                    (0.0, 0.0, 1.0, 0.0),
+                                    (0.0, 0.0, 0.0, 1.0))
+            out0 = R3D.Flat.FlatPolytope{4,Float64}(256)
+            out1 = R3D.Flat.FlatPolytope{4,Float64}(256)
+            R3D.Flat.split_coord!(sim, out0, out1, c, 1)
+            @test isapprox(R3D.Flat.volume(out0) + R3D.Flat.volume(out1),
+                           1/24; rtol = 1e-12)
+        end
+
+        # Empty input returns two empty halves.
+        let
+            empty4 = R3D.Flat.box((0.0, 0.0, 0.0, 0.0), (1.0, 1.0, 1.0, 1.0))
+            far = R3D.Plane{4,Float64}(R3D.Vec{4,Float64}(1.0, 0, 0, 0), -100.0)
+            R3D.Flat.clip!(empty4, far)
+            @test empty4.nverts == 0
+            out0 = R3D.Flat.FlatPolytope{4,Float64}(64)
+            out1 = R3D.Flat.FlatPolytope{4,Float64}(64)
+            R3D.Flat.split_coord!(empty4, out0, out1, 0.5, 1)
+            @test out0.nverts == 0
+            @test out1.nverts == 0
+        end
+    end
+
     @testset "D ≥ 4 clip! handles FP-boundary clipped vertex (sd_vnext ≈ 0)" begin
         # Regression for the symmetric case of the c4496ab boundary-vertex
         # bug: a previously-interpolated vertex's coordinate may exactly

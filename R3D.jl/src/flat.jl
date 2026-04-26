@@ -1044,6 +1044,67 @@ end
 end
 
 """
+    split_coord!(in::FlatPolytope{D,T}, out0::FlatPolytope{D,T},
+                 out1::FlatPolytope{D,T}, coord, ax) where {D ≥ 4} -> Bool
+
+Split `in` along the axis-aligned plane `x[ax] = coord` into two
+output polytopes:
+
+- `out0` receives the half satisfying `x[ax] ≤ coord`.
+- `out1` receives the half satisfying `x[ax] ≥ coord`.
+
+Aliasing: passing `in === out0` is supported and is the common
+voxelize_fold!-style pattern — the implementation copies `in` into
+`out1` first, then clips `in` (= `out0`) in place. If `in` and `out0`
+are distinct, an extra copy is performed.
+
+This D ≥ 4 method is a thin wrapper around `clip_plane!` that calls
+it twice: once with the negative half-space plane on `out0`, once
+with the positive half-space plane on `out1`. The 3D
+`split_coord!` is a true single-pass implementation that does the
+boundary walker work once for both halves; porting that pattern to
+D ≥ 4 is tracked as a perf-only follow-up — the current wrapper
+matches voxelize_fold!'s existing two-clip cost (no copy is added
+when `in === out0`), and `clip_plane!` itself is already heap-free
+and tuned. The benefit of this method as a public API is parity
+with the lower-D `split_coord!` signature.
+
+Returns `true` on success; `false` if either half exceeds capacity.
+"""
+function split_coord!(in::FlatPolytope{D,T},
+                       out0::FlatPolytope{D,T}, out1::FlatPolytope{D,T},
+                       coord::T, ax::Int) where {D,T}
+    @assert D >= 4 "this method is for D ≥ 4 only; D = 2 / D = 3 have specialized methods"
+    if in.nverts <= 0
+        out0.nverts = 0
+        out1.nverts = 0
+        return true
+    end
+
+    # Save `in` into `out1` BEFORE we mutate it. When `in === out0`
+    # (the voxelize_fold! aliasing pattern), this is the only copy
+    # needed; the subsequent in-place clip turns `in` into `out0`.
+    _copy_polytope_nd!(out1, in)
+    if in !== out0
+        _copy_polytope_nd!(out0, in)
+    end
+
+    # Axis-aligned half-space planes. Plane n·x + d ≥ 0 keeps the
+    # named half:
+    #   plane_neg = (-e_ax,  +coord) keeps {x : -x[ax] + coord ≥ 0}
+    #             ⇔ {x[ax] ≤ coord}.
+    #   plane_pos = (+e_ax, -coord) keeps {x[ax] ≥ coord}.
+    n_neg = ntuple(k -> k == ax ? T(-1) : T(0), Val(D))
+    n_pos = ntuple(k -> k == ax ? T( 1) : T(0), Val(D))
+    plane_neg = Plane{D,T}(Vec{D,T}(n_neg),  coord)
+    plane_pos = Plane{D,T}(Vec{D,T}(n_pos), -coord)
+
+    ok0 = clip_plane!(out0, plane_neg)
+    ok1 = clip_plane!(out1, plane_pos)
+    return ok0 && ok1
+end
+
+"""
     walk_facet_vertices(callback::F, poly::FlatPolytope{D,T}, fid::Integer) where {F,D,T}
 
 Call `callback(v)` for each vertex `v` incident to facet `fid` in the
@@ -1201,17 +1262,14 @@ function voxelize_fold!(callback::F,
             _ensure_stack!(ws, nstack + 2)
         end
         # `cur === ws.polys[nstack+1]` because the workspace stack reuses
-        # the popped slot. Save `cur` into `out1` (a fresh slot) BEFORE
-        # we clip `cur` in place to become `out0`.
+        # the popped slot. `cur === ws.polys[nstack + 1]` is the
+        # voxelize_fold!-style aliasing pattern that `split_coord!`
+        # supports without an extra copy (saves cur → out1 first,
+        # then clips cur in place to become out0).
         out0 = ws.polys[nstack + 1]   # alias of cur — becomes negative half
         out1 = ws.polys[nstack + 2]   # fresh slot — gets positive half
 
-        plane_pos = Plane{D,T}(Vec{D,T}(_axis_unit(spax,  one(T), Val(D))), -split_pos)
-        plane_neg = Plane{D,T}(Vec{D,T}(_axis_unit(spax, -one(T), Val(D))),  split_pos)
-
-        _copy_polytope_nd!(out1, cur)
-        clip!(out0, plane_neg)        # cur (=out0) clipped in place
-        clip!(out1, plane_pos)
+        split_coord!(cur, out0, out1, split_pos, spax)
 
         hi_left  = _replace_at(hi, spax, split_index, Val(D))
         lo_right = _replace_at(lo, spax, split_index, Val(D))

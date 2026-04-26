@@ -1149,6 +1149,89 @@ using LinearAlgebra: I
         @test isapprox(sum(values(cellvol)), 1/24; atol = 1e-10)
     end
 
+    @testset "D ≥ 4 API parity: box / simplex / aabb / box_planes / copy!" begin
+        # Generic `box(lo, hi)` / `simplex(verts...)` constructors at D ≥ 4
+        # mirror the D = 2 / D = 3 conveniences. Phase B.5.
+        for D in 4:6
+            lo = ntuple(_ -> 0.0, Val(D))
+            hi = ntuple(_ -> 1.0, Val(D))
+            b = R3D.Flat.box(lo, hi)
+            @test b isa R3D.Flat.FlatPolytope{D,Float64}
+            @test b.nverts == 1 << D
+            @test isapprox(R3D.Flat.volume(b), 1.0; atol = 1e-12)
+        end
+
+        # Splat-of-vertices simplex constructor.
+        s4 = R3D.Flat.simplex((0.0, 0.0, 0.0, 0.0),
+                              (1.0, 0.0, 0.0, 0.0),
+                              (0.0, 1.0, 0.0, 0.0),
+                              (0.0, 0.0, 1.0, 0.0),
+                              (0.0, 0.0, 0.0, 1.0))
+        @test s4.nverts == 5
+        @test isapprox(R3D.Flat.volume(s4), 1/24; atol = 1e-12)
+        s5 = R3D.Flat.simplex(ntuple(_ -> 0.0, 5),
+                              ntuple(k -> k == 1 ? 1.0 : 0.0, 5),
+                              ntuple(k -> k == 2 ? 1.0 : 0.0, 5),
+                              ntuple(k -> k == 3 ? 1.0 : 0.0, 5),
+                              ntuple(k -> k == 4 ? 1.0 : 0.0, 5),
+                              ntuple(k -> k == 5 ? 1.0 : 0.0, 5))
+        @test s5.nverts == 6
+        @test isapprox(R3D.Flat.volume(s5), 1/120; atol = 1e-12)
+
+        # aabb (Phase B.4): D-generic FlatPolytope variant + D ≥ 4
+        # StaticFlatPolytope variant.
+        b4 = R3D.Flat.box((0.0, 0.0, 0.0, 0.0), (1.0, 2.0, 3.0, 4.0))
+        @test R3D.Flat.aabb(b4) ==
+            ((0.0, 0.0, 0.0, 0.0), (1.0, 2.0, 3.0, 4.0))
+        # Empty polytope (clipped away) returns the canonical sentinel.
+        empty4 = R3D.Flat.box((0.0, 0.0, 0.0, 0.0), (1.0, 1.0, 1.0, 1.0))
+        far_plane = R3D.Plane{4,Float64}(R3D.Vec{4,Float64}(1.0, 0.0, 0.0, 0.0), -100.0)
+        R3D.Flat.clip!(empty4, far_plane)
+        @test R3D.Flat.aabb(empty4) ==
+            (ntuple(_ -> Inf, 4), ntuple(_ -> -Inf, 4))
+
+        # box_planes / box_planes! (Phase B.2)
+        for D in 4:6
+            lo = ntuple(_ -> 0.0, Val(D))
+            hi = ntuple(_ -> 1.0, Val(D))
+            ps = R3D.Flat.box_planes(lo, hi)
+            @test length(ps) == 2D
+            # Round-trip: clipping a larger box by these planes equals the
+            # inner unit hypercube to floating-point precision.
+            big = R3D.Flat.box(ntuple(_ -> -0.5, Val(D)),
+                               ntuple(_ ->  1.5, Val(D)))
+            R3D.Flat.clip!(big, ps)
+            @test isapprox(R3D.Flat.volume(big), 1.0; atol = 1e-12)
+        end
+        # In-place variant fills the right slots.
+        out4 = Vector{R3D.Plane{4,Float64}}(undef, 8)
+        R3D.Flat.box_planes!(out4, (0.0, 0.0, 0.0, 0.0), (1.0, 1.0, 1.0, 1.0))
+        # Plane 1 is +x at lo[1] = 0; plane 2 is -x at hi[1] = 1.
+        @test out4[1].n == R3D.Vec{4,Float64}(1.0, 0.0, 0.0, 0.0)
+        @test out4[1].d == 0.0
+        @test out4[2].n == R3D.Vec{4,Float64}(-1.0, 0.0, 0.0, 0.0)
+        @test out4[2].d == 1.0
+        # Length-mismatch errors out cleanly.
+        wrong = Vector{R3D.Plane{4,Float64}}(undef, 6)
+        @test_throws AssertionError R3D.Flat.box_planes!(wrong,
+            (0.0, 0.0, 0.0, 0.0), (1.0, 1.0, 1.0, 1.0))
+
+        # copy! public overload (Phase B.3): drop-in for the existing
+        # internal `_copy_polytope_nd!`.
+        for D in 4:6
+            src = R3D.Flat.box(ntuple(_ -> 0.0, Val(D)),
+                               ntuple(_ -> 1.0, Val(D)))
+            dst = R3D.Flat.FlatPolytope{D,Float64}(128)
+            R3D.Flat.copy!(dst, src)
+            @test dst.nverts == src.nverts
+            @test isapprox(R3D.Flat.volume(dst), R3D.Flat.volume(src);
+                           atol = 1e-12)
+            # Mutating dst's positions must not affect src.
+            dst.positions[1, 1] = 999.0
+            @test src.positions[1, 1] != 999.0
+        end
+    end
+
     @testset "Phase 3 groundwork: D ≥ 4 constructors + num_moments" begin
         # init_box for D = 4, 5, 6 — bit-hack vertex enumeration
         for D in 4:6

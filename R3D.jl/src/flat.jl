@@ -197,6 +197,17 @@ function box(lo::NTuple{3,Real}, hi::NTuple{3,Real}; capacity::Int = 512)
     return p
 end
 
+# D-generic convenience constructor. The D=2 / D=3 specializations
+# above pick smaller default capacities tuned to those dimensions.
+# For D ≥ 4 we default to 512 which comfortably accommodates a
+# unit hypercube (2^D vertices) plus several clip cuts.
+function box(lo::NTuple{D,Real}, hi::NTuple{D,Real}; capacity::Int = 512) where {D}
+    @assert D >= 4 "this method is for D ≥ 4 only; D = 2 / D = 3 have specialized methods"
+    p = FlatPolytope{D,Float64}(capacity)
+    init_box!(p, [lo...], [hi...])
+    return p
+end
+
 # ---------------------------------------------------------------------------
 # Helpers — accessing a vertex's position/neighbours as views
 # ---------------------------------------------------------------------------
@@ -2737,6 +2748,19 @@ function simplex(v1::NTuple{2,Real}, v2::NTuple{2,Real}, v3::NTuple{2,Real};
     return p
 end
 
+# D ≥ 4 simplex constructors — explicit per-D dispatches for Aqua
+# unbound-args hygiene. Takes `D + 1` vertices as `NTuple{D,Real}`.
+# The D = 3 analogue is `tet(v1, v2, v3, v4)`.
+for _D in 4:6
+    _M = _D + 1
+    @eval function simplex(verts::Vararg{NTuple{$_D,Real}, $_M};
+                            capacity::Int = 512)
+        p = FlatPolytope{$_D,Float64}(capacity)
+        init_simplex!(p, [collect(Float64, v) for v in verts])
+        return p
+    end
+end
+
 """
     init_poly!(poly::FlatPolytope{2,T}, vertices) -> poly
 
@@ -3300,6 +3324,40 @@ function aabb(poly::StaticFlatPolytope{3,T,N,DN}) where {T,N,DN}
     return ((x_lo, y_lo, z_lo), (x_hi, y_hi, z_hi))
 end
 
+# D-generic axis-aligned bounding box. Used at D ≥ 4 (D = 2 / D = 3
+# have specialized methods above that unroll the per-axis update).
+function aabb(poly::FlatPolytope{D,T}) where {D,T}
+    @assert D >= 4 "this method is for D ≥ 4 only; D = 2 / D = 3 have specialized methods"
+    if poly.nverts <= 0
+        return (ntuple(_ -> T( Inf), Val(D)),
+                ntuple(_ -> T(-Inf), Val(D)))
+    end
+    lo = MVector{D,T}(ntuple(k -> @inbounds(poly.positions[k, 1]), Val(D)))
+    hi = MVector{D,T}(ntuple(k -> @inbounds(poly.positions[k, 1]), Val(D)))
+    @inbounds for v in 2:poly.nverts, k in 1:D
+        x = poly.positions[k, v]
+        x < lo[k] && (lo[k] = x)
+        x > hi[k] && (hi[k] = x)
+    end
+    return (Tuple(lo), Tuple(hi))
+end
+
+function aabb(poly::StaticFlatPolytope{D,T,N,DN}) where {D,T,N,DN}
+    @assert D >= 4 "this method is for D ≥ 4 only; D = 3 has a specialized method above"
+    if poly.nverts <= 0
+        return (ntuple(_ -> T( Inf), Val(D)),
+                ntuple(_ -> T(-Inf), Val(D)))
+    end
+    lo = MVector{D,T}(ntuple(k -> @inbounds(poly.positions[k, 1]), Val(D)))
+    hi = MVector{D,T}(ntuple(k -> @inbounds(poly.positions[k, 1]), Val(D)))
+    @inbounds for v in 2:poly.nverts, k in 1:D
+        x = poly.positions[k, v]
+        x < lo[k] && (lo[k] = x)
+        x > hi[k] && (hi[k] = x)
+    end
+    return (Tuple(lo), Tuple(hi))
+end
+
 """
     box_planes(lo, hi) -> Vector{Plane{D,T}}
 
@@ -3320,6 +3378,19 @@ function box_planes(lo::NTuple{3,T}, hi::NTuple{3,T}) where {T}
     out = Vector{Plane{3,T}}(undef, 6)
     box_planes!(out, lo, hi)
     return out
+end
+
+# D ≥ 4 box_planes: explicit per-D dispatches to keep Aqua's
+# unbound-args check happy (a single `where {D, T}` method binds
+# both parameters only via the argument NTuple, which Aqua flags
+# as ambiguous when `D == 0`). Same pattern as the existing 2D / 3D
+# specializations above.
+for _D in 4:6
+    @eval function box_planes(lo::NTuple{$_D,T}, hi::NTuple{$_D,T}) where {T}
+        out = Vector{Plane{$_D,T}}(undef, 2 * $_D)
+        box_planes!(out, lo, hi)
+        return out
+    end
 end
 
 """
@@ -3353,6 +3424,19 @@ function box_planes!(out::AbstractVector{Plane{3,T}},
         out[4] = Plane{3,T}(Vec{3,T}(T(0),  T(-1), T(0)),  hi[2])
         out[5] = Plane{3,T}(Vec{3,T}(T(0),  T(0),  T( 1)), -lo[3])
         out[6] = Plane{3,T}(Vec{3,T}(T(0),  T(0),  T(-1)),  hi[3])
+    end
+    return out
+end
+
+function box_planes!(out::AbstractVector{Plane{D,T}},
+                     lo::NTuple{D,T}, hi::NTuple{D,T}) where {D,T}
+    @assert D >= 4 "this method is for D ≥ 4 only; D = 2 / D = 3 have specialized methods"
+    @assert length(out) == 2D "box_planes! D=$D needs out of length $(2D), got $(length(out))"
+    @inbounds for k in 1:D
+        n_pos = ntuple(j -> j == k ? T( 1) : T(0), Val(D))
+        n_neg = ntuple(j -> j == k ? T(-1) : T(0), Val(D))
+        out[2k - 1] = Plane{D,T}(Vec{D,T}(n_pos), -lo[k])
+        out[2k    ] = Plane{D,T}(Vec{D,T}(n_neg),  hi[k])
     end
     return out
 end
@@ -3398,6 +3482,11 @@ end
 
 @inline function copy!(dst::FlatPolytope{3,T}, src::FlatPolytope{3,T}) where {T}
     return _copy_polytope!(dst, src)
+end
+
+@inline function copy!(dst::FlatPolytope{D,T}, src::FlatPolytope{D,T}) where {D,T}
+    @assert D >= 4 "this method is for D ≥ 4 only; D = 2 / D = 3 have specialized methods"
+    return _copy_polytope_nd!(dst, src)
 end
 
 # ===========================================================================

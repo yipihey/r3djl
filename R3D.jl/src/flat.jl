@@ -76,7 +76,7 @@ caller-allocated buffer pattern.
 """
 mutable struct FlatPolytope{D,T}
     positions::Matrix{T}    # D × capacity
-    pnbrs::Matrix{Int32}    # D × capacity
+    pnbrs::Matrix{Int32}    # D × capacity (1-based; 0 = "unset")
     nverts::Int
     capacity::Int
 
@@ -91,9 +91,19 @@ mutable struct FlatPolytope{D,T}
     Dm::Array{T,3}
     Cm::Array{T,3}
     moment_order::Int       # current allocated order for Sm/Dm/Cm; -1 = none
+
+    # 2-face connectivity for D ≥ 4 (rNd port). For D ≤ 3 this stays at
+    # the empty (0,0,0) sentinel — D=2 and D=3 clip kernels don't need
+    # it (in D=3 a 2-face coincides with an edge, hence the `find_back3`
+    # shortcut). For D ≥ 4 it is shape `D × D × capacity`, with
+    # `finds[a, b, v]` = `finds[b, a, v]` = the index of the 2-face
+    # containing v's edges to neighbours a and b. Sentinel `0` = unset.
+    finds::Array{Int32,3}
+    nfaces::Int
 end
 
 function FlatPolytope{D,T}(capacity::Int = 512) where {D,T}
+    finds = D >= 4 ? zeros(Int32, D, D, capacity) : Array{Int32,3}(undef, 0, 0, 0)
     FlatPolytope{D,T}(zeros(T, D, capacity),
                       zeros(Int32, D, capacity),
                       0, capacity,
@@ -103,7 +113,9 @@ function FlatPolytope{D,T}(capacity::Int = 512) where {D,T}
                       Array{T,3}(undef, 0, 0, 0),
                       Array{T,3}(undef, 0, 0, 0),
                       Array{T,3}(undef, 0, 0, 0),
-                      -1)
+                      -1,
+                      finds,
+                      0)
 end
 
 """
@@ -2666,6 +2678,20 @@ function init_box!(poly::FlatPolytope{D,T},
             poly.pnbrs[i, v + 1] = Int32((v ⊻ stride) + 1)
         end
     end
+
+    # 2-face connectivity (rNd_init_box, src/rNd.c:568-574). The box has
+    # one 2-face per axis pair (np, np1) with np < np1: any pair of axes
+    # determines a 2D face that is shared by all 2^D vertices via the
+    # symmetry of the hypercube. Total nfaces = D*(D-1)/2.
+    f = 0
+    @inbounds for np in 1:D, np1 in (np + 1):D
+        f += 1
+        for v in 1:nv
+            poly.finds[np,  np1, v] = Int32(f)
+            poly.finds[np1, np,  v] = Int32(f)
+        end
+    end
+    poly.nfaces = f
     return poly
 end
 
@@ -2693,7 +2719,44 @@ function init_simplex!(poly::FlatPolytope{D,T}, vertices) where {D,T}
             poly.pnbrs[i, v] = Int32(((v - 1 + i) % nv) + 1)
         end
     end
+
+    # 2-face connectivity (rNd_init_simplex, src/rNd.c:527-545).
+    # Each unordered vertex triple (v0, v1, v2) defines one 2-face; the
+    # face ID gets written into each of those vertices' finds matrix at
+    # the (slot-of-other, slot-of-other) position. Total faces:
+    # C(D+1, 3) = binomial(nv, 3).
+    f = 0
+    @inbounds for v0 in 1:nv, v1 in (v0+1):nv, v2 in (v1+1):nv
+        f += 1
+        # v0's slots pointing to v1 and v2
+        np1_at_v0 = _find_pnbr_slot(poly, v0, v1, D)
+        np2_at_v0 = _find_pnbr_slot(poly, v0, v2, D)
+        poly.finds[np1_at_v0, np2_at_v0, v0] = Int32(f)
+        poly.finds[np2_at_v0, np1_at_v0, v0] = Int32(f)
+        # v1's slots pointing to v0 and v2
+        np0_at_v1 = _find_pnbr_slot(poly, v1, v0, D)
+        np2_at_v1 = _find_pnbr_slot(poly, v1, v2, D)
+        poly.finds[np0_at_v1, np2_at_v1, v1] = Int32(f)
+        poly.finds[np2_at_v1, np0_at_v1, v1] = Int32(f)
+        # v2's slots pointing to v0 and v1
+        np0_at_v2 = _find_pnbr_slot(poly, v2, v0, D)
+        np1_at_v2 = _find_pnbr_slot(poly, v2, v1, D)
+        poly.finds[np0_at_v2, np1_at_v2, v2] = Int32(f)
+        poly.finds[np1_at_v2, np0_at_v2, v2] = Int32(f)
+    end
+    poly.nfaces = f
     return poly
+end
+
+# Linear scan over poly.pnbrs[1..D, v] for the slot containing `target`.
+# D ≥ 4 simplex/box neighbour graphs are dense, so a 0-return is a bug.
+@inline function _find_pnbr_slot(poly::FlatPolytope, v::Int, target::Int, D::Int)
+    @inbounds for k in 1:D
+        if Int(poly.pnbrs[k, v]) == target
+            return k
+        end
+    end
+    error("_find_pnbr_slot: vertex $v has no neighbour slot pointing to $target (D=$D)")
 end
 
 # ===========================================================================
@@ -3017,38 +3080,386 @@ function Base.show(io::IO, p::StaticFlatPolytope{D,T,N,DN}) where {D,T,N,DN}
 end
 
 # ===========================================================================
-# D ≥ 4 stubs — these will become real implementations in Phase 3 of the
-# HierarchicalGrids overlap-layer work. See docs/phase3_status.md.
+# D ≥ 4 clip! port — translation of rNd_clip from src/rNd.c.
+#
+# The algorithm is the same five-step structure as the 3D `clip!`:
+# (1) signed distances, (2) trivial accept/reject, (3) insert new
+# vertices on cut edges, (4) walk 2-face boundaries to close newly
+# created faces, (5) compact. The genuinely D-generic piece is step
+# 4, which uses the `finds[D][D]` 2-face table to walk around new
+# face boundaries — in D = 3 this collapses to an edge walk (handled
+# by `find_back3` / `next3`), but in D ≥ 4 each face has its own
+# boundary that needs explicit tracking.
+#
+# Indexing convention shift from the C source:
+#   - C: 0-based vertex / pnbrs / face indices, sentinel `-1` for unset.
+#   - Julia: 1-based throughout, sentinel `0` for unset.
 # ===========================================================================
 
 """
     clip!(poly::FlatPolytope{D,T}, planes) where {D ≥ 4}
 
-**Not yet implemented for D ≥ 4.** See `docs/phase3_status.md` for the
-planned port of `rNd_clip` (the `finds[][]` 2-face linker from
-`src/rNd.c`).
+Clip a `D`-dimensional polytope (D ≥ 4) in place against an array of
+half-spaces `planes` (`Plane{D,T}`). Mirrors `rNd_clip` (`src/rNd.c`).
+
+Returns `true` on success, `false` on capacity overflow.
+
+Requires the polytope's `finds[D][D]` 2-face table to be populated (this
+happens automatically when the polytope is built with `init_box!` or
+`init_simplex!` for `D ≥ 4`).
 """
-function clip!(::FlatPolytope{D,T}, ::Any) where {D,T}
-    D >= 4 || error("clip! reached the D ≥ 4 fallback at D = $D")
-    error("R3D.Flat.clip!: D = $D not yet implemented. ",
-          "Tracked in docs/phase3_status.md (Phase 3 of HierarchicalGrids overlap layer). ",
-          "D = 2 and D = 3 are fully supported.")
+function clip!(poly::FlatPolytope{D,T},
+               planes::AbstractVector{Plane{D,T}}) where {D,T}
+    @assert D >= 4 "this method is for D ≥ 4 only; D = 2 / D = 3 have specialized methods"
+    poly.nverts <= 0 && return false
+    @inbounds for plane in planes
+        ok = _clip_plane_nd!(poly, plane)
+        ok || return false
+        poly.nverts == 0 && return true
+    end
+    return true
 end
+
+function _clip_plane_nd!(poly::FlatPolytope{D,T}, plane::Plane{D,T}) where {D,T}
+    sdists  = poly.sdists
+    clipped = poly.clipped
+    onv     = poly.nverts
+
+    # --- Step 1: signed distances + clipped flags
+    smin = T(Inf); smax = T(-Inf)
+    @inbounds for v in 1:onv
+        s = plane.d
+        for i in 1:D
+            s += poly.positions[i, v] * plane.n[i]
+        end
+        sdists[v] = s
+        s < smin && (smin = s)
+        s > smax && (smax = s)
+        clipped[v] = s < 0 ? Int32(1) : Int32(0)
+    end
+
+    # --- Step 2: trivial accept/reject
+    smin >= 0 && return true
+    if smax <= 0
+        poly.nverts = 0
+        return true
+    end
+
+    # --- Step 3: insert new vertices on each cut edge.
+    # For a kept vertex `vcur` whose neighbour `vnext` is clipped, we
+    # insert a new vertex at the cut. The new vertex inherits a partial
+    # `finds` connectivity from `vcur` (the row 0 / column 0 entries are
+    # populated; the rest are sentinel-zero for the linker to fill).
+    @inbounds for vcur in 1:onv
+        clipped[vcur] != 0 && continue
+        for np in 1:D
+            vnext = Int(poly.pnbrs[np, vcur])
+            (vnext == 0 || clipped[vnext] == 0) && continue
+
+            poly.nverts >= poly.capacity && return false
+            new_v = (poly.nverts += 1)
+
+            # Position: weighted average between vcur and vnext.
+            # Match the C formula exactly to keep diff-test agreement at
+            # floating-point precision: (vnext * sd_vcur - vcur * sd_vnext) / (sd_vcur - sd_vnext)
+            for i in 1:D
+                poly.positions[i, new_v] =
+                    (poly.positions[i, vnext] * sdists[vcur] -
+                     poly.positions[i, vcur]  * sdists[vnext]) /
+                    (sdists[vcur] - sdists[vnext])
+            end
+
+            # pnbrs[1] = vcur (the kept vertex side); rest sentinel-zero.
+            poly.pnbrs[1, new_v] = Int32(vcur)
+            for k in 2:D
+                poly.pnbrs[k, new_v] = Int32(0)
+            end
+            # vcur's slot for vnext now points at the new vertex.
+            poly.pnbrs[np, vcur] = Int32(new_v)
+
+            # Carry 2-face IDs from vcur into the new vertex's row 0 /
+            # column 0 of finds. For each np0 ≠ np in vcur's pnbrs, the
+            # 2-face vcur.finds[np][np0] becomes the 2-face
+            # new_v.finds[0][np1] / .finds[np1][0] for np1 = 1..D-1.
+            np1 = 1
+            for np0 in 1:D
+                np0 == np && continue
+                np1 += 1
+                fid = poly.finds[np, np0, vcur]
+                poly.finds[1,   np1, new_v] = fid
+                poly.finds[np1, 1,   new_v] = fid
+            end
+            # Mark everything else (interior of the finds matrix) as 0
+            # for the linker to fill.
+            for np0 in 2:D, np1b in 2:D
+                poly.finds[np0, np1b, new_v] = Int32(0)
+            end
+            clipped[new_v] = Int32(0)
+        end
+    end
+
+    # --- Step 4: walk 2-face boundaries to close all new 2-faces.
+    # For each new vertex `vstart` and each pair of unset slot-pairs
+    # (np0, np1) with np0 < np1 (both ≥ 2 in our 1-based scheme),
+    # walk around the boundary of a newly-created 2-face. Each step
+    # patches `pnbrs` and `finds` so that the new face has consistent
+    # connectivity once the walk returns to vstart.
+    nfaces = poly.nfaces
+    @inbounds for vstart in (onv + 1):poly.nverts, np0 in 2:D, np1 in (np0 + 1):D
+        if poly.finds[np0, np1, vstart] != 0
+            continue   # already closed
+        end
+        # The two faces incident to (vstart's edges in slots np0 and np1)
+        # via row 0 of vstart's finds matrix. The walker will alternate
+        # which is "current" and which is "adjacent" each time it
+        # crosses through a new vertex.
+        fcur = Int(poly.finds[1, np0, vstart])
+        fadj = Int(poly.finds[1, np1, vstart])
+        vprev = vstart
+        vcur  = Int(poly.pnbrs[1, vstart])    # the original vertex on
+                                                # the kept side that vstart
+                                                # was inserted onto.
+        prevnewvert = vstart
+
+        # Walk until we return to vstart.
+        while true
+            if vcur > onv
+                # Reached another new vertex along the boundary.
+                # Find which slot of vcur (in row 0 / column 0) carries
+                # `fcur`, and similarly for prevnewvert; then `np` is
+                # the slot in vcur whose finds[0][np] = fadj.
+                pprev = _find_face_in_row0(poly, vcur, fcur, D)
+                pnext = _find_face_in_row0(poly, prevnewvert, fcur, D)
+                npx   = _find_face_in_row0(poly, vcur, fadj, D)
+                # Patch the new pnbrs link (vcur ↔ prevnewvert) and the
+                # new face ID into both vertices' finds.
+                poly.pnbrs[pprev, vcur]            = Int32(prevnewvert)
+                poly.pnbrs[pnext, prevnewvert]     = Int32(vcur)
+                nfaces += 1
+                poly.finds[pprev, npx, vcur]       = Int32(nfaces)
+                poly.finds[npx, pprev, vcur]       = Int32(nfaces)
+                # Swap fcur ↔ fadj.
+                fcur, fadj = fadj, fcur
+                prevnewvert = vcur
+                vprev = vcur
+                vcur  = Int(poly.pnbrs[1, vcur])
+            end
+            # Now vcur is an original (kept) vertex. Find:
+            #  pprev = slot of vcur pointing back to vprev
+            #  pnext = slot of vcur such that finds[pprev][pnext] == fcur
+            #  npx   = slot of vcur such that finds[npx][pprev] == fadj
+            # Then advance fadj := finds[npx][pnext], walk to pnbrs[pnext].
+            pprev = _find_pnbr_slot_or0(poly, vcur, vprev, D)
+            pnext = _find_face_in_finds_row(poly, vcur, pprev, fcur, D)
+            npx   = _find_face_in_finds_col(poly, vcur, pprev, fadj, D)
+            fadj = Int(poly.finds[npx, pnext, vcur])
+            vprev = vcur
+            vcur  = Int(poly.pnbrs[pnext, vcur])
+            vcur == vstart && break
+        end
+        # Close the loop: same patch as the inside-loop "new vertex"
+        # branch, but executed once at the end with vcur == vstart.
+        pprev = _find_face_in_row0(poly, vcur, fcur, D)
+        pnext = _find_face_in_row0(poly, prevnewvert, fcur, D)
+        npx   = _find_face_in_row0(poly, vcur, fadj, D)
+        poly.pnbrs[pprev, vcur]        = Int32(prevnewvert)
+        poly.pnbrs[pnext, prevnewvert] = Int32(vcur)
+        nfaces += 1
+        poly.finds[pprev, npx, vcur]   = Int32(nfaces)
+        poly.finds[npx, pprev, vcur]   = Int32(nfaces)
+    end
+    poly.nfaces = nfaces
+
+    # --- Step 5: compact (same as 3D, generalized to D pnbrs slots).
+    numunclipped = 0
+    @inbounds for v in 1:poly.nverts
+        if clipped[v] == 0
+            numunclipped += 1
+            if numunclipped != v
+                for i in 1:D
+                    poly.positions[i, numunclipped] = poly.positions[i, v]
+                    poly.pnbrs[i, numunclipped]     = poly.pnbrs[i, v]
+                end
+                for i in 1:D, j in 1:D
+                    poly.finds[i, j, numunclipped] = poly.finds[i, j, v]
+                end
+            end
+            clipped[v] = Int32(numunclipped)
+        else
+            clipped[v] = Int32(0)
+        end
+    end
+    poly.nverts = numunclipped
+    @inbounds for v in 1:poly.nverts, np in 1:D
+        old = Int(poly.pnbrs[np, v])
+        poly.pnbrs[np, v] = old == 0 ? Int32(0) : clipped[old]
+    end
+    return true
+end
+
+# Linear scan of vcur's row 0 of finds for the face ID `target`. Used
+# by the linker when walking through a new vertex.
+@inline function _find_face_in_row0(poly::FlatPolytope, vcur::Int, target::Int, D::Int)
+    @inbounds for k in 2:D
+        if Int(poly.finds[1, k, vcur]) == target
+            return k
+        end
+    end
+    error("_find_face_in_row0: face $target not in row 0 of vertex $vcur")
+end
+
+# Same as _find_pnbr_slot but returns 0 instead of erroring (used in
+# pnbrs-walk where 0 means "not found").
+@inline function _find_pnbr_slot_or0(poly::FlatPolytope, v::Int, target::Int, D::Int)
+    @inbounds for k in 1:D
+        Int(poly.pnbrs[k, v]) == target && return k
+    end
+    return 0
+end
+
+# Find slot pnext such that finds[pprev, pnext, vcur] == target, with
+# pnext ≠ pprev. Used in the linker's per-original-vertex step.
+@inline function _find_face_in_finds_row(poly::FlatPolytope, vcur::Int, pprev::Int,
+                                          target::Int, D::Int)
+    @inbounds for k in 1:D
+        k == pprev && continue
+        Int(poly.finds[pprev, k, vcur]) == target && return k
+    end
+    error("_find_face_in_finds_row: face $target not in row $pprev of vertex $vcur")
+end
+
+# Find slot npx such that finds[npx, pprev, vcur] == target, with
+# npx ≠ pprev.
+@inline function _find_face_in_finds_col(poly::FlatPolytope, vcur::Int, pprev::Int,
+                                          target::Int, D::Int)
+    @inbounds for k in 1:D
+        k == pprev && continue
+        Int(poly.finds[k, pprev, vcur]) == target && return k
+    end
+    error("_find_face_in_finds_col: face $target not in column $pprev of vertex $vcur")
+end
+
+# ===========================================================================
+# D ≥ 4 moments stub (Phase 3d). The 0th moment can be ported from
+# rNd_reduce; higher orders need Lasserre-style decomposition or
+# D-generic Koehl, which is a separate ~week of work.
+# ===========================================================================
 
 """
     moments(poly::FlatPolytope{D,T}, order) where {D ≥ 4}
     moments!(out, poly::FlatPolytope{D,T}, order) where {D ≥ 4}
 
-**Not yet implemented for D ≥ 4.** See `docs/phase3_status.md`.
+The 0th moment is computed via a port of `rNd_reduce` (orthogonalized
+"line-tangent-distance" recursion at each vertex; `src/rNd.c:175–315`).
+**Higher orders (order ≥ 1) are not yet implemented** — they require
+either Lasserre's recursive decomposition or a D-generic Koehl
+recursion, separate work tracked in `docs/phase3_status.md`.
 """
-function moments(::FlatPolytope{D,T}, ::Integer) where {D,T}
+function moments(poly::FlatPolytope{D,T}, order::Integer) where {D,T}
     D >= 4 || error("moments reached the D ≥ 4 fallback at D = $D")
-    error("R3D.Flat.moments: D = $D not yet implemented. See docs/phase3_status.md.")
+    if order == 0
+        out = zeros(T, 1)
+        _reduce_nd_zeroth!(out, poly)
+        return out
+    end
+    error("R3D.Flat.moments: D = $D, order ≥ 1 not yet implemented. ",
+          "Use `moments(poly, 0)` for the 0th moment. See docs/phase3_status.md.")
 end
 
-function moments!(::AbstractVector, ::FlatPolytope{D,T}, ::Integer) where {D,T}
+function moments!(out::AbstractVector{T}, poly::FlatPolytope{D,T},
+                  order::Integer) where {D,T}
     D >= 4 || error("moments! reached the D ≥ 4 fallback at D = $D")
-    error("R3D.Flat.moments!: D = $D not yet implemented. See docs/phase3_status.md.")
+    if order == 0
+        @assert length(out) >= 1
+        _reduce_nd_zeroth!(out, poly)
+        return out
+    end
+    error("R3D.Flat.moments!: D = $D, order ≥ 1 not yet implemented. ",
+          "Use `moments!(out, poly, 0)` for the 0th moment. ",
+          "See docs/phase3_status.md.")
+end
+
+# Port of rNd_reduce (`src/rNd.c:252-315`) for the 0th moment only.
+# Sums per-vertex orthogonalized LTD terms; each per-vertex term is
+# itself a recursive Gram-Schmidt over the D! permutations of the
+# vertex's D outgoing edges.
+function _reduce_nd_zeroth!(out::AbstractVector{T},
+                            poly::FlatPolytope{D,T}) where {D,T}
+    out[1] = zero(T)
+    poly.nverts <= 0 && return out
+    # Pre-allocate scratch on stack (small D guarantees this is fine).
+    processed = MVector{D,Bool}(ntuple(_ -> false, Val(D)))
+    ltd = MMatrix{D,D,T}(zeros(T, D, D))   # ltd[:, dd] is the dd-th orthonormal vector
+    s = zero(T)
+    @inbounds for v in 1:poly.nverts
+        # Reset processed flags
+        for k in 1:D
+            processed[k] = false
+        end
+        s += _reduce_helper_nd(poly, v, 0, processed, ltd, Val(D))
+    end
+    out[1] = s
+    return out
+end
+
+# Recursive Gram-Schmidt LTD helper. `d` is the current depth (0-based,
+# matching the C source), `processed[i]` tracks which of v's pnbrs have
+# been used. When d == D we have a full orthonormal frame and accumulate
+# its contribution.
+function _reduce_helper_nd(poly::FlatPolytope{D,T}, v::Int, d::Int,
+                           processed::MVector{D,Bool},
+                           ltd::MMatrix{D,D,T},
+                           ::Val{D}) where {D,T}
+    if d == D
+        # Full LTD: product of dot(ltd[:,dd], pos_v) / (dd+1) for dd in 0..D-1.
+        ltdsum = one(T)
+        @inbounds for dd in 1:D
+            dot = zero(T)
+            for j in 1:D
+                dot += ltd[j, dd] * poly.positions[j, v]
+            end
+            ltdsum *= dot / dd
+        end
+        return ltdsum
+    end
+
+    s = zero(T)
+    @inbounds for i in 1:D
+        processed[i] && continue
+        # Edge vector: v's position minus its i-th neighbour's position
+        nbr = Int(poly.pnbrs[i, v])
+        for j in 1:D
+            ltd[j, d + 1] = poly.positions[j, v] - poly.positions[j, nbr]
+        end
+        # Gram-Schmidt against prior orthonormal vectors ltd[:, 1..d]
+        for dd in 1:d
+            dotp = zero(T)
+            for j in 1:D
+                dotp += ltd[j, d + 1] * ltd[j, dd]
+            end
+            for j in 1:D
+                ltd[j, d + 1] -= dotp * ltd[j, dd]
+            end
+        end
+        # Normalize
+        len = zero(T)
+        for j in 1:D
+            len += ltd[j, d + 1] * ltd[j, d + 1]
+        end
+        len = sqrt(len)
+        # If the edge is degenerate (collinear with prior), skip this
+        # branch — its contribution is zero. The C code divides anyway
+        # and produces NaN; we guard against that here.
+        len <= eps(T) && continue
+        for j in 1:D
+            ltd[j, d + 1] /= len
+        end
+        # Recurse into the next depth; restore processed[i] on backtrack.
+        processed[i] = true
+        s += _reduce_helper_nd(poly, v, d + 1, processed, ltd, Val(D))
+        processed[i] = false
+    end
+    return s
 end
 
 end # module Flat

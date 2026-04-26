@@ -645,6 +645,65 @@ using LinearAlgebra: I
         @test (@allocated R3D.Flat.copy!(dst3, src3)) == 0
     end
 
+    @testset "R3D.Flat ND (D ≥ 4) — clip + 0th-moment closed forms + diff vs C" begin
+        # Closed-form: unit D-simplex volume = 1/D!, unit D-box volume = 1.
+        for D in 4:6
+            sim = R3D.Flat.FlatPolytope{D,Float64}(128)
+            R3D.Flat.init_simplex!(sim,
+                [ntuple(j -> j == i ? 1.0 : 0.0, D) for i in 0:D])
+            @test isapprox(R3D.Flat.volume(sim), 1 / factorial(D);
+                           atol=1e-12, rtol=1e-10)
+
+            box = R3D.Flat.FlatPolytope{D,Float64}(128)
+            R3D.Flat.init_box!(box, zeros(D), ones(D))
+            @test isapprox(R3D.Flat.volume(box), 1.0; atol=1e-12, rtol=1e-10)
+
+            # Clip with x[1] ≥ 0.5 → slab volume 0.5
+            R3D.Flat.clip!(box, [R3D.Plane{D,Float64}(
+                R3D.Vec{D,Float64}(ntuple(i -> i == 1 ? 1.0 : 0.0, D)), -0.5)])
+            @test isapprox(R3D.Flat.volume(box), 0.5; atol=1e-12, rtol=1e-10)
+        end
+
+        # Order ≥ 1 stays stubbed with informative error.
+        buf4 = R3D.Flat.FlatPolytope{4,Float64}(64)
+        R3D.Flat.init_box!(buf4, zeros(4), ones(4))
+        @test_throws ErrorException R3D.Flat.moments(buf4, 1)
+        @test_throws ErrorException R3D.Flat.moments!(zeros(5), buf4, 1)
+
+        # Differential vs C (only when the per-dimension rNd library is loaded).
+        if HAVE_C && !isempty(R3D_C.libr3d_4d[])
+            rng = Random.MersenneTwister(20260425)
+            for (D, new_poly_fn, init_box_fn, clip_fn, reduce_fn, RVecD, PlaneD) in [
+                (4, R3D_C.new_poly4, R3D_C.init_box4!, R3D_C.clip4!,
+                 R3D_C.reduce4!, R3D_C.RVec4, R3D_C.Plane4),
+            ]
+                cp, cbuf = new_poly_fn()
+                for trial in 1:100
+                    v = randn(rng, D); v ./= sqrt(sum(v.^2))
+                    dd = -sum(v) / 2 + 0.3 * randn(rng)
+
+                    bufjl = R3D.Flat.FlatPolytope{D,Float64}(256)
+                    R3D.Flat.init_box!(bufjl, zeros(D), ones(D))
+                    R3D.Flat.clip!(bufjl, [
+                        R3D.Plane{D,Float64}(R3D.Vec{D,Float64}(v), dd)])
+
+                    GC.@preserve cbuf begin
+                        init_box_fn(cp,
+                            RVecD(ntuple(_ -> 0.0, D)),
+                            RVecD(ntuple(_ -> 1.0, D)))
+                        clip_fn(cp, [PlaneD(RVecD(ntuple(i -> v[i], D)), dd)])
+                        out = zeros(Float64, 1)
+                        reduce_fn(cp, out, 0)
+                        v_jl = bufjl.nverts > 0 ? R3D.Flat.volume(bufjl) : 0.0
+                        @test isapprox(v_jl, out[1]; atol=1e-12, rtol=1e-10)
+                    end
+                end
+            end
+        else
+            @info "skipping D≥4 differential tests; ENV[\"R3D_LIB_4D\"] etc. not set"
+        end
+    end
+
     @testset "Phase 3 groundwork: D ≥ 4 constructors + num_moments" begin
         # init_box for D = 4, 5, 6 — bit-hack vertex enumeration
         for D in 4:6
@@ -671,12 +730,12 @@ using LinearAlgebra: I
             @test R3D.num_moments(D, P) == binomial(D + P, P)
         end
 
-        # Stubs raise informative errors so consumers don't get silent
-        # wrong answers if they call into the unimplemented path.
+        # `clip!` and `moments(., 0)` are now real for D ≥ 4 (Phase 3c
+        # + 3d). Higher-order moments stay stubbed.
         buf4 = R3D.Flat.FlatPolytope{4,Float64}(64)
         R3D.Flat.init_box!(buf4, zeros(4), ones(4))
-        @test_throws ErrorException R3D.Flat.clip!(buf4, [])
-        @test_throws ErrorException R3D.Flat.moments(buf4, 0)
+        @test isapprox(R3D.Flat.moments(buf4, 0)[1], 1.0; atol=1e-12)
+        @test_throws ErrorException R3D.Flat.moments(buf4, 1)
     end
 
     @testset "Hot-loop overlap pattern is 0-alloc end-to-end" begin

@@ -7,6 +7,32 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Phase 3 (D ≥ 4) — clip + 0th-moment ported
+
+- `FlatPolytope{D,T}` carries a lazily-allocated `finds::Array{Int32,3}`
+  and `nfaces::Int` for `D ≥ 4`'s 2-face connectivity table.
+  `init_box!` and `init_simplex!` for `D ≥ 4` populate it mirroring
+  upstream `rNd_init_box` / `rNd_init_simplex`.
+- `clip!(::FlatPolytope{D,T}, planes)` for `D ≥ 4` — full port of
+  `rNd_clip` (`src/rNd.c:26–171`) including the 2-face boundary-walk
+  linker.
+- `moments(poly, 0)` / `moments!(out, poly, 0)` for `D ≥ 4` — port of
+  `rNd_reduce`'s LTD recursion, with one safety improvement:
+  degenerate Gram-Schmidt steps are skipped instead of producing NaN.
+- `R3D_C` exposes per-dimension wrappers: `Poly4{N}`/`Poly5{N}`/`Poly6{N}`
+  struct mirrors and `init_box4!`/`clip4!`/`reduce4!`/`new_poly4`
+  (and analogous for D=5, D=6). Each loads its own
+  `libr3d_{4,5,6}d.dylib` (built with `-DRND_DIM=N` against a
+  conditionalized `rNd.h`); load is gated on `ENV["R3D_LIB_4D"]` etc.
+- 140 new tests: closed-form D-simplex / D-box / slab volumes at
+  D = 4,5,6 and 100 random-clip differential comparisons against C
+  `rNd_clip + rNd_reduce` at D = 4 (max relative diff 3.2e-15, well
+  under the 1e-10 acceptance bar).
+
+Higher-order moments (P ≥ 1) for `D ≥ 4` remain stubbed (informative
+error). See `docs/phase3_status.md` for the path forward (Lasserre or
+D-generic Koehl).
+
 ### Added (HierarchicalGrids overlap-layer support)
 
 - `init_simplex!(buf, vertices)` collection wrappers for D = 2 and D = 3.

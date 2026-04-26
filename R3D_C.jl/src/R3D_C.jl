@@ -27,41 +27,64 @@ using Libdl
 const R3D_MAX_VERTS = parse(Int, get(ENV, "R3D_MAX_VERTS", "512"))
 
 const libr3d = Ref{String}("")
+# Per-dimension rNd libraries (set via ENV["R3D_LIB_4D"] etc., dlopen'd
+# lazily). Each one is a separate compilation of rNd.c with -DRND_DIM=N.
+const libr3d_4d = Ref{String}("")
+const libr3d_5d = Ref{String}("")
+const libr3d_6d = Ref{String}("")
 
 function __init__()
-    # Resolution order:
-    #   1. ENV["R3D_LIB"] — explicit override always wins.
-    #   2. r3d_jll (if installed) — preferred when available.
-    #   3. Warn that no library is set; ccalls will fail.
+    # 1. Main r3d (D = 2 / D = 3) library: ENV["R3D_LIB"] → r3d_jll → warn.
     libpath = get(ENV, "R3D_LIB", "")
+    main_loaded = false
     if !isempty(libpath)
         if !isfile(libpath)
             error("R3D_C: ENV[\"R3D_LIB\"] = $libpath does not exist")
         end
         libr3d[] = libpath
+        main_loaded = true
     else
-        # Try to load r3d_jll lazily so users without it don't pay any
-        # cost (and don't hit a missing-package error when the JLL
-        # isn't yet registered).
-        jll_loaded = false
         try
             @eval Main using r3d_jll
             libr3d[] = Main.r3d_jll.libr3d
-            jll_loaded = true
+            main_loaded = true
         catch
             # JLL not available — fall through.
         end
-        if !jll_loaded
-            @warn "R3D_C: ENV[\"R3D_LIB\"] not set and `r3d_jll` not available; " *
-                  "ccalls will fail until you set R3D_LIB or `Pkg.add(\"r3d_jll\")`."
-            return
-        end
     end
-    try
-        Libdl.dlopen(libr3d[])
-    catch e
-        @error "R3D_C: failed to dlopen $(libr3d[])" exception=e
-        rethrow()
+
+    if main_loaded
+        try
+            Libdl.dlopen(libr3d[])
+        catch e
+            @error "R3D_C: failed to dlopen $(libr3d[])" exception=e
+            rethrow()
+        end
+    else
+        @warn "R3D_C: ENV[\"R3D_LIB\"] not set and `r3d_jll` not available; " *
+              "D=2 / D=3 ccalls will fail until you set R3D_LIB or `Pkg.add(\"r3d_jll\")`."
+    end
+
+    # 2. Per-dimension rNd libraries (optional, independent of the main
+    # r3d library). Each is a separate compilation of rNd.c with
+    # -DRND_DIM=N. When missing, the *_4d / *_5d / *_6d ccalls fail
+    # with a clear pointer at the corresponding ENV var.
+    for (D, ref, var) in ((4, libr3d_4d, "R3D_LIB_4D"),
+                          (5, libr3d_5d, "R3D_LIB_5D"),
+                          (6, libr3d_6d, "R3D_LIB_6D"))
+        p = get(ENV, var, "")
+        isempty(p) && continue
+        if !isfile(p)
+            @warn "R3D_C: ENV[\"$var\"] = $p does not exist; D=$D ccalls disabled"
+            continue
+        end
+        ref[] = p
+        try
+            Libdl.dlopen(p)
+        catch e
+            @warn "R3D_C: failed to dlopen $p" exception=e
+            ref[] = ""
+        end
     end
 end
 
@@ -455,6 +478,214 @@ function rasterize2!(dest_grid::Vector{Float64},
               dest_grid, drv, Int32(polyorder))
     end
     return dest_grid
+end
+
+# ===========================================================================
+# rNd (D ≥ 4) wrappers — one set per dimension. Each set targets a
+# separately-built libr3d_${D}d.dylib (rNd.c compiled with -DRND_DIM=N),
+# so the function names collide across dimensions but live in different
+# libraries.
+#
+# Layout note for `Vertex{D}`: the C struct is
+#   pnbrs[D]   (D × Int32)
+#   finds[D][D] (D*D × Int32, row-major)
+#   pos[D]      (D × Float64)
+# Float64 alignment is 8 bytes. For D ∈ {4, 5, 6}, the int32 prefix
+# (D + D²) * 4 bytes is already 8-byte aligned, so no padding before
+# `pos`. Verify with `sizeof(Vertex4) == 112` etc.
+# ===========================================================================
+
+struct RVec4; xyz::NTuple{4, Float64}; end
+struct Plane4; n::RVec4; d::Float64; end
+struct Vertex4
+    pnbrs::NTuple{4, Int32}
+    finds::NTuple{16, Int32}
+    pos::RVec4
+end
+struct Poly4{N}
+    verts::NTuple{N, Vertex4}
+    nverts::Int32
+    nfaces::Int32
+end
+const RND_4D_MAX_VERTS = 1024
+const Poly4Default = Poly4{RND_4D_MAX_VERTS}
+
+struct RVec5; xyz::NTuple{5, Float64}; end
+struct Plane5; n::RVec5; d::Float64; end
+struct Vertex5
+    pnbrs::NTuple{5, Int32}
+    finds::NTuple{25, Int32}
+    pos::RVec5
+end
+struct Poly5{N}
+    verts::NTuple{N, Vertex5}
+    nverts::Int32
+    nfaces::Int32
+end
+const RND_5D_MAX_VERTS = 1024
+const Poly5Default = Poly5{RND_5D_MAX_VERTS}
+
+struct RVec6; xyz::NTuple{6, Float64}; end
+struct Plane6; n::RVec6; d::Float64; end
+struct Vertex6
+    pnbrs::NTuple{6, Int32}
+    finds::NTuple{36, Int32}
+    pos::RVec6
+end
+struct Poly6{N}
+    verts::NTuple{N, Vertex6}
+    nverts::Int32
+    nfaces::Int32
+end
+const RND_6D_MAX_VERTS = 1024
+const Poly6Default = Poly6{RND_6D_MAX_VERTS}
+
+# Buffer allocation helpers (mirror new_poly() / new_poly2()).
+function new_poly4()
+    buf = zeros(UInt8, sizeof(Poly4Default))
+    return Base.unsafe_convert(Ptr{Poly4Default}, pointer(buf)), buf
+end
+function new_poly5()
+    buf = zeros(UInt8, sizeof(Poly5Default))
+    return Base.unsafe_convert(Ptr{Poly5Default}, pointer(buf)), buf
+end
+function new_poly6()
+    buf = zeros(UInt8, sizeof(Poly6Default))
+    return Base.unsafe_convert(Ptr{Poly6Default}, pointer(buf)), buf
+end
+
+function _check_lib(libref::Ref{String}, var::String, D::Int)
+    isempty(libref[]) && error(
+        "R3D_C: D=$D rNd library not loaded. Set ENV[\"$var\"] to a libr3d_$(D)d.{so,dylib} " *
+        "built with `gcc -O3 -fPIC -shared -DRND_DIM=$D rNd.c -lm` before `using R3D_C`.")
+    return libref[]
+end
+
+# --- D = 4 ccall wrappers --------------------------------------------------
+
+function init_box4!(poly_ptr::Ptr{Poly4{N}}, lo::RVec4, hi::RVec4) where {N}
+    bounds = Ref((lo, hi))
+    GC.@preserve bounds begin
+        ccall((:rNd_init_box, _check_lib(libr3d_4d, "R3D_LIB_4D", 4)),
+              Cvoid, (Ptr{Poly4{N}}, Ptr{NTuple{2,RVec4}}),
+              poly_ptr, Base.unsafe_convert(Ptr{NTuple{2,RVec4}}, bounds))
+    end
+    return poly_ptr
+end
+
+function init_simplex4!(poly_ptr::Ptr{Poly4{N}}, verts::NTuple{5,RVec4}) where {N}
+    vertsref = Ref(verts)
+    GC.@preserve vertsref begin
+        ccall((:rNd_init_simplex, _check_lib(libr3d_4d, "R3D_LIB_4D", 4)),
+              Cvoid, (Ptr{Poly4{N}}, Ptr{NTuple{5,RVec4}}),
+              poly_ptr, Base.unsafe_convert(Ptr{NTuple{5,RVec4}}, vertsref))
+    end
+    return poly_ptr
+end
+
+function clip4!(poly_ptr::Ptr{Poly4{N}}, planes::Vector{Plane4}) where {N}
+    nplanes = Int32(length(planes))
+    ccall((:rNd_clip, _check_lib(libr3d_4d, "R3D_LIB_4D", 4)),
+          Cvoid, (Ptr{Poly4{N}}, Ptr{Plane4}, Int32),
+          poly_ptr, planes, nplanes)
+    return poly_ptr
+end
+
+function reduce4!(poly_ptr::Ptr{Poly4{N}}, moments::Vector{Float64},
+                  polyorder::Integer) where {N}
+    ccall((:rNd_reduce, _check_lib(libr3d_4d, "R3D_LIB_4D", 4)),
+          Cvoid, (Ptr{Poly4{N}}, Ptr{Float64}, Int32),
+          poly_ptr, moments, Int32(polyorder))
+    return moments
+end
+
+function nverts4(poly_ptr::Ptr{Poly4{N}}) where {N}
+    offset = fieldoffset(Poly4{N}, 2)
+    return unsafe_load(reinterpret(Ptr{Int32}, poly_ptr + offset))
+end
+
+# --- D = 5 ccall wrappers --------------------------------------------------
+
+function init_box5!(poly_ptr::Ptr{Poly5{N}}, lo::RVec5, hi::RVec5) where {N}
+    bounds = Ref((lo, hi))
+    GC.@preserve bounds begin
+        ccall((:rNd_init_box, _check_lib(libr3d_5d, "R3D_LIB_5D", 5)),
+              Cvoid, (Ptr{Poly5{N}}, Ptr{NTuple{2,RVec5}}),
+              poly_ptr, Base.unsafe_convert(Ptr{NTuple{2,RVec5}}, bounds))
+    end
+    return poly_ptr
+end
+
+function init_simplex5!(poly_ptr::Ptr{Poly5{N}}, verts::NTuple{6,RVec5}) where {N}
+    vertsref = Ref(verts)
+    GC.@preserve vertsref begin
+        ccall((:rNd_init_simplex, _check_lib(libr3d_5d, "R3D_LIB_5D", 5)),
+              Cvoid, (Ptr{Poly5{N}}, Ptr{NTuple{6,RVec5}}),
+              poly_ptr, Base.unsafe_convert(Ptr{NTuple{6,RVec5}}, vertsref))
+    end
+    return poly_ptr
+end
+
+function clip5!(poly_ptr::Ptr{Poly5{N}}, planes::Vector{Plane5}) where {N}
+    ccall((:rNd_clip, _check_lib(libr3d_5d, "R3D_LIB_5D", 5)),
+          Cvoid, (Ptr{Poly5{N}}, Ptr{Plane5}, Int32),
+          poly_ptr, planes, Int32(length(planes)))
+    return poly_ptr
+end
+
+function reduce5!(poly_ptr::Ptr{Poly5{N}}, moments::Vector{Float64},
+                  polyorder::Integer) where {N}
+    ccall((:rNd_reduce, _check_lib(libr3d_5d, "R3D_LIB_5D", 5)),
+          Cvoid, (Ptr{Poly5{N}}, Ptr{Float64}, Int32),
+          poly_ptr, moments, Int32(polyorder))
+    return moments
+end
+
+function nverts5(poly_ptr::Ptr{Poly5{N}}) where {N}
+    offset = fieldoffset(Poly5{N}, 2)
+    return unsafe_load(reinterpret(Ptr{Int32}, poly_ptr + offset))
+end
+
+# --- D = 6 ccall wrappers --------------------------------------------------
+
+function init_box6!(poly_ptr::Ptr{Poly6{N}}, lo::RVec6, hi::RVec6) where {N}
+    bounds = Ref((lo, hi))
+    GC.@preserve bounds begin
+        ccall((:rNd_init_box, _check_lib(libr3d_6d, "R3D_LIB_6D", 6)),
+              Cvoid, (Ptr{Poly6{N}}, Ptr{NTuple{2,RVec6}}),
+              poly_ptr, Base.unsafe_convert(Ptr{NTuple{2,RVec6}}, bounds))
+    end
+    return poly_ptr
+end
+
+function init_simplex6!(poly_ptr::Ptr{Poly6{N}}, verts::NTuple{7,RVec6}) where {N}
+    vertsref = Ref(verts)
+    GC.@preserve vertsref begin
+        ccall((:rNd_init_simplex, _check_lib(libr3d_6d, "R3D_LIB_6D", 6)),
+              Cvoid, (Ptr{Poly6{N}}, Ptr{NTuple{7,RVec6}}),
+              poly_ptr, Base.unsafe_convert(Ptr{NTuple{7,RVec6}}, vertsref))
+    end
+    return poly_ptr
+end
+
+function clip6!(poly_ptr::Ptr{Poly6{N}}, planes::Vector{Plane6}) where {N}
+    ccall((:rNd_clip, _check_lib(libr3d_6d, "R3D_LIB_6D", 6)),
+          Cvoid, (Ptr{Poly6{N}}, Ptr{Plane6}, Int32),
+          poly_ptr, planes, Int32(length(planes)))
+    return poly_ptr
+end
+
+function reduce6!(poly_ptr::Ptr{Poly6{N}}, moments::Vector{Float64},
+                  polyorder::Integer) where {N}
+    ccall((:rNd_reduce, _check_lib(libr3d_6d, "R3D_LIB_6D", 6)),
+          Cvoid, (Ptr{Poly6{N}}, Ptr{Float64}, Int32),
+          poly_ptr, moments, Int32(polyorder))
+    return moments
+end
+
+function nverts6(poly_ptr::Ptr{Poly6{N}}) where {N}
+    offset = fieldoffset(Poly6{N}, 2)
+    return unsafe_load(reinterpret(Ptr{Int32}, poly_ptr + offset))
 end
 
 end # module R3D_C

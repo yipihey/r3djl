@@ -7,6 +7,45 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Hot loop heap-free at D ≥ 4: `voxelize_fold!` allocations 286 KB → 0
+
+Steady-state per-call heap budget for `voxelize_fold!` at D ≥ 4 is
+now **0 bytes**, down from ~286 KB on the existing
+unit-D=4-box-over-4×4×4×4-grid benchmark (and ~5.8 MB on the first
+call due to per-test-closure recompilation that masked the steady-
+state cost). Three fixes:
+
+- **Closure-boxed `spax` / `split_index`** in the bisection loop:
+  the `ntuple(k -> k == spax ? ... : ..., Val(D))` calls captured
+  mutable locals from the enclosing scope, forcing Julia to box
+  them. Factored each into a small `@inline` helper
+  (`_argmax_extent`, `_axis_unit`, `_replace_at`,
+  `_shifted_index`) that takes its dependencies as parameters, so
+  the closures don't escape the helper's frame. Fix accounts for
+  ~245 KB of the 286 KB.
+- **`MVector{D,Bool}` `processed` set in `_reduce_helper_nd`'s
+  recursion**: each recursive call's mutation of
+  `processed[i] = true; ...; = false` for backtracking forced the
+  MVector onto the heap. Replaced with a `UInt32` bitfield
+  (immutable by-value scalar; backtracking is implicit because the
+  caller's value is unchanged). Removes the recursion's per-call
+  allocation entirely.
+- **`MMatrix{D,D,T}` LTD scratch in `_reduce_nd_zeroth!`**:
+  Julia's escape analysis can't keep a stack-resident MMatrix
+  alive across the recursive `_reduce_helper_nd` call boundary.
+  Moved the scratch onto a new `ltd_scratch::Matrix{T}` field on
+  `FlatPolytope` (lazy-allocated in the constructor for D ≥ 4,
+  empty otherwise). Helper signature relaxed to take a
+  `Matrix{T}` instead of `MMatrix{D,D,T}`. Last 144 bytes go to 0.
+
+The existing test of the steady-state alloc budget on a
+4×4×4×4 voxelize is now `@test a == 0`. The alloc test was wrapped
+in a function so the closure type stays consistent across warmup
+and measurement (each toplevel `do ... end` is a distinct
+anonymous-function type that triggers fresh compilation inside
+`@allocated`, swamping the actual hot-loop cost — that's how the
+~5.8 MB number arose).
+
 ### Bug fix: D ≥ 4 sequential `clip!` corrupts simplex polytopes
 
 Sequential `clip!` calls on a D ≥ 4 simplex (or any polytope whose

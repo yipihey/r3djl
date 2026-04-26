@@ -109,11 +109,20 @@ mutable struct FlatPolytope{D,T}
     # integration (added on top of this in a follow-up session).
     facets::Matrix{Int32}
     nfacets::Int
+
+    # D × D scratch for `_reduce_nd_zeroth!`'s LTD recursion at D ≥ 4.
+    # Allocated once at construction so `moments!`'s hot loop doesn't
+    # heap-allocate an `MMatrix` per call (Julia's escape analysis
+    # can't keep a stack-resident MMatrix alive across the recursive
+    # `_reduce_helper_nd` call boundary). Empty for D ≤ 3, which use
+    # `Sm`/`Dm`/`Cm` for moment integration instead.
+    ltd_scratch::Matrix{T}
 end
 
 function FlatPolytope{D,T}(capacity::Int = 512) where {D,T}
     finds  = D >= 4 ? zeros(Int32, D, D, capacity) : Array{Int32,3}(undef, 0, 0, 0)
     facets = D >= 4 ? zeros(Int32, D,    capacity) : Matrix{Int32}(undef, 0, 0)
+    ltd    = D >= 4 ? zeros(T,     D, D)           : Matrix{T}(undef, 0, 0)
     FlatPolytope{D,T}(zeros(T, D, capacity),
                       zeros(Int32, D, capacity),
                       0, capacity,
@@ -127,7 +136,8 @@ function FlatPolytope{D,T}(capacity::Int = 512) where {D,T}
                       finds,
                       0,
                       facets,
-                      0)
+                      0,
+                      ltd)
 end
 
 """
@@ -1096,18 +1106,15 @@ function voxelize_fold!(callback::F,
 
         cur.nverts <= 0 && continue
 
-        # Find the longest axis to split.
-        spax = 1; dmax = hi[1] - lo[1]
-        for k in 2:D
-            s = hi[k] - lo[k]
-            if s > dmax
-                dmax = s; spax = k
-            end
-        end
+        # Find the longest axis to split. Wrapped in a helper so the
+        # iteration's mutation of `spax` stays local — otherwise the
+        # outer-scope `spax` gets boxed when captured by the `ntuple`
+        # closures below, costing ~1 KB / cell on the hot loop.
+        spax, dmax = _argmax_extent(lo, hi, Val(D))
 
         if dmax == 1
             moments!(moments_buf, cur, order)
-            idx = ntuple(k -> lo[k] - ibox_lo[k] + 1, Val(D))
+            idx = _shifted_index(lo, ibox_lo, Val(D))
             state = callback(state, idx, moments_buf)
             continue
         end
@@ -1132,23 +1139,49 @@ function voxelize_fold!(callback::F,
         out0 = ws.polys[nstack + 1]   # alias of cur — becomes negative half
         out1 = ws.polys[nstack + 2]   # fresh slot — gets positive half
 
-        n_pos = ntuple(k -> k == spax ? T(1) : T(0), Val(D))
-        n_neg = ntuple(k -> k == spax ? T(-1) : T(0), Val(D))
-        plane_pos = Plane{D,T}(Vec{D,T}(n_pos), -split_pos)
-        plane_neg = Plane{D,T}(Vec{D,T}(n_neg),  split_pos)
+        plane_pos = Plane{D,T}(Vec{D,T}(_axis_unit(spax,  one(T), Val(D))), -split_pos)
+        plane_neg = Plane{D,T}(Vec{D,T}(_axis_unit(spax, -one(T), Val(D))),  split_pos)
 
         _copy_polytope_nd!(out1, cur)
         clip!(out0, plane_neg)        # cur (=out0) clipped in place
         clip!(out1, plane_pos)
 
-        hi_left  = ntuple(k -> k == spax ? split_index : hi[k], Val(D))
-        lo_right = ntuple(k -> k == spax ? split_index : lo[k], Val(D))
+        hi_left  = _replace_at(hi, spax, split_index, Val(D))
+        lo_right = _replace_at(lo, spax, split_index, Val(D))
         ws.iboxes[nstack + 1] = (lo, hi_left)
         ws.iboxes[nstack + 2] = (lo_right, hi)
         nstack += 2
     end
     return state
 end
+
+# Helpers for the D ≥ 4 voxelize_fold! hot loop. Factored out so the
+# `ntuple` closures don't capture mutable locals from the parent
+# scope (which would force boxing — the original cause of the
+# per-cell ~1 KB allocation regression).
+@inline function _argmax_extent(lo::NTuple{D,Int}, hi::NTuple{D,Int},
+                                ::Val{D}) where {D}
+    spax = 1
+    dmax = hi[1] - lo[1]
+    @inbounds for k in 2:D
+        s = hi[k] - lo[k]
+        if s > dmax
+            dmax = s
+            spax = k
+        end
+    end
+    return spax, dmax
+end
+
+@inline _shifted_index(lo::NTuple{D,Int}, ibox_lo::NTuple{D,Int},
+                       ::Val{D}) where {D} =
+    ntuple(k -> lo[k] - ibox_lo[k] + 1, Val(D))
+
+@inline _axis_unit(axis::Int, sign::T, ::Val{D}) where {D,T} =
+    ntuple(k -> k == axis ? sign : zero(T), Val(D))
+
+@inline _replace_at(t::NTuple{D,Int}, k::Int, v::Int, ::Val{D}) where {D} =
+    ntuple(i -> i == k ? v : t[i], Val(D))
 
 """
     voxelize!(dest_grid::AbstractArray{T,DG}, poly::FlatPolytope{D,T},
@@ -3886,27 +3919,30 @@ function _reduce_nd_zeroth!(out::AbstractVector{T},
                             poly::FlatPolytope{D,T}) where {D,T}
     out[1] = zero(T)
     poly.nverts <= 0 && return out
-    # Pre-allocate scratch on stack (small D guarantees this is fine).
-    processed = MVector{D,Bool}(ntuple(_ -> false, Val(D)))
-    ltd = MMatrix{D,D,T}(zeros(T, D, D))
+    # The LTD scratch is owned by the polytope so `_reduce_helper_nd`
+    # can mutate it in place without per-call heap allocation. The
+    # `processed` set is a UInt32 bitfield (rather than an
+    # `MVector{D,Bool}`) so Julia's escape analysis sees it as a plain
+    # by-value scalar across the recursive call boundary. Both matter
+    # for `voxelize_fold!`'s hot loop, which calls this once per leaf.
+    @assert D <= 32 "_reduce_nd_zeroth! UInt32 processed-bitfield supports up to D = 32"
+    ltd = poly.ltd_scratch
     s = zero(T)
     @inbounds for v in 1:poly.nverts
-        for k in 1:D
-            processed[k] = false
-        end
-        s += _reduce_helper_nd(poly, v, 0, processed, ltd, Val(D))
+        s += _reduce_helper_nd(poly, v, 0, UInt32(0), ltd, Val(D))
     end
     out[1] = s
     return out
 end
 
 # Recursive Gram-Schmidt LTD helper. `d` is the current depth (0-based,
-# matching the C source), `processed[i]` tracks which of v's pnbrs have
-# been used. When d == D we have a full orthonormal frame and accumulate
-# its contribution.
+# matching the C source); `processed` is a UInt32 bitfield where bit
+# (i-1) indicates whether vertex slot `i` has already been used at a
+# higher-up recursion level. When d == D we have a full orthonormal
+# frame and accumulate its contribution.
 function _reduce_helper_nd(poly::FlatPolytope{D,T}, v::Int, d::Int,
-                           processed::MVector{D,Bool},
-                           ltd::MMatrix{D,D,T},
+                           processed::UInt32,
+                           ltd::Matrix{T},
                            ::Val{D}) where {D,T}
     if d == D
         # Full LTD: product of dot(ltd[:,dd], pos_v) / (dd+1) for dd in 0..D-1.
@@ -3923,7 +3959,7 @@ function _reduce_helper_nd(poly::FlatPolytope{D,T}, v::Int, d::Int,
 
     s = zero(T)
     @inbounds for i in 1:D
-        processed[i] && continue
+        ((processed >> (i - 1)) & UInt32(1)) == UInt32(1) && continue
         # Edge vector: v's position minus its i-th neighbour's position
         nbr = Int(poly.pnbrs[i, v])
         for j in 1:D
@@ -3952,10 +3988,12 @@ function _reduce_helper_nd(poly::FlatPolytope{D,T}, v::Int, d::Int,
         for j in 1:D
             ltd[j, d + 1] /= len
         end
-        # Recurse into the next depth; restore processed[i] on backtrack.
-        processed[i] = true
-        s += _reduce_helper_nd(poly, v, d + 1, processed, ltd, Val(D))
-        processed[i] = false
+        # Recurse into the next depth. Backtracking is implicit — the
+        # caller's UInt32 is unchanged; we OR-in slot `i` only for the
+        # callee's frame.
+        s += _reduce_helper_nd(poly, v, d + 1,
+                                processed | (UInt32(1) << (i - 1)),
+                                ltd, Val(D))
     end
     return s
 end

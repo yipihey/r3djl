@@ -1018,21 +1018,26 @@ using LinearAlgebra: I
         ibox_lo = ntuple(_ -> 0, D)
         ibox_hi = ntuple(_ -> 4, D)
 
+        # Wrap in a function so the closure type stays the same across
+        # warmup and measurement — each toplevel `do ... end` is a
+        # distinct anonymous-function type, which would otherwise
+        # trigger fresh compilation inside `@allocated` and dominate
+        # the measurement (millions of bytes of compiler internals).
+        function _vfold_sumvol(buf, ibox_lo, ibox_hi, d_grid, ws)
+            R3D.Flat.voxelize_fold!(0.0, buf, ibox_lo, ibox_hi, d_grid,
+                                    0; workspace = ws) do acc, idx, m
+                acc + m[1]
+            end
+        end
         # warmup pass — first call may allocate workspace stack growth /
         # moment scratch resize; we measure the second call.
-        R3D.Flat.voxelize_fold!(0.0, buf, ibox_lo, ibox_hi, d_grid, 0;
-                                workspace = ws) do acc, idx, m
-            acc + m[1]
-        end
-        a = @allocated R3D.Flat.voxelize_fold!(0.0, buf, ibox_lo, ibox_hi, d_grid, 0;
-                                               workspace = ws) do acc, idx, m
-            acc + m[1]
-        end
-        # Per-leaf `[plane]` array allocations have been removed; the
-        # remaining ~kilobyte budget covers stack frame setup for the
-        # closure call and the NTuple iboxes. The previous implementation
-        # paid ~100s of KB on this same input.
-        @test a < 8 * 1024
+        _vfold_sumvol(buf, ibox_lo, ibox_hi, d_grid, ws)
+        a = @allocated _vfold_sumvol(buf, ibox_lo, ibox_hi, d_grid, ws)
+        # Hot loop is now fully heap-free: the per-leaf `[plane]`
+        # array allocations were removed via the single-plane `clip!`
+        # overload, and the LTD scratch backing the per-leaf
+        # `_reduce_nd_zeroth!` call lives on the polytope itself.
+        @test a == 0
     end
 
     @testset "D ≥ 4 sequential clips don't corrupt finds[][]" begin

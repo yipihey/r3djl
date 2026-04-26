@@ -2711,3 +2711,145 @@ end
                        R3D.Flat.moments(float_poly, 0)[1]; atol = 1e-9)
     end
 end
+
+@testset "R3D.IntExact polynomial moments at D ∈ {2, 3}" begin
+    factorial_int(n) = prod(1:n; init = 1)
+    function expected_simplex(α, D)
+        s = sum(α)
+        num = prod(factorial_int(a) for a in α; init = 1)
+        return Rational{BigInt}(num) // factorial_int(D + s)
+    end
+    expected_box(α) = prod(1 // (a + 1) for a in α; init = 1 // 1)
+
+    @testset "D = 2 closed-form simplex + box" begin
+        T = Int64
+        # Unit triangle (origin + e_1 + e_2): moments_exact at P ∈ 1..3.
+        for P in 1:3
+            sim = R3D.IntExact.IntFlatPolytope{2,T}(64)
+            R3D.IntExact.init_simplex!(sim, [0, 0], [1, 0], [0, 1])
+            m = R3D.IntExact.moments_exact(sim, P)
+            for (i, α) in enumerate([(a, P_total - a)
+                                     for P_total in 0:P
+                                     for a in P_total:-1:0])
+                @test m[i] == expected_simplex((α[1], α[2]), 2)
+            end
+
+            # Unit square: ∏ 1/(α_j + 1)
+            box = R3D.IntExact.IntFlatPolytope{2,T}(64)
+            R3D.IntExact.init_box!(box, [0, 0], [1, 1])
+            m_box = R3D.IntExact.moments_exact(box, P)
+            for (i, α) in enumerate([(a, P_total - a)
+                                     for P_total in 0:P
+                                     for a in P_total:-1:0])
+                @test m_box[i] == expected_box((α[1], α[2]))
+            end
+        end
+    end
+
+    @testset "D = 3 closed-form simplex + box" begin
+        T = Int64
+        for P in 1:3
+            sim = R3D.IntExact.IntFlatPolytope{3,T}(64)
+            R3D.IntExact.init_tet!(sim,
+                ([0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]))
+            m = R3D.IntExact.moments_exact(sim, P)
+            i = 0
+            for P_total in 0:P
+                for a in P_total:-1:0, b in (P_total - a):-1:0
+                    c = P_total - a - b
+                    i += 1
+                    @test m[i] == expected_simplex((a, b, c), 3)
+                end
+            end
+
+            box = R3D.IntExact.IntFlatPolytope{3,T}(64)
+            R3D.IntExact.init_box!(box, [0, 0, 0], [1, 1, 1])
+            m_box = R3D.IntExact.moments_exact(box, P)
+            i = 0
+            for P_total in 0:P
+                for a in P_total:-1:0, b in (P_total - a):-1:0
+                    c = P_total - a - b
+                    i += 1
+                    @test m_box[i] == expected_box((a, b, c))
+                end
+            end
+        end
+    end
+
+    @testset "Cross-check vs R3D.Flat float oracle (D ∈ {2, 3})" begin
+        T = Int64
+        rng = Random.MersenneTwister(20260429)
+        # D = 2: random integer rectangles + integer planes, P = 1..2.
+        for trial in 1:50
+            lo = (rand(rng, -3:3), rand(rng, -3:3))
+            hi = (lo[1] + rand(rng, 1:5), lo[2] + rand(rng, 1:5))
+            int_poly   = R3D.IntExact.IntFlatPolytope{2,T}(64)
+            float_poly = R3D.Flat.FlatPolytope{2,Float64}(64)
+            R3D.IntExact.init_box!(int_poly, [lo[1], lo[2]], [hi[1], hi[2]])
+            R3D.Flat.init_box!(float_poly, [lo...], [hi...])
+            for _ in 1:rand(rng, 0:2)
+                a = rand(rng, -3:3); b = rand(rng, -3:3); c = rand(rng, -10:10)
+                if a == 0 && b == 0; continue; end
+                R3D.IntExact.clip!(int_poly,
+                    R3D.Plane{2,T}(R3D.Vec{2,T}(a, b), c))
+                R3D.Flat.clip!(float_poly,
+                    R3D.Plane{2,Float64}(R3D.Vec{2,Float64}(a, b), c))
+            end
+            int_poly.nverts == 0 && continue
+            for P in 1:2
+                m_int   = R3D.IntExact.moments_exact(int_poly, P; R = Int128)
+                m_float = R3D.Flat.moments(float_poly, P)
+                for k in eachindex(m_float)
+                    @test isapprox(Float64(m_int[k]), m_float[k];
+                                   atol = 1e-9, rtol = 1e-9)
+                end
+            end
+        end
+
+        # D = 3: random integer cubes + integer planes, P = 1..2.
+        for trial in 1:30
+            lo = (rand(rng, -2:2), rand(rng, -2:2), rand(rng, -2:2))
+            hi = (lo[1] + rand(rng, 1:4),
+                  lo[2] + rand(rng, 1:4),
+                  lo[3] + rand(rng, 1:4))
+            int_poly   = R3D.IntExact.IntFlatPolytope{3,T}(128)
+            float_poly = R3D.Flat.FlatPolytope{3,Float64}(128)
+            R3D.IntExact.init_box!(int_poly, [lo...], [hi...])
+            R3D.Flat.init_box!(float_poly, [lo...], [hi...])
+            for _ in 1:rand(rng, 0:2)
+                a = rand(rng, -2:2); b = rand(rng, -2:2); c = rand(rng, -2:2); d = rand(rng, -8:8)
+                if a == 0 && b == 0 && c == 0; continue; end
+                R3D.IntExact.clip!(int_poly,
+                    R3D.Plane{3,T}(R3D.Vec{3,T}(a, b, c), d))
+                R3D.Flat.clip!(float_poly,
+                    R3D.Plane{3,Float64}(R3D.Vec{3,Float64}(a, b, c), d))
+            end
+            int_poly.nverts == 0 && continue
+            for P in 1:2
+                m_int   = R3D.IntExact.moments_exact(int_poly, P; R = Int128)
+                m_float = R3D.Flat.moments(float_poly, P)
+                for k in eachindex(m_float)
+                    @test isapprox(Float64(m_int[k]), m_float[k];
+                                   atol = 1e-8, rtol = 1e-8)
+                end
+            end
+        end
+    end
+
+    @testset "BigInt accumulator path (overflow defense)" begin
+        # P = 3 on a heavily-clipped D = 3 polytope with rational vertices —
+        # ensures the BigInt path produces exact rationals matching the
+        # default-T path within numerical agreement.
+        T = Int128
+        poly = R3D.IntExact.IntFlatPolytope{3,T}(128)
+        R3D.IntExact.init_box!(poly, [0, 0, 0], [4, 4, 4])
+        # A diagonal cut producing rational vertices.
+        R3D.IntExact.clip!(poly,
+            R3D.Plane{3,T}(R3D.Vec{3,T}(1, 1, 1), -5))
+        m_t   = R3D.IntExact.moments_exact(poly, 2; R = T)
+        m_big = R3D.IntExact.moments_exact(poly, 2; R = BigInt)
+        for k in eachindex(m_t)
+            @test m_t[k] == m_big[k]   # exact rational equality
+        end
+    end
+end

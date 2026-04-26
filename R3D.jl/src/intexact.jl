@@ -41,7 +41,7 @@ hard guarantee.
 module IntExact
 
 using StaticArrays: SVector, MVector
-using ..R3D: Plane, Vec
+using ..R3D: Plane, Vec, num_moments
 
 # ---------------------------------------------------------------------------
 # Type
@@ -672,6 +672,283 @@ function area_exact(poly::IntFlatPolytope{2,T},
         end
     end
     return sum_rat // 2
+end
+
+# ===========================================================================
+# Polynomial moments at D ∈ {2, 3} — direct exact-rational port of the
+# `R3D.Flat.moments!` Koehl recursion. Same per-edge / per-face boundary
+# walk; same `Sm` / `Dm` / `Cm` polynomial-coefficient scratch; same
+# normalization at the end. The float kernel uses only integer-constant
+# division and multiplication / addition / subtraction in vertex
+# coordinates, so the algorithm is exact-rational compatible verbatim
+# once the storage type changes from `T` to `Rational{R}`.
+#
+# Returns `Vector{Rational{R}}` of length `R3D.num_moments(D, P)`. The
+# `R` accumulator type defaults to the polytope's storage type; pass
+# a wider integer type (`R = BigInt`) to defend against numerator-product
+# overflow when the polytope has been clipped repeatedly.
+# ===========================================================================
+
+"""
+    moments_exact(poly::IntFlatPolytope{D, T}, P::Integer;
+                  R::Type{<:Signed} = T) -> Vector{Rational{R}}
+
+Compute moments `∫ x_1^{α_1} … x_D^{α_D} dV` over `poly`, exactly
+as `Rational{R}`, for every multi-index `α` with `|α| ≤ P`. Result
+is in canonical lex-by-degree order (matching `R3D.Flat.moments` at
+the same D).
+
+The accumulator type `R` defaults to `T`; pass `R = BigInt` (or
+another wider integer type) for overflow defense — the per-edge /
+per-face Koehl recursion's polynomial-scratch denominators grow
+roughly as `O(P^D)` bits per step.
+
+Allocation: one `Rational{R}` per `out[i]` plus a small (`(P+1)^D`)
+polynomial scratch per call. Exact arithmetic has an inherent
+allocation cost beyond what the IntExact `clip!` hot path manages.
+"""
+function moments_exact(poly::IntFlatPolytope{D, T}, P::Integer;
+                       R::Type{<:Signed} = T) where {D, T}
+    out = Vector{Rational{R}}(undef, num_moments(D, Int(P)))
+    moments_exact!(out, poly, Int(P))
+    return out
+end
+
+"""
+    moments_exact!(out::AbstractVector{Rational{R}},
+                   poly::IntFlatPolytope{D, T}, P::Integer) -> out
+
+In-place form of [`moments_exact`](@ref). The accumulator type
+`R` is taken from `out`'s element type (`out::Vector{Rational{R}}`),
+so to use BigInt accumulation, pass
+`out::Vector{Rational{BigInt}}`. `length(out) ≥ num_moments(D, P)`
+required. Writes the moments into `out` in canonical order.
+Returns `out`.
+"""
+function moments_exact!(out::AbstractVector{Rational{R}},
+                         poly::IntFlatPolytope{D, T},
+                         P::Integer) where {D, T, R<:Signed}
+    @assert length(out) >= num_moments(D, Int(P))
+    fill!(out, zero(Rational{R}))
+    poly.nverts <= 0 && return out
+    if D == 2
+        return _moments_exact_d2!(out, poly, Int(P), R)
+    elseif D == 3
+        return _moments_exact_d3!(out, poly, Int(P), R)
+    else
+        error("moments_exact!: D = $D not supported in IntExact (D ∈ {2, 3} only). ",
+              "Phase 6 of d4plus_finalization_plan.md will add D ≥ 4 volume; ",
+              "polynomial moments at D ≥ 4 are research-grade (sqrt-free " *
+              "alternatives to Lasserre).")
+    end
+end
+
+# Convert a vertex's stored shared-denominator integer position into a
+# `Rational{R}` per coordinate. Allocates two `Rational{R}` per call.
+@inline _vertex_rational_d2(poly::IntFlatPolytope{2, T}, v::Int,
+                             ::Type{R}) where {T, R} =
+    (R(poly.positions_num[1, v]) // R(poly.positions_den[v]),
+     R(poly.positions_num[2, v]) // R(poly.positions_den[v]))
+
+@inline _vertex_rational_d3(poly::IntFlatPolytope{3, T}, v::Int,
+                             ::Type{R}) where {T, R} =
+    (R(poly.positions_num[1, v]) // R(poly.positions_den[v]),
+     R(poly.positions_num[2, v]) // R(poly.positions_den[v]),
+     R(poly.positions_num[3, v]) // R(poly.positions_den[v]))
+
+# Direct exact-rational port of `R3D.Flat.moments!(::FlatPolytope{2, T})`.
+# Same per-edge boundary walk on pnbrs[1] (CCW next), same Cm/Dm
+# polynomial-scratch recursion, same `out[m] /= Cv·(corder+1)·(corder+2)`
+# normalization. The only differences:
+# - `twoa = v0x*v1y - v0y*v1x` → exact rational product.
+# - `out[1] += 0.5 * twoa` → `out[1] += twoa // 2`.
+# - polynomial-scratch arrays are `Rational{R}` (heap-allocated;
+#   one per call, reused across vertex iterations).
+function _moments_exact_d2!(out::AbstractVector{Rational{R}},
+                             poly::IntFlatPolytope{2, T}, P::Int,
+                             ::Type{R}) where {T, R<:Signed}
+    np1 = P + 1
+    Dm = Array{Rational{R}, 3}(undef, np1, 1, 2)
+    Cm = Array{Rational{R}, 3}(undef, np1, 1, 2)
+    fill!(Dm, zero(Rational{R}))
+    fill!(Cm, zero(Rational{R}))
+    prevlayer = 1; curlayer = 2
+
+    nv = poly.nverts
+    @inbounds for vcur in 1:nv
+        vnext = Int(poly.pnbrs[1, vcur])
+        v0x, v0y = _vertex_rational_d2(poly, vcur,  R)
+        v1x, v1y = _vertex_rational_d2(poly, vnext, R)
+
+        twoa = v0x * v1y - v0y * v1x
+
+        Dm[1, 1, prevlayer] = one(Rational{R})
+        Cm[1, 1, prevlayer] = one(Rational{R})
+        out[1] += twoa // 2
+
+        m = 1
+        for corder in 1:P
+            for i in corder:-1:0
+                j = corder - i
+                m += 1
+                ci = i + 1
+                Cv = zero(Rational{R}); Dv = zero(Rational{R})
+                if i > 0
+                    Cv += v1x * Cm[ci - 1, 1, prevlayer]
+                    Dv += v0x * Dm[ci - 1, 1, prevlayer]
+                end
+                if j > 0
+                    Cv += v1y * Cm[ci, 1, prevlayer]
+                    Dv += v0y * Dm[ci, 1, prevlayer]
+                end
+                Dv += Cv
+                Cm[ci, 1, curlayer] = Cv
+                Dm[ci, 1, curlayer] = Dv
+                out[m] += twoa * Dv
+            end
+            curlayer  = 3 - curlayer
+            prevlayer = 3 - prevlayer
+        end
+    end
+
+    @inbounds Cm[1, 1, prevlayer] = one(Rational{R})
+    m = 1
+    for corder in 1:P
+        for i in corder:-1:0
+            j = corder - i
+            m += 1
+            ci = i + 1
+            Cv = zero(Rational{R})
+            i > 0 && (Cv += Cm[ci - 1, 1, prevlayer])
+            j > 0 && (Cv += Cm[ci, 1, prevlayer])
+            Cm[ci, 1, curlayer] = Cv
+            out[m] = out[m] // (Cv * (corder + 1) * (corder + 2))
+        end
+        curlayer  = 3 - curlayer
+        prevlayer = 3 - prevlayer
+    end
+    return out
+end
+
+# Direct exact-rational port of `R3D.Flat.moments!(::FlatPolytope{3, T})`.
+# Same per-face boundary walk via emarks; same fan-triangulation from
+# each face's first vertex; same Sm/Dm/Cm polynomial-scratch recursion;
+# same `out[m] /= Cv·(corder+1)·(corder+2)·(corder+3)` normalization.
+function _moments_exact_d3!(out::AbstractVector{Rational{R}},
+                             poly::IntFlatPolytope{3, T}, P::Int,
+                             ::Type{R}) where {T, R<:Signed}
+    nv = poly.nverts
+    np1 = P + 1
+    Sm = Array{Rational{R}, 3}(undef, np1, np1, 2)
+    Dm = Array{Rational{R}, 3}(undef, np1, np1, 2)
+    Cm = Array{Rational{R}, 3}(undef, np1, np1, 2)
+    fill!(Sm, zero(Rational{R}))
+    fill!(Dm, zero(Rational{R}))
+    fill!(Cm, zero(Rational{R}))
+
+    emarks = falses(nv, 3)
+    prevlayer = 1; curlayer = 2
+
+    @inbounds for vstart in 1:nv, pstart in 1:3
+        emarks[vstart, pstart] && continue
+
+        pnext = pstart
+        vcur = vstart
+        emarks[vcur, pnext] = true
+        vnext = Int(poly.pnbrs[pnext, vcur])
+        v0x, v0y, v0z = _vertex_rational_d3(poly, vcur, R)
+
+        np = _find_back3_intexact(poly.pnbrs, vnext, vcur)
+        vcur = vnext
+        pnext = (np == 3) ? 1 : (np + 1)
+        emarks[vcur, pnext] = true
+        vnext = Int(poly.pnbrs[pnext, vcur])
+
+        while vnext != vstart
+            v2x, v2y, v2z = _vertex_rational_d3(poly, vcur,  R)
+            v1x, v1y, v1z = _vertex_rational_d3(poly, vnext, R)
+
+            sixv = -v2x * v1y * v0z + v1x * v2y * v0z +
+                    v2x * v0y * v1z - v0x * v2y * v1z -
+                    v1x * v0y * v2z + v0x * v1y * v2z
+
+            Sm[1, 1, prevlayer] = one(Rational{R})
+            Dm[1, 1, prevlayer] = one(Rational{R})
+            Cm[1, 1, prevlayer] = one(Rational{R})
+            out[1] += sixv // 6
+
+            m = 1
+            for corder in 1:P
+                for i in corder:-1:0, j in (corder - i):-1:0
+                    k = corder - i - j
+                    m += 1
+                    ci = i + 1; cj = j + 1
+                    Cv = zero(Rational{R}); Dv = zero(Rational{R}); Sv = zero(Rational{R})
+                    if i > 0
+                        Cv += v2x * Cm[ci - 1, cj, prevlayer]
+                        Dv += v1x * Dm[ci - 1, cj, prevlayer]
+                        Sv += v0x * Sm[ci - 1, cj, prevlayer]
+                    end
+                    if j > 0
+                        Cv += v2y * Cm[ci, cj - 1, prevlayer]
+                        Dv += v1y * Dm[ci, cj - 1, prevlayer]
+                        Sv += v0y * Sm[ci, cj - 1, prevlayer]
+                    end
+                    if k > 0
+                        Cv += v2z * Cm[ci, cj, prevlayer]
+                        Dv += v1z * Dm[ci, cj, prevlayer]
+                        Sv += v0z * Sm[ci, cj, prevlayer]
+                    end
+                    Dv += Cv
+                    Sv += Dv
+                    Cm[ci, cj, curlayer] = Cv
+                    Dm[ci, cj, curlayer] = Dv
+                    Sm[ci, cj, curlayer] = Sv
+                    out[m] += sixv * Sv
+                end
+                curlayer  = 3 - curlayer
+                prevlayer = 3 - prevlayer
+            end
+
+            np = _find_back3_intexact(poly.pnbrs, vnext, vcur)
+            vcur = vnext
+            pnext = (np == 3) ? 1 : (np + 1)
+            emarks[vcur, pnext] = true
+            vnext = Int(poly.pnbrs[pnext, vcur])
+        end
+    end
+
+    @inbounds Cm[1, 1, prevlayer] = one(Rational{R})
+    m = 1
+    for corder in 1:P
+        for i in corder:-1:0, j in (corder - i):-1:0
+            k = corder - i - j
+            m += 1
+            ci = i + 1; cj = j + 1
+            Cv = zero(Rational{R})
+            i > 0 && (Cv += Cm[ci - 1, cj, prevlayer])
+            j > 0 && (Cv += Cm[ci, cj - 1, prevlayer])
+            k > 0 && (Cv += Cm[ci, cj, prevlayer])
+            Cm[ci, cj, curlayer] = Cv
+            out[m] = out[m] //
+                     (Cv * (corder + 1) * (corder + 2) * (corder + 3))
+        end
+        curlayer  = 3 - curlayer
+        prevlayer = 3 - prevlayer
+    end
+    return out
+end
+
+# Local copy of `R3D.Flat.find_back3` — kept here so this submodule
+# doesn't reach into Flat's internals. The 3-regular pnbrs graph at
+# D = 3 makes the by-elimination return correct.
+@inline function _find_back3_intexact(pnbrs::Matrix{Int32},
+                                       vnext::Int, vcur::Int)
+    @inbounds begin
+        pnbrs[1, vnext] == Int32(vcur) && return 1
+        pnbrs[2, vnext] == Int32(vcur) && return 2
+        return 3
+    end
 end
 
 end # module IntExact

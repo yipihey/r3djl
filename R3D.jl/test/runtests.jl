@@ -2560,3 +2560,154 @@ end
         @test R3D.IntExact.volume_exact(buf) == 1232 // 1
     end
 end
+
+@testset "R3D.IntExact (D=2 integer-coordinate polytopes)" begin
+    @testset "Closed-form areas" begin
+        for T in (Int64, Int128)
+            # Unit square = 1
+            b = R3D.IntExact.IntFlatPolytope{2,T}(64)
+            R3D.IntExact.init_box!(b, [0, 0], [1, 1])
+            @test R3D.IntExact.area_exact(b) == 1 // 1
+            @test b.nverts == 4
+            for v in 1:b.nverts
+                @test b.positions_den[v] == 1
+            end
+
+            # Scaled rectangle = lo·hi product
+            b2 = R3D.IntExact.IntFlatPolytope{2,T}(64)
+            R3D.IntExact.init_box!(b2, [0, 0], [3, 5])
+            @test R3D.IntExact.area_exact(b2) == 15 // 1
+
+            # Translated box invariant
+            b3 = R3D.IntExact.IntFlatPolytope{2,T}(64)
+            R3D.IntExact.init_box!(b3, [10, 20], [13, 25])
+            @test R3D.IntExact.area_exact(b3) == 15 // 1
+
+            # Unit triangle (origin + two axis vertices) = 1//2
+            t = R3D.IntExact.IntFlatPolytope{2,T}(64)
+            R3D.IntExact.init_simplex!(t, [0, 0], [1, 0], [0, 1])
+            @test R3D.IntExact.area_exact(t) == 1 // 2
+
+            # Scaled triangle, edge length k → area = k^2 / 2
+            for k in (1, 2, 5, 10)
+                tk = R3D.IntExact.IntFlatPolytope{2,T}(64)
+                R3D.IntExact.init_simplex!(tk, [0, 0], [k, 0], [0, k])
+                @test R3D.IntExact.area_exact(tk) == (k^2) // 2
+            end
+        end
+    end
+
+    @testset "Half-cube cuts (rational vertices)" begin
+        T = Int64
+        # Axis-aligned cut at x = 1/2 of a unit square — survivors have
+        # rational denominators of 2.
+        b = R3D.IntExact.IntFlatPolytope{2,T}(64)
+        R3D.IntExact.init_box!(b, [0, 0], [2, 2])
+        @test R3D.IntExact.clip!(b, R3D.Plane{2,T}(R3D.Vec{2,T}(1, 0), -1))
+        @test R3D.IntExact.area_exact(b) == 2 // 1   # half of 4
+
+        # Three orthogonal half-cuts — quarter of a unit square
+        b2 = R3D.IntExact.IntFlatPolytope{2,T}(64)
+        R3D.IntExact.init_box!(b2, [0, 0], [2, 2])
+        R3D.IntExact.clip!(b2, R3D.Plane{2,T}(R3D.Vec{2,T}(1, 0), -1))
+        R3D.IntExact.clip!(b2, R3D.Plane{2,T}(R3D.Vec{2,T}(0, 1), -1))
+        @test R3D.IntExact.area_exact(b2) == 1 // 1   # quarter of 4
+
+        # Diagonal cut on unit square — produces 1//2.
+        b3 = R3D.IntExact.IntFlatPolytope{2,T}(64)
+        R3D.IntExact.init_box!(b3, [0, 0], [1, 1])
+        R3D.IntExact.clip!(b3, R3D.Plane{2,T}(R3D.Vec{2,T}(-1, -1), 1))   # x+y ≤ 1
+        @test R3D.IntExact.area_exact(b3) == 1 // 2
+
+        # Diagonal cut on 2×2: x + y ≥ 2 — triangle with area 2.
+        b4 = R3D.IntExact.IntFlatPolytope{2,T}(64)
+        R3D.IntExact.init_box!(b4, [0, 0], [2, 2])
+        R3D.IntExact.clip!(b4, R3D.Plane{2,T}(R3D.Vec{2,T}(1, 1), -2))
+        @test R3D.IntExact.area_exact(b4) == 2 // 1
+    end
+
+    @testset "Trivial accept/reject" begin
+        T = Int64
+        # Plane entirely inside (-x ≤ 100): no cut, area unchanged.
+        b = R3D.IntExact.IntFlatPolytope{2,T}(64)
+        R3D.IntExact.init_box!(b, [0, 0], [1, 1])
+        @test R3D.IntExact.clip!(b, R3D.Plane{2,T}(R3D.Vec{2,T}(1, 0), 100))
+        @test b.nverts == 4
+        @test R3D.IntExact.area_exact(b) == 1 // 1
+        # Plane entirely outside (x ≥ 1000): polytope cleared.
+        @test R3D.IntExact.clip!(b, R3D.Plane{2,T}(R3D.Vec{2,T}(1, 0), -1000))
+        @test b.nverts == 0
+        @test R3D.IntExact.area_exact(b) == 0 // 1
+    end
+
+    @testset "Cross-check vs R3D.Flat (D=2) Float64 oracle" begin
+        T = Int64
+        rng = Random.MersenneTwister(20260427)
+        for trial in 1:100
+            # Random integer rectangle and a few random integer planes.
+            lo = (rand(rng, -3:3), rand(rng, -3:3))
+            hi = (lo[1] + rand(rng, 1:5), lo[2] + rand(rng, 1:5))
+
+            int_poly = R3D.IntExact.IntFlatPolytope{2,T}(64)
+            R3D.IntExact.init_box!(int_poly, [lo[1], lo[2]], [hi[1], hi[2]])
+            float_poly = R3D.Flat.FlatPolytope{2,Float64}(64)
+            R3D.Flat.init_box!(float_poly, [lo...], [hi...])
+
+            # Apply 1-3 random integer-coefficient planes.
+            nplanes = rand(rng, 1:3)
+            for _ in 1:nplanes
+                a = rand(rng, -3:3); b = rand(rng, -3:3); c = rand(rng, -10:10)
+                if a == 0 && b == 0
+                    continue
+                end
+                R3D.IntExact.clip!(int_poly, R3D.Plane{2,T}(R3D.Vec{2,T}(a, b), c))
+                R3D.Flat.clip!(float_poly, R3D.Plane{2,Float64}(R3D.Vec{2,Float64}(a, b), c))
+            end
+
+            int_area = R3D.IntExact.area_exact(int_poly, Int128)
+            float_area = R3D.Flat.moments(float_poly, 0)[1]
+
+            @test isapprox(Float64(int_area), float_area; atol = 1e-10)
+        end
+    end
+
+    @testset "Lazy-GCD invariant on axis-aligned integer cuts" begin
+        T = Int64
+        buf = R3D.IntExact.IntFlatPolytope{2,T}(64)
+        R3D.IntExact.init_box!(buf, [0, 0], [16, 16])
+        # Sequential axis-aligned integer-plane cuts on integer box;
+        # surviving vertices are at integer coordinates so the lazy
+        # GCD reduction must keep all denominators at 1.
+        cuts = [
+            (R3D.Vec{2,T}(1, 0), -8),   # x ≥ 8
+            (R3D.Vec{2,T}(0, 1), -5),   # y ≥ 5
+            (R3D.Vec{2,T}(1, 0), -6),   # x ≥ 6 (dominated)
+        ]
+        for (n, d) in cuts
+            R3D.IntExact.clip_plane!(buf, R3D.Plane{2,T}(n, d))
+        end
+        for v in 1:buf.nverts
+            @test buf.positions_den[v] == 1
+        end
+        # Surviving region is [8, 16] × [5, 16] = 8·11 = 88.
+        @test R3D.IntExact.area_exact(buf) == 88 // 1
+    end
+
+    @testset "BigInt drift — exact rational over 10 random cuts" begin
+        rng = Random.MersenneTwister(20260428)
+        big_poly   = R3D.IntExact.IntFlatPolytope{2,BigInt}(128)
+        float_poly = R3D.Flat.FlatPolytope{2,Float64}(128)
+        R3D.IntExact.init_box!(big_poly, [BigInt(0), BigInt(0)], [BigInt(8), BigInt(8)])
+        R3D.Flat.init_box!(float_poly, [0.0, 0.0], [8.0, 8.0])
+        for _ in 1:10
+            a = rand(rng, -3:3); b = rand(rng, -3:3); c = rand(rng, -8:8)
+            if a == 0 && b == 0
+                continue
+            end
+            R3D.IntExact.clip!(big_poly, R3D.Plane{2,BigInt}(R3D.Vec{2,BigInt}(a, b), c))
+            R3D.Flat.clip!(float_poly, R3D.Plane{2,Float64}(R3D.Vec{2,Float64}(a, b), c))
+        end
+        @test isapprox(Float64(R3D.IntExact.area_exact(big_poly)),
+                       R3D.Flat.moments(float_poly, 0)[1]; atol = 1e-9)
+    end
+end

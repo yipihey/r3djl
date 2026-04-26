@@ -13,7 +13,8 @@
 | `a955ce4` | Symmetric companion to the c4496ab clip!-on-boundary-vertex fix, surfaced via voxelize_fold! at non-power-of-2 grid sizes. |
 | `86e51da` | **Phase B.1** — `split_coord!` D ≥ 4 public API (wrapper over `clip_plane!`). voxelize_fold! D ≥ 4 refactored to use it. |
 | `dc0c056` | **Phase C** — `affine!` and `rotate!` for D ≥ 4 (D × D linear and (D+1) × (D+1) homogeneous forms). Per-D `@eval` dispatch for Aqua hygiene. |
-| `(this push)` | **Phase A at D = 5** — Lasserre recursion lifted one level, validated to closed-form on D = 5 simplex + box for P ∈ {1, 2, 3} (all 56 multi-indices). dfmm cubic-edge dimension lifting at D = 5 is now fully unblocked. |
+| `66feec5` | **Phase A at D = 5** — Lasserre recursion lifted one level, validated to closed-form on D = 5 simplex + box for P ∈ {1, 2, 3} (all 56 multi-indices). dfmm cubic-edge dimension lifting at D = 5 is now fully unblocked. |
+| `(this push)` | **Phase A at D = 6** — Lasserre recursion lifted one more level (each 6D facet projects to a 5D polytope and recurses into the D = 5 pass). Validated to closed-form on D = 6 simplex + box for P ∈ {1, 2}, with a P = 3 spot-check on the unit hypercube (84 multi-indices). Coordinate-permutation symmetry verified at order 2; voxelize-fold consistency verified at order 1. `moments(., P ≥ 1)` and `voxelize_fold!(., ., ., ., ., P ≥ 1)` are now fully implemented for D ∈ {4, 5, 6}. |
 
 This document closes the remaining gaps so D ≥ 4 reaches feature
 parity with the D = 2 / D = 3 surface area, in priority order.

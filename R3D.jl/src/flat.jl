@@ -1206,13 +1206,13 @@ function voxelize_fold!(callback::F,
                         workspace::Union{Nothing,VoxelizeWorkspace{D,T}} = nothing
                         ) where {F,D,T}
     @assert D >= 4 "use the D=2 / D=3 voxelize_fold! methods for those dimensions"
-    if D == 4 || D == 5
-        # D = 4 / D = 5 support any order via Lasserre's recursive face
+    if D == 4 || D == 5 || D == 6
+        # D ∈ {4, 5, 6} support any order via Lasserre's recursive face
         # decomposition.
     else
         @assert order == 0 "voxelize_fold! at D = $D currently supports only order = 0 " *
-                           "(D ∈ {4, 5} support order ≥ 1 via Lasserre; D = 6 still needs " *
-                           "additional codim-face tracking — see docs/d4plus_finalization_plan.md)"
+                           "(D ∈ {4, 5, 6} support order ≥ 1 via Lasserre; see " *
+                           "docs/d4plus_finalization_plan.md)"
     end
     poly.nverts <= 0 && return state
     sizes = ntuple(k -> ibox_hi[k] - ibox_lo[k], Val(D))
@@ -4413,10 +4413,14 @@ function moments(poly::FlatPolytope{D,T}, order::Integer) where {D,T}
         _reduce_nd_higher_d5!(out, poly, Int(order))
         return out
     end
+    if D == 6
+        out = zeros(T, num_moments(6, Int(order)))
+        _reduce_nd_higher_d6!(out, poly, Int(order))
+        return out
+    end
     error("R3D.Flat.moments: D = $D, order ≥ 1 not yet implemented. ",
-          "Use `moments(poly, 0)` for the 0th moment, or D ∈ {4, 5} for ",
-          "higher orders. D = 6 requires an additional 4-face tracking ",
-          "layer; see docs/d4plus_finalization_plan.md.")
+          "Use `moments(poly, 0)` for the 0th moment, or D ∈ {4, 5, 6} for ",
+          "higher orders; see docs/d4plus_finalization_plan.md.")
 end
 
 function moments!(out::AbstractVector{T}, poly::FlatPolytope{D,T},
@@ -4437,10 +4441,14 @@ function moments!(out::AbstractVector{T}, poly::FlatPolytope{D,T},
         _reduce_nd_higher_d5!(out, poly, Int(order))
         return out
     end
+    if D == 6
+        @assert length(out) >= num_moments(6, Int(order))
+        _reduce_nd_higher_d6!(out, poly, Int(order))
+        return out
+    end
     error("R3D.Flat.moments!: D = $D, order ≥ 1 not yet implemented. ",
-          "Use `moments!(out, poly, 0)` for the 0th moment, or D ∈ {4, 5} ",
-          "for higher orders. D = 6 requires an additional 4-face ",
-          "tracking layer; see docs/d4plus_finalization_plan.md.")
+          "Use `moments!(out, poly, 0)` for the 0th moment, or D ∈ {4, 5, 6} ",
+          "for higher orders; see docs/d4plus_finalization_plan.md.")
 end
 
 # ===========================================================================
@@ -5463,6 +5471,615 @@ function _expand_facet_monomial_d5(α::NTuple{5,Int},
         coeff = poly_buf[b1+1, b2+1, b3+1, b4+1]
         coeff == zero(T) && continue
         s += coeff * moments_4d[_moment_index_d4((b1, b2, b3, b4))]
+    end
+    return s
+end
+
+# ===========================================================================
+# Phase A — Lasserre at D = 6. Same recursion as D = 5 but one level
+# deeper: each 6D facet is a 5D polytope, projected and handed to the
+# existing `_reduce_nd_higher_d5!` for its own Lasserre pass. The 5D
+# polytope's facets are 4-faces of P (codim-2), identified at each
+# vertex of P via unordered pairs of P's facets.
+# ===========================================================================
+
+function _reduce_nd_higher_d6!(out::AbstractVector{T},
+                                poly::FlatPolytope{6,T}, P::Int) where {T}
+    @assert P >= 1 "_reduce_nd_higher_d6! is for P ≥ 1; use _reduce_nd_zeroth! for P = 0"
+    nmom = num_moments(6, P)
+    @assert length(out) >= nmom
+    fill!(out, zero(T))
+    poly.nverts <= 0 && return out
+
+    alphas = _enumerate_moments_d6(P)
+    facet5d = FlatPolytope{5,T}(max(poly.nverts, 16))
+    moments_5d = zeros(T, num_moments(5, P))
+    B = zeros(T, 6, 5)
+    vmap = zeros(Int32, poly.nverts)
+    wrong_slot = zeros(Int32, poly.nverts)
+    # 4-face dedup scratch: at D = 6, each in-facet vertex contributes
+    # up to D - 1 = 5 incident 4-faces, generously sized for clipped
+    # polytopes that exceed simplex bounds.
+    pair_first  = zeros(Int32, 2 * (D_const_6(poly) + poly.nfacets))
+    pair_second = zeros(Int32, 2 * (D_const_6(poly) + poly.nfacets))
+
+    @inbounds for fid in 1:poly.nfacets
+        ok = _build_facet5d!(facet5d, B, vmap, wrong_slot,
+                              pair_first, pair_second, poly, fid)
+        ok || continue
+        v0 = _first_facet_vertex(poly, fid)
+        c_F = (poly.positions[1, v0], poly.positions[2, v0],
+               poly.positions[3, v0], poly.positions[4, v0],
+               poly.positions[5, v0], poly.positions[6, v0])
+
+        # Recurse via the existing 5D Lasserre pass.
+        moments!(moments_5d, facet5d, P)
+
+        sgn = sign(moments_5d[1])
+        sgn == zero(T) && continue
+        if sgn < zero(T)
+            for k in eachindex(moments_5d)
+                moments_5d[k] = -moments_5d[k]
+            end
+        end
+
+        d_F = poly.facet_distances[fid]
+        for ai in 1:nmom
+            α = alphas[ai]
+            order_α = α[1] + α[2] + α[3] + α[4] + α[5] + α[6]
+            order_α == 0 && continue
+            integral = _expand_facet_monomial_d6(α, c_F, B, moments_5d, P)
+            out[ai] += d_F * integral / (6 + order_α)
+        end
+    end
+
+    zeroth = zeros(T, 1)
+    _reduce_nd_zeroth!(zeroth, poly)
+    out[1] = zeroth[1]
+    return out
+end
+
+@inline D_const_6(::FlatPolytope{6}) = 6
+
+# Build a 5D `FlatPolytope` for the projected facet `fid` of the 6D
+# polytope `poly`. Mirrors `_build_facet4d!` but populates the next
+# layer of structure so the recursive `_reduce_nd_higher_d5!` call has
+# everything it needs.
+function _build_facet5d!(facet5d::FlatPolytope{5,T},
+                          B::Matrix{T},
+                          vmap::Vector{Int32},
+                          wrong_slot::Vector{Int32},
+                          pair_first::Vector{Int32},
+                          pair_second::Vector{Int32},
+                          poly::FlatPolytope{6,T},
+                          fid::Integer) where {T}
+    fid_i = Int(fid)
+    nf = 0
+    fill!(vmap, Int32(0))
+    fill!(wrong_slot, Int32(0))
+
+    # Pass 1: enumerate in-facet vertices and record vmap + wrong slot.
+    @inbounds for v in 1:poly.nverts
+        for k in 1:6
+            if Int(poly.facets[k, v]) == fid_i
+                nf += 1
+                vmap[v] = Int32(nf)
+                wrong_slot[v] = Int32(k)
+                break
+            end
+        end
+    end
+    nf < 6 && return false   # facet has < 6 vertices: degenerate at D = 6
+    facet5d.capacity >= nf || return false
+
+    # Pass 2: 5D basis B (6 × 5) ⊥ to facet's outward normal.
+    _orthonormal_perp_basis_6d!(B, poly.facet_normals, fid_i)
+
+    # Pass 3: project positions; reset facet5d structural fields.
+    v0 = _first_facet_vertex(poly, fid_i)
+    c1 = poly.positions[1, v0]; c2 = poly.positions[2, v0]
+    c3 = poly.positions[3, v0]; c4 = poly.positions[4, v0]
+    c5 = poly.positions[5, v0]; c6 = poly.positions[6, v0]
+    facet5d.nverts = nf
+    @inbounds for v in 1:poly.nverts
+        v_5d = Int(vmap[v])
+        v_5d == 0 && continue
+        for j in 1:5
+            facet5d.positions[j, v_5d] =
+                B[1, j] * (poly.positions[1, v] - c1) +
+                B[2, j] * (poly.positions[2, v] - c2) +
+                B[3, j] * (poly.positions[3, v] - c3) +
+                B[4, j] * (poly.positions[4, v] - c4) +
+                B[5, j] * (poly.positions[5, v] - c5) +
+                B[6, j] * (poly.positions[6, v] - c6)
+        end
+    end
+
+    # Pass 4: dedup 4-face IDs. Same unordered-pair pattern as the
+    # 3-face dedup at D = 5.
+    n_pairs = 0
+    @inbounds for v in 1:poly.nverts
+        v_5d = Int(vmap[v])
+        v_5d == 0 && continue
+        wrong = Int(wrong_slot[v])
+        for k in 1:6
+            k == wrong && continue
+            other = Int(poly.facets[k, v])
+            a = min(fid_i, other); b = max(fid_i, other)
+            found = 0
+            for j in 1:n_pairs
+                if Int(pair_first[j]) == a && Int(pair_second[j]) == b
+                    found = j
+                    break
+                end
+            end
+            if found == 0
+                n_pairs += 1
+                if n_pairs > length(pair_first)
+                    return false
+                end
+                pair_first[n_pairs]  = Int32(a)
+                pair_second[n_pairs] = Int32(b)
+            end
+        end
+    end
+    facet5d.nfacets = n_pairs
+    _grow_facet_metadata!(facet5d, n_pairs)
+
+    # Pass 5: pnbrs with consistent 5D handedness via 5D det-sign.
+    seed_sign = zero(T)
+    @inbounds for v in 1:poly.nverts
+        v_5d = Int(vmap[v])
+        v_5d == 0 && continue
+        wrong = Int(wrong_slot[v])
+        n_a = Int32(0); n_b = Int32(0); n_c = Int32(0)
+        n_d = Int32(0); n_e = Int32(0)
+        e1 = e2 = e3 = e4 = e5 = (zero(T), zero(T), zero(T), zero(T), zero(T))
+        slot5d = 0
+        for k in 1:6
+            k == wrong && continue
+            slot5d += 1
+            nbr_6d = Int(poly.pnbrs[k, v])
+            n5d = vmap[nbr_6d]
+            ex = facet5d.positions[1, n5d] - facet5d.positions[1, v_5d]
+            ey = facet5d.positions[2, n5d] - facet5d.positions[2, v_5d]
+            ez = facet5d.positions[3, n5d] - facet5d.positions[3, v_5d]
+            ew = facet5d.positions[4, n5d] - facet5d.positions[4, v_5d]
+            eu = facet5d.positions[5, n5d] - facet5d.positions[5, v_5d]
+            if slot5d == 1
+                n_a = n5d; e1 = (ex, ey, ez, ew, eu)
+            elseif slot5d == 2
+                n_b = n5d; e2 = (ex, ey, ez, ew, eu)
+            elseif slot5d == 3
+                n_c = n5d; e3 = (ex, ey, ez, ew, eu)
+            elseif slot5d == 4
+                n_d = n5d; e4 = (ex, ey, ez, ew, eu)
+            else
+                n_e = n5d; e5 = (ex, ey, ez, ew, eu)
+            end
+        end
+        det_v = _det5(e1, e2, e3, e4, e5)
+        if seed_sign == zero(T)
+            seed_sign = sign(det_v)
+        end
+        if det_v == zero(T)
+            return false   # degenerate vertex (rank-deficient 5 edges in 5D)
+        end
+        if sign(det_v) != seed_sign
+            n_d, n_e = n_e, n_d   # swap last two slots to flip handedness
+        end
+        facet5d.pnbrs[1, v_5d] = n_a
+        facet5d.pnbrs[2, v_5d] = n_b
+        facet5d.pnbrs[3, v_5d] = n_c
+        facet5d.pnbrs[4, v_5d] = n_d
+        facet5d.pnbrs[5, v_5d] = n_e
+    end
+
+    # Pass 6: facets[k, v_5d] (for the 5D polytope) = mapped 4-face ID.
+    # The 5D-slot ordering matches Pass 5's swap convention.
+    @inbounds for v in 1:poly.nverts
+        v_5d = Int(vmap[v])
+        v_5d == 0 && continue
+        wrong = Int(wrong_slot[v])
+        # Collect 6D slots in numerical order.
+        slots = (Int32(0), Int32(0), Int32(0), Int32(0), Int32(0))
+        sl2 = 0
+        for k in 1:6
+            k == wrong && continue
+            sl2 += 1
+            slots = (sl2 == 1 ? Int32(k) : slots[1],
+                     sl2 == 2 ? Int32(k) : slots[2],
+                     sl2 == 3 ? Int32(k) : slots[3],
+                     sl2 == 4 ? Int32(k) : slots[4],
+                     sl2 == 5 ? Int32(k) : slots[5])
+        end
+        e_a_6 = Int(slots[1]); e_b_6 = Int(slots[2]); e_c_6 = Int(slots[3])
+        e_d_6 = Int(slots[4]); e_e_6 = Int(slots[5])
+        # Re-compute det to determine swap decision.
+        n_a_5d = vmap[Int(poly.pnbrs[e_a_6, v])]
+        n_b_5d = vmap[Int(poly.pnbrs[e_b_6, v])]
+        n_c_5d = vmap[Int(poly.pnbrs[e_c_6, v])]
+        n_d_5d = vmap[Int(poly.pnbrs[e_d_6, v])]
+        n_e_5d = vmap[Int(poly.pnbrs[e_e_6, v])]
+        eA = (facet5d.positions[1, n_a_5d] - facet5d.positions[1, v_5d],
+              facet5d.positions[2, n_a_5d] - facet5d.positions[2, v_5d],
+              facet5d.positions[3, n_a_5d] - facet5d.positions[3, v_5d],
+              facet5d.positions[4, n_a_5d] - facet5d.positions[4, v_5d],
+              facet5d.positions[5, n_a_5d] - facet5d.positions[5, v_5d])
+        eB = (facet5d.positions[1, n_b_5d] - facet5d.positions[1, v_5d],
+              facet5d.positions[2, n_b_5d] - facet5d.positions[2, v_5d],
+              facet5d.positions[3, n_b_5d] - facet5d.positions[3, v_5d],
+              facet5d.positions[4, n_b_5d] - facet5d.positions[4, v_5d],
+              facet5d.positions[5, n_b_5d] - facet5d.positions[5, v_5d])
+        eC = (facet5d.positions[1, n_c_5d] - facet5d.positions[1, v_5d],
+              facet5d.positions[2, n_c_5d] - facet5d.positions[2, v_5d],
+              facet5d.positions[3, n_c_5d] - facet5d.positions[3, v_5d],
+              facet5d.positions[4, n_c_5d] - facet5d.positions[4, v_5d],
+              facet5d.positions[5, n_c_5d] - facet5d.positions[5, v_5d])
+        eD = (facet5d.positions[1, n_d_5d] - facet5d.positions[1, v_5d],
+              facet5d.positions[2, n_d_5d] - facet5d.positions[2, v_5d],
+              facet5d.positions[3, n_d_5d] - facet5d.positions[3, v_5d],
+              facet5d.positions[4, n_d_5d] - facet5d.positions[4, v_5d],
+              facet5d.positions[5, n_d_5d] - facet5d.positions[5, v_5d])
+        eE = (facet5d.positions[1, n_e_5d] - facet5d.positions[1, v_5d],
+              facet5d.positions[2, n_e_5d] - facet5d.positions[2, v_5d],
+              facet5d.positions[3, n_e_5d] - facet5d.positions[3, v_5d],
+              facet5d.positions[4, n_e_5d] - facet5d.positions[4, v_5d],
+              facet5d.positions[5, n_e_5d] - facet5d.positions[5, v_5d])
+        det_v = _det5(eA, eB, eC, eD, eE)
+        v0_5d = Int(vmap[v0])
+        if v0_5d == 0
+            return false
+        end
+        seed_sgn = _seed_sign_d5(facet5d, vmap, wrong_slot, poly, v0)
+        swap_de = sign(det_v) != seed_sgn
+
+        # k_5D=1..3 -> e_a_6..e_c_6; slots 4 and 5 swapped per Pass 5.
+        slot_for = (e_a_6, e_b_6, e_c_6,
+                    swap_de ? e_e_6 : e_d_6,
+                    swap_de ? e_d_6 : e_e_6)
+        for k_5d in 1:5
+            k6 = slot_for[k_5d]
+            other = Int(poly.facets[k6, v])
+            a = min(fid_i, other); b = max(fid_i, other)
+            id = 0
+            for j in 1:n_pairs
+                if Int(pair_first[j]) == a && Int(pair_second[j]) == b
+                    id = j
+                    break
+                end
+            end
+            facet5d.facets[k_5d, v_5d] = Int32(id)
+        end
+    end
+
+    # Pass 7: facet_normals + facet_distances for each unique 4-face.
+    # Same projection logic as the D = 5 version, one dimension up.
+    @inbounds for j in 1:n_pairs
+        a = Int(pair_first[j]); b = Int(pair_second[j])
+        other = (a == fid_i) ? b : a
+        # m = B^T * n_other (length 5).
+        m1 = B[1,1]*poly.facet_normals[1,other] + B[2,1]*poly.facet_normals[2,other] +
+             B[3,1]*poly.facet_normals[3,other] + B[4,1]*poly.facet_normals[4,other] +
+             B[5,1]*poly.facet_normals[5,other] + B[6,1]*poly.facet_normals[6,other]
+        m2 = B[1,2]*poly.facet_normals[1,other] + B[2,2]*poly.facet_normals[2,other] +
+             B[3,2]*poly.facet_normals[3,other] + B[4,2]*poly.facet_normals[4,other] +
+             B[5,2]*poly.facet_normals[5,other] + B[6,2]*poly.facet_normals[6,other]
+        m3 = B[1,3]*poly.facet_normals[1,other] + B[2,3]*poly.facet_normals[2,other] +
+             B[3,3]*poly.facet_normals[3,other] + B[4,3]*poly.facet_normals[4,other] +
+             B[5,3]*poly.facet_normals[5,other] + B[6,3]*poly.facet_normals[6,other]
+        m4 = B[1,4]*poly.facet_normals[1,other] + B[2,4]*poly.facet_normals[2,other] +
+             B[3,4]*poly.facet_normals[3,other] + B[4,4]*poly.facet_normals[4,other] +
+             B[5,4]*poly.facet_normals[5,other] + B[6,4]*poly.facet_normals[6,other]
+        m5 = B[1,5]*poly.facet_normals[1,other] + B[2,5]*poly.facet_normals[2,other] +
+             B[3,5]*poly.facet_normals[3,other] + B[4,5]*poly.facet_normals[4,other] +
+             B[5,5]*poly.facet_normals[5,other] + B[6,5]*poly.facet_normals[6,other]
+        len = sqrt(m1*m1 + m2*m2 + m3*m3 + m4*m4 + m5*m5)
+        if len <= eps(T)
+            facet5d.facet_normals[1, j] = zero(T)
+            facet5d.facet_normals[2, j] = zero(T)
+            facet5d.facet_normals[3, j] = zero(T)
+            facet5d.facet_normals[4, j] = zero(T)
+            facet5d.facet_normals[5, j] = zero(T)
+            facet5d.facet_distances[j]  = zero(T)
+            continue
+        end
+        facet5d.facet_normals[1, j] = m1 / len
+        facet5d.facet_normals[2, j] = m2 / len
+        facet5d.facet_normals[3, j] = m3 / len
+        facet5d.facet_normals[4, j] = m4 / len
+        facet5d.facet_normals[5, j] = m5 / len
+        n_dot_c = poly.facet_normals[1,other]*c1 + poly.facet_normals[2,other]*c2 +
+                  poly.facet_normals[3,other]*c3 + poly.facet_normals[4,other]*c4 +
+                  poly.facet_normals[5,other]*c5 + poly.facet_normals[6,other]*c6
+        facet5d.facet_distances[j] = (poly.facet_distances[other] - n_dot_c) / len
+    end
+
+    # Pass 8: finds[k1, k2, v_5d] inherited from poly.finds via the
+    # 5D-slot -> 6D-slot mapping (with the same swap convention as
+    # Pass 6 / Pass 5).
+    @inbounds for v in 1:poly.nverts
+        v_5d = Int(vmap[v])
+        v_5d == 0 && continue
+        wrong = Int(wrong_slot[v])
+        seed_sgn = _seed_sign_d5(facet5d, vmap, wrong_slot, poly, v0)
+        slots5d_to_6d = MVector{5, Int}(0, 0, 0, 0, 0)
+        sl = 0
+        for k in 1:6
+            k == wrong && continue
+            sl += 1
+            slots5d_to_6d[sl] = k
+        end
+        n_a_5d = vmap[Int(poly.pnbrs[slots5d_to_6d[1], v])]
+        n_b_5d = vmap[Int(poly.pnbrs[slots5d_to_6d[2], v])]
+        n_c_5d = vmap[Int(poly.pnbrs[slots5d_to_6d[3], v])]
+        n_d_5d = vmap[Int(poly.pnbrs[slots5d_to_6d[4], v])]
+        n_e_5d = vmap[Int(poly.pnbrs[slots5d_to_6d[5], v])]
+        eA = (facet5d.positions[1, n_a_5d] - facet5d.positions[1, v_5d],
+              facet5d.positions[2, n_a_5d] - facet5d.positions[2, v_5d],
+              facet5d.positions[3, n_a_5d] - facet5d.positions[3, v_5d],
+              facet5d.positions[4, n_a_5d] - facet5d.positions[4, v_5d],
+              facet5d.positions[5, n_a_5d] - facet5d.positions[5, v_5d])
+        eB = (facet5d.positions[1, n_b_5d] - facet5d.positions[1, v_5d],
+              facet5d.positions[2, n_b_5d] - facet5d.positions[2, v_5d],
+              facet5d.positions[3, n_b_5d] - facet5d.positions[3, v_5d],
+              facet5d.positions[4, n_b_5d] - facet5d.positions[4, v_5d],
+              facet5d.positions[5, n_b_5d] - facet5d.positions[5, v_5d])
+        eC = (facet5d.positions[1, n_c_5d] - facet5d.positions[1, v_5d],
+              facet5d.positions[2, n_c_5d] - facet5d.positions[2, v_5d],
+              facet5d.positions[3, n_c_5d] - facet5d.positions[3, v_5d],
+              facet5d.positions[4, n_c_5d] - facet5d.positions[4, v_5d],
+              facet5d.positions[5, n_c_5d] - facet5d.positions[5, v_5d])
+        eD = (facet5d.positions[1, n_d_5d] - facet5d.positions[1, v_5d],
+              facet5d.positions[2, n_d_5d] - facet5d.positions[2, v_5d],
+              facet5d.positions[3, n_d_5d] - facet5d.positions[3, v_5d],
+              facet5d.positions[4, n_d_5d] - facet5d.positions[4, v_5d],
+              facet5d.positions[5, n_d_5d] - facet5d.positions[5, v_5d])
+        eE = (facet5d.positions[1, n_e_5d] - facet5d.positions[1, v_5d],
+              facet5d.positions[2, n_e_5d] - facet5d.positions[2, v_5d],
+              facet5d.positions[3, n_e_5d] - facet5d.positions[3, v_5d],
+              facet5d.positions[4, n_e_5d] - facet5d.positions[4, v_5d],
+              facet5d.positions[5, n_e_5d] - facet5d.positions[5, v_5d])
+        det_v = _det5(eA, eB, eC, eD, eE)
+        if sign(det_v) != seed_sgn
+            slots5d_to_6d[4], slots5d_to_6d[5] = slots5d_to_6d[5], slots5d_to_6d[4]
+        end
+        for k1_5d in 1:5, k2_5d in 1:5
+            k1_6d = slots5d_to_6d[k1_5d]
+            k2_6d = slots5d_to_6d[k2_5d]
+            facet5d.finds[k1_5d, k2_5d, v_5d] = poly.finds[k1_6d, k2_6d, v]
+        end
+    end
+
+    nfaces = 0
+    @inbounds for v_5d in 1:facet5d.nverts, j in 1:5, k in 1:5
+        f = Int(facet5d.finds[j, k, v_5d])
+        f > nfaces && (nfaces = f)
+    end
+    facet5d.nfaces = nfaces
+    facet5d.moment_order = -1
+    return true
+end
+
+# 5 × 5 determinant via cofactor expansion along the first column.
+# Used by `_build_facet5d!` to determine consistent pnbrs handedness
+# across vertices of a 5D facet.
+@inline function _det5(e1::NTuple{5,T}, e2::NTuple{5,T},
+                        e3::NTuple{5,T}, e4::NTuple{5,T},
+                        e5::NTuple{5,T}) where {T}
+    # Each minor is a 4x4 determinant of the rows {2..5} with one
+    # column dropped; reuse `_det4` against 4-tuples that strip the
+    # k-th coordinate.
+    function strip(e::NTuple{5,T}, k::Int)
+        if k == 1
+            return (e[2], e[3], e[4], e[5])
+        elseif k == 2
+            return (e[1], e[3], e[4], e[5])
+        elseif k == 3
+            return (e[1], e[2], e[4], e[5])
+        elseif k == 4
+            return (e[1], e[2], e[3], e[5])
+        else
+            return (e[1], e[2], e[3], e[4])
+        end
+    end
+    s = zero(T)
+    sgn = one(T)
+    @inbounds for k in 1:5
+        m = _det4(strip(e2, k), strip(e3, k), strip(e4, k), strip(e5, k))
+        s += sgn * e1[k] * m
+        sgn = -sgn
+    end
+    return s
+end
+
+# Compute the seed handedness sign at the first in-facet vertex of a
+# 5D facet. Used by Pass 6 / Pass 8 of `_build_facet5d!` to match
+# Pass 5's slot-4-vs-5 swap decision.
+@inline function _seed_sign_d5(facet5d::FlatPolytope{5,T},
+                                vmap::Vector{Int32},
+                                wrong_slot::Vector{Int32},
+                                poly::FlatPolytope{6,T},
+                                v0::Int) where {T}
+    v_5d = Int(vmap[v0])
+    wrong = Int(wrong_slot[v0])
+    e1 = e2 = e3 = e4 = e5 = (zero(T), zero(T), zero(T), zero(T), zero(T))
+    sl = 0
+    @inbounds for k in 1:6
+        k == wrong && continue
+        sl += 1
+        nbr_6d = Int(poly.pnbrs[k, v0])
+        n5d = vmap[nbr_6d]
+        ex = facet5d.positions[1, n5d] - facet5d.positions[1, v_5d]
+        ey = facet5d.positions[2, n5d] - facet5d.positions[2, v_5d]
+        ez = facet5d.positions[3, n5d] - facet5d.positions[3, v_5d]
+        ew = facet5d.positions[4, n5d] - facet5d.positions[4, v_5d]
+        eu = facet5d.positions[5, n5d] - facet5d.positions[5, v_5d]
+        if sl == 1
+            e1 = (ex, ey, ez, ew, eu)
+        elseif sl == 2
+            e2 = (ex, ey, ez, ew, eu)
+        elseif sl == 3
+            e3 = (ex, ey, ez, ew, eu)
+        elseif sl == 4
+            e4 = (ex, ey, ez, ew, eu)
+        else
+            e5 = (ex, ey, ez, ew, eu)
+        end
+    end
+    return sign(_det5(e1, e2, e3, e4, e5))
+end
+
+# 6×5 orthonormal basis perpendicular to the facet's outward unit
+# normal. Drop the unit axis most-parallel to n, then run classical
+# Gram-Schmidt on the remaining 5.
+@inline function _orthonormal_perp_basis_6d!(B::Matrix{T},
+                                              facet_normals::Matrix{T},
+                                              fid::Int) where {T}
+    n1 = facet_normals[1, fid]; n2 = facet_normals[2, fid]
+    n3 = facet_normals[3, fid]; n4 = facet_normals[4, fid]
+    n5 = facet_normals[5, fid]; n6 = facet_normals[6, fid]
+    abs_n = (abs(n1), abs(n2), abs(n3), abs(n4), abs(n5), abs(n6))
+    drop = argmax(abs_n)
+    col = 0
+    @inbounds for k in 1:6
+        k == drop && continue
+        col += 1
+        nk = facet_normals[k, fid]
+        B[1, col] = (k == 1 ? T(1) : T(0)) - nk * n1
+        B[2, col] = (k == 2 ? T(1) : T(0)) - nk * n2
+        B[3, col] = (k == 3 ? T(1) : T(0)) - nk * n3
+        B[4, col] = (k == 4 ? T(1) : T(0)) - nk * n4
+        B[5, col] = (k == 5 ? T(1) : T(0)) - nk * n5
+        B[6, col] = (k == 6 ? T(1) : T(0)) - nk * n6
+    end
+    @inbounds for c in 1:5
+        for cprev in 1:(c - 1)
+            dotp = B[1, c] * B[1, cprev] + B[2, c] * B[2, cprev] +
+                   B[3, c] * B[3, cprev] + B[4, c] * B[4, cprev] +
+                   B[5, c] * B[5, cprev] + B[6, c] * B[6, cprev]
+            B[1, c] -= dotp * B[1, cprev]
+            B[2, c] -= dotp * B[2, cprev]
+            B[3, c] -= dotp * B[3, cprev]
+            B[4, c] -= dotp * B[4, cprev]
+            B[5, c] -= dotp * B[5, cprev]
+            B[6, c] -= dotp * B[6, cprev]
+        end
+        len2 = B[1,c]^2 + B[2,c]^2 + B[3,c]^2 + B[4,c]^2 + B[5,c]^2 + B[6,c]^2
+        len = sqrt(len2)
+        @assert len > eps(T) "_orthonormal_perp_basis_6d!: degenerate facet normal"
+        B[1, c] /= len; B[2, c] /= len
+        B[3, c] /= len; B[4, c] /= len
+        B[5, c] /= len; B[6, c] /= len
+    end
+    return B
+end
+
+# 6D moment-index enumeration in lex-by-degree convention.
+function _enumerate_moments_d6(P::Int)
+    out = NTuple{6,Int}[]
+    for total in 0:P
+        for a in total:-1:0,
+            b in (total - a):-1:0,
+            c in (total - a - b):-1:0,
+            d in (total - a - b - c):-1:0,
+            e in (total - a - b - c - d):-1:0
+            f = total - a - b - c - d - e
+            push!(out, (a, b, c, d, e, f))
+        end
+    end
+    return out
+end
+
+# Index of a 5D multi-index β within `_enumerate_moments_d5(P)`'s
+# output. Per-degree count at D = 5 is C(t + 4, 4); within a degree
+# block we replicate the descending-loop ordering of Pass-1 (a desc,
+# b desc within (total - a), c desc within (total - a - b), d desc
+# within (total - a - b - c)).
+@inline function _moment_index_d5(β::NTuple{5,Int})
+    total = β[1] + β[2] + β[3] + β[4] + β[5]
+    idx = 0
+    for t in 0:(total - 1)
+        # C(t + 4, 4) = (t+1)(t+2)(t+3)(t+4) / 24
+        idx += div((t + 1) * (t + 2) * (t + 3) * (t + 4), 24)
+    end
+    a_cur = β[1]
+    sub = 0
+    for a_above in total:-1:(a_cur + 1)
+        # Number of (b, c, d, e) with b + c + d + e = total - a_above
+        # = C(total - a_above + 3, 3)
+        n = total - a_above + 1
+        sub += div(n * (n + 1) * (n + 2), 6)
+    end
+    rem1 = total - a_cur
+    b_cur = β[2]
+    for b_above in rem1:-1:(b_cur + 1)
+        n = rem1 - b_above + 1
+        sub += div(n * (n + 1), 2)
+    end
+    rem2 = rem1 - b_cur
+    c_cur = β[3]
+    for c_above in rem2:-1:(c_cur + 1)
+        sub += rem2 - c_above + 1
+    end
+    sub += (rem2 - c_cur) - β[4]
+    return idx + sub + 1
+end
+
+# Multinomial expansion of (c + B y)^α at D = 6 -> 5D y-monomials.
+function _expand_facet_monomial_d6(α::NTuple{6,Int},
+                                    c::NTuple{6,T},
+                                    B::Matrix{T},
+                                    moments_5d::Vector{T},
+                                    P::Int) where {T}
+    nb = P + 1
+    poly_buf = zeros(T, nb, nb, nb, nb, nb)
+    poly_new = zeros(T, nb, nb, nb, nb, nb)
+    @inbounds poly_buf[1, 1, 1, 1, 1] = one(T)
+
+    @inbounds for j in 1:6
+        αj = α[j]
+        αj == 0 && continue
+        cj  = c[j]
+        Bj1 = B[j, 1]; Bj2 = B[j, 2]; Bj3 = B[j, 3]
+        Bj4 = B[j, 4]; Bj5 = B[j, 5]
+        for _step in 1:αj
+            fill!(poly_new, zero(T))
+            for b1 in 0:P, b2 in 0:(P - b1),
+                b3 in 0:(P - b1 - b2),
+                b4 in 0:(P - b1 - b2 - b3),
+                b5 in 0:(P - b1 - b2 - b3 - b4)
+                pv = poly_buf[b1+1, b2+1, b3+1, b4+1, b5+1]
+                pv == zero(T) && continue
+                poly_new[b1+1, b2+1, b3+1, b4+1, b5+1] += cj * pv
+                if b1 + 1 < nb
+                    poly_new[b1+2, b2+1, b3+1, b4+1, b5+1] += Bj1 * pv
+                end
+                if b2 + 1 < nb
+                    poly_new[b1+1, b2+2, b3+1, b4+1, b5+1] += Bj2 * pv
+                end
+                if b3 + 1 < nb
+                    poly_new[b1+1, b2+1, b3+2, b4+1, b5+1] += Bj3 * pv
+                end
+                if b4 + 1 < nb
+                    poly_new[b1+1, b2+1, b3+1, b4+2, b5+1] += Bj4 * pv
+                end
+                if b5 + 1 < nb
+                    poly_new[b1+1, b2+1, b3+1, b4+1, b5+2] += Bj5 * pv
+                end
+            end
+            poly_buf, poly_new = poly_new, poly_buf
+        end
+    end
+
+    s = zero(T)
+    @inbounds for b1 in 0:P, b2 in 0:(P - b1),
+        b3 in 0:(P - b1 - b2),
+        b4 in 0:(P - b1 - b2 - b3),
+        b5 in 0:(P - b1 - b2 - b3 - b4)
+        coeff = poly_buf[b1+1, b2+1, b3+1, b4+1, b5+1]
+        coeff == zero(T) && continue
+        s += coeff * moments_5d[_moment_index_d5((b1, b2, b3, b4, b5))]
     end
     return s
 end

@@ -1088,6 +1088,97 @@ using LinearAlgebra: I
         end
     end
 
+    @testset "Phase A: D = 6 Lasserre moments (P ≥ 1) closed-form validation" begin
+        # Same closed forms as the D = 4 / D = 5 Lasserre testsets,
+        # one level deeper. Each per-facet integral now reduces to a
+        # 5D moment problem handed off to `_reduce_nd_higher_d5!`.
+        # P = 3 has C(8, 3) = 56 multi-indices and would chain four
+        # Lasserre levels per facet, so we cap the closed-form sweep
+        # at P = 2 (28 multi-indices is plenty for coverage) and add
+        # a single P = 3 spot-check below.
+        factorial_int(n) = prod(1:n; init = 1)
+        function expected_simplex(α::NTuple{6,Int})
+            num = prod(factorial_int(a) for a in α; init = 1)
+            return num / factorial_int(6 + sum(α))
+        end
+        expected_box(α::NTuple{6,Int}) = prod(1.0 / (a + 1) for a in α; init = 1.0)
+
+        for P in 1:2
+            sim = R3D.Flat.simplex((0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+                                    (1.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+                                    (0.0, 1.0, 0.0, 0.0, 0.0, 0.0),
+                                    (0.0, 0.0, 1.0, 0.0, 0.0, 0.0),
+                                    (0.0, 0.0, 0.0, 1.0, 0.0, 0.0),
+                                    (0.0, 0.0, 0.0, 0.0, 1.0, 0.0),
+                                    (0.0, 0.0, 0.0, 0.0, 0.0, 1.0))
+            m_sim = R3D.Flat.moments(sim, P)
+            box = R3D.Flat.box((0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+                               (1.0, 1.0, 1.0, 1.0, 1.0, 1.0))
+            m_box = R3D.Flat.moments(box, P)
+            for (i, α) in enumerate(R3D.Flat._enumerate_moments_d6(P))
+                @test isapprox(m_sim[i], expected_simplex(α); atol = 1e-10)
+                @test isapprox(m_box[i], expected_box(α); atol = 1e-10)
+            end
+        end
+
+        # P = 3 spot-check on the unit hypercube (separable closed form
+        # is cheap to verify; the simplex path runs slower at P = 3 due
+        # to nested polynomial buffers and isn't load-bearing here).
+        let
+            box = R3D.Flat.box((0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+                               (1.0, 1.0, 1.0, 1.0, 1.0, 1.0))
+            m_box = R3D.Flat.moments(box, 3)
+            for (i, α) in enumerate(R3D.Flat._enumerate_moments_d6(3))
+                @test isapprox(m_box[i], expected_box(α); atol = 1e-9)
+            end
+        end
+
+        # Coordinate-permutation symmetry on the unit hypercube: any α
+        # invariant under a coordinate swap must give the same moment.
+        let
+            box = R3D.Flat.box((0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+                               (1.0, 1.0, 1.0, 1.0, 1.0, 1.0))
+            m = R3D.Flat.moments(box, 2)
+            alphas = R3D.Flat._enumerate_moments_d6(2)
+            idx = Dict(α => i for (i, α) in enumerate(alphas))
+            for α in alphas
+                α_swap = (α[2], α[1], α[3], α[4], α[5], α[6])
+                @test isapprox(m[idx[α]], m[idx[α_swap]]; atol = 1e-12)
+            end
+        end
+
+        # Voxelize-fold consistency at order = 1, n = 2.
+        let
+            poly = R3D.Flat.simplex((0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+                                     (1.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+                                     (0.0, 1.0, 0.0, 0.0, 0.0, 0.0),
+                                     (0.0, 0.0, 1.0, 0.0, 0.0, 0.0),
+                                     (0.0, 0.0, 0.0, 1.0, 0.0, 0.0),
+                                     (0.0, 0.0, 0.0, 0.0, 1.0, 0.0),
+                                     (0.0, 0.0, 0.0, 0.0, 0.0, 1.0))
+            whole = R3D.Flat.moments(poly, 1)
+            ws = R3D.Flat.VoxelizeWorkspace{6,Float64}(64)
+            d_grid  = ntuple(_ -> 0.5, Val(6))
+            ibox_lo = ntuple(_ -> 0,   Val(6))
+            ibox_hi = ntuple(_ -> 2,   Val(6))
+            sum_cells = zeros(Float64, length(whole))
+            R3D.Flat.voxelize_fold!(sum_cells, poly, ibox_lo, ibox_hi, d_grid,
+                                    1; workspace = ws) do acc, idx, m
+                @inbounds for k in eachindex(acc)
+                    acc[k] += m[k]
+                end
+                acc
+            end
+            # Tolerance reflects the deepest Lasserre chain in the
+            # codebase (D = 6 -> 5 -> 4 -> 3 with rounding at each level).
+            # The unit D = 6 simplex's first moments are ~2e-4, so a 1e-7
+            # absolute slack already corresponds to ~5e-4 relative.
+            for k in eachindex(whole)
+                @test isapprox(sum_cells[k], whole[k]; atol = 1e-7, rtol = 1e-3)
+            end
+        end
+    end
+
     @testset "R3D.Flat facet normals + signed distances (D ≥ 4, Phase A foundation)" begin
         # Box facets: outward axis-aligned, signed-distance matches
         # the corresponding lo/hi coordinate.
@@ -1219,9 +1310,7 @@ using LinearAlgebra: I
             @test isapprox(R3D.Flat.volume(box), 0.5; atol=1e-12, rtol=1e-10)
         end
 
-        # D = 4 order ≥ 1 now lands via Lasserre (Phase A). D = 5 / D = 6
-        # still require additional codim-face tracking layers and stay
-        # stubbed with an informative error.
+        # D ∈ {4, 5, 6} order ≥ 1 all land via Lasserre (Phase A).
         buf4 = R3D.Flat.FlatPolytope{4,Float64}(64)
         R3D.Flat.init_box!(buf4, zeros(4), ones(4))
         m4 = R3D.Flat.moments(buf4, 1)
@@ -1231,7 +1320,6 @@ using LinearAlgebra: I
         for i in 2:5
             @test isapprox(m4[i], 0.5; atol = 1e-12)
         end
-        # D = 5 also lands via Lasserre (Phase A); D = 6 stays stubbed.
         buf5 = R3D.Flat.FlatPolytope{5,Float64}(64)
         R3D.Flat.init_box!(buf5, zeros(5), ones(5))
         m5 = R3D.Flat.moments(buf5, 1)
@@ -1240,11 +1328,13 @@ using LinearAlgebra: I
         for i in 2:6
             @test isapprox(m5[i], 0.5; atol = 1e-12)
         end
-        let
-            buf6 = R3D.Flat.FlatPolytope{6,Float64}(64)
-            R3D.Flat.init_box!(buf6, zeros(6), ones(6))
-            @test_throws ErrorException R3D.Flat.moments(buf6, 1)
-            @test_throws ErrorException R3D.Flat.moments!(zeros(7), buf6, 1)
+        buf6 = R3D.Flat.FlatPolytope{6,Float64}(64)
+        R3D.Flat.init_box!(buf6, zeros(6), ones(6))
+        m6 = R3D.Flat.moments(buf6, 1)
+        @test length(m6) == R3D.num_moments(6, 1)
+        @test isapprox(m6[1], 1.0; atol = 1e-12)
+        for i in 2:7
+            @test isapprox(m6[i], 0.5; atol = 1e-12)
         end
 
         # Differential vs C (only when the per-dimension rNd library is loaded).
@@ -1298,8 +1388,7 @@ using LinearAlgebra: I
             @test all(isapprox.(grid, cell_vol; atol=1e-12, rtol=1e-10))
         end
 
-        # D = 4 voxelize_fold! at order ≥ 1 lands via Lasserre. D = 5 / D = 6
-        # still throw.
+        # D ∈ {4, 5, 6} voxelize_fold! at order ≥ 1 all land via Lasserre.
         buf4 = R3D.Flat.FlatPolytope{4,Float64}(64)
         R3D.Flat.init_box!(buf4, zeros(4), ones(4))
         ws4 = R3D.Flat.VoxelizeWorkspace{4,Float64}(64)
@@ -1337,17 +1426,29 @@ using LinearAlgebra: I
                 @test isapprox(sum_cells5[k], whole5[k]; atol = 1e-10, rtol = 1e-10)
             end
         end
-        # D = 6 still throws on order ≥ 1 (no Lasserre yet).
+        # D = 6 voxelize_fold! at order ≥ 1 also lands via Lasserre.
+        # Capacity bumped past the D = 6 unit-box's 64 starting vertices
+        # so the bisection's per-leaf clip has room for the cut points.
         let
-            buf6 = R3D.Flat.FlatPolytope{6,Float64}(64)
+            buf6 = R3D.Flat.FlatPolytope{6,Float64}(128)
             R3D.Flat.init_box!(buf6, zeros(6), ones(6))
-            ws6 = R3D.Flat.VoxelizeWorkspace{6,Float64}(64)
+            ws6 = R3D.Flat.VoxelizeWorkspace{6,Float64}(128)
             d_grid6 = ntuple(_ -> 0.5, 6)
             ibox_lo6 = ntuple(_ -> 0, 6)
             ibox_hi6 = ntuple(_ -> 2, 6)
-            @test_throws AssertionError R3D.Flat.voxelize_fold!(0.0, buf6, ibox_lo6,
-                ibox_hi6, d_grid6, 1; workspace = ws6) do acc, idx, m
-                acc + m[1]
+            whole6 = R3D.Flat.moments(buf6, 1)
+            sum_cells6 = zeros(Float64, length(whole6))
+            R3D.Flat.voxelize_fold!(sum_cells6, buf6, ibox_lo6, ibox_hi6,
+                d_grid6, 1; workspace = ws6) do acc, idx, m
+                @inbounds for k in eachindex(acc)
+                    acc[k] += m[k]
+                end
+                acc
+            end
+            # D = 6 chains 4 levels of Lasserre recursion, so FP
+            # accumulates more than at D = 5; relax tolerance.
+            for k in eachindex(whole6)
+                @test isapprox(sum_cells6[k], whole6[k]; atol = 1e-9, rtol = 1e-6)
             end
         end
     end
@@ -1782,19 +1883,13 @@ using LinearAlgebra: I
             @test R3D.num_moments(D, P) == binomial(D + P, P)
         end
 
-        # `clip!` and `moments(., 0)` are now real for D ≥ 4 (Phase 3c
-        # + 3d). D = 4 higher-order moments now via Lasserre (Phase A);
-        # D = 4 / D = 5 land via Lasserre; D = 6 still stubbed.
-        for D in 4:5
+        # `clip!` and `moments(., 0)` are real for D ≥ 4 (Phase 3c +
+        # 3d); higher-order moments now land via Lasserre at D ∈ {4, 5, 6}.
+        for D in 4:6
             buf = R3D.Flat.FlatPolytope{D,Float64}(64)
             R3D.Flat.init_box!(buf, zeros(D), ones(D))
             @test isapprox(R3D.Flat.moments(buf, 0)[1], 1.0; atol = 1e-12)
             @test isapprox(R3D.Flat.moments(buf, 1)[1], 1.0; atol = 1e-12)
-        end
-        let
-            buf = R3D.Flat.FlatPolytope{6,Float64}(64)
-            R3D.Flat.init_box!(buf, zeros(6), ones(6))
-            @test_throws ErrorException R3D.Flat.moments(buf, 1)
         end
     end
 

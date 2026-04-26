@@ -951,4 +951,392 @@ end
     end
 end
 
+# ===========================================================================
+# voxelize_fold! at D ∈ {2, 3} — exact-rational analog of
+# `R3D.Flat.voxelize_fold!`. Bisects the polytope by axis-aligned
+# integer-coordinate planes until each leaf cell is a 1×…×1 voxel,
+# then computes per-leaf exact-rational moments via `moments_exact!`
+# and folds them through the user callback.
+#
+# The grid spacing `d` is integer (`NTuple{D, T}`). For non-integer
+# spacings, scale up the polytope's coordinates first — the IntExact
+# representation is happiest when all geometry sits on an integer
+# common-denominator grid.
+# ===========================================================================
+
+"""
+    IntVoxelizeWorkspace{D, T}
+
+Reusable scratch storage for [`voxelize_fold!`](@ref) at D ∈ {2, 3}.
+Holds a stack of `IntFlatPolytope{D, T}` buffers (one per recursion
+depth) plus the `(ibox_lo, ibox_hi)` index ranges for each. Allocate
+once, reuse across many `voxelize_fold!` calls — the bisection-loop
+inner work is then heap-free except for the per-call exact-rational
+moment scratch (an unavoidable cost of `Rational{R}` arithmetic).
+"""
+mutable struct IntVoxelizeWorkspace{D, T<:Signed}
+    polys::Vector{IntFlatPolytope{D, T}}
+    iboxes::Vector{Tuple{NTuple{D, Int}, NTuple{D, Int}}}
+    capacity::Int
+end
+
+function IntVoxelizeWorkspace{D, T}(capacity::Integer = 64;
+                                     max_depth::Integer = 64) where {D, T<:Signed}
+    @assert D == 2 || D == 3 "IntVoxelizeWorkspace: D ∈ {2, 3} supported"
+    polys = [IntFlatPolytope{D, T}(Int(capacity)) for _ in 1:Int(max_depth)]
+    iboxes = Vector{Tuple{NTuple{D, Int}, NTuple{D, Int}}}(undef, Int(max_depth))
+    IntVoxelizeWorkspace{D, T}(polys, iboxes, Int(capacity))
+end
+
+@inline function _ensure_stack_intexact!(ws::IntVoxelizeWorkspace{D, T},
+                                          n::Int) where {D, T}
+    z = ntuple(_ -> 0, Val(D))
+    while length(ws.polys) < n
+        push!(ws.polys, IntFlatPolytope{D, T}(ws.capacity))
+        push!(ws.iboxes, (z, z))
+    end
+    return ws
+end
+
+# Copy positions_num + positions_den + pnbrs + nverts. Used by the
+# voxelize bisection loop's two-clips-per-split pattern (parallel to
+# `R3D.Flat._copy_polytope!`).
+@inline function _copy_polytope_intexact!(dst::IntFlatPolytope{D, T},
+                                           src::IntFlatPolytope{D, T}) where {D, T}
+    n = src.nverts
+    @assert dst.capacity >= n
+    @inbounds for v in 1:n
+        for k in 1:D
+            dst.positions_num[k, v] = src.positions_num[k, v]
+            dst.pnbrs[k, v]         = src.pnbrs[k, v]
+        end
+        dst.positions_den[v] = src.positions_den[v]
+    end
+    dst.nverts = n
+    return dst
+end
+
+"""
+    voxelize_fold!(callback::F, state, poly::IntFlatPolytope{D, T},
+                   ibox_lo::NTuple{D, Int}, ibox_hi::NTuple{D, Int},
+                   d::NTuple{D, T}, P::Integer;
+                   workspace = nothing,
+                   R::Type{<:Signed} = T) where {F, D, T}
+
+Walk the same `r3d_voxelize`-style bisection recursion as
+`R3D.Flat.voxelize_fold!`, but in exact-rational arithmetic. At
+each non-empty leaf cell `(i_1, …, i_D)` (1-based, relative to
+`ibox_lo`) calls
+
+    state = callback(state, idx::NTuple{D, Int}, m::Vector{Rational{R}})
+
+where `m` is a `num_moments(D, P)`-length view into the
+moment-scratch buffer (overwritten on the next leaf — consume in
+the callback or copy out).
+
+`d` is the integer grid spacing per axis. Cell `(i_1, …, i_D)`
+covers `[i_k · d_k, (i_k + 1) · d_k)` per axis. Restricting to
+integer `d` keeps every per-cell intersection polytope at
+shared-denominator-of-product-of-d's resolution — exact rational
+all the way through. For finer-than-unit grids, scale the
+polytope coordinates first.
+
+Returns the final `state`.
+
+D ∈ {2, 3} only at this writing; D ≥ 4 lands in Phase 6.
+"""
+function voxelize_fold!(callback::F,
+                        state,
+                        poly::IntFlatPolytope{D, T},
+                        ibox_lo::NTuple{D, Int}, ibox_hi::NTuple{D, Int},
+                        d::NTuple{D, T}, P::Integer;
+                        workspace::Union{Nothing, IntVoxelizeWorkspace{D, T}} = nothing,
+                        R::Type{<:Signed} = T) where {F, D, T}
+    @assert D == 2 || D == 3 "voxelize_fold! IntExact: D ∈ {2, 3} only"
+    sizes = ntuple(k -> ibox_hi[k] - ibox_lo[k], Val(D))
+    (poly.nverts <= 0 || any(s -> s <= 0, sizes)) && return state
+
+    ws = workspace === nothing ?
+        IntVoxelizeWorkspace{D, T}(poly.capacity) : workspace
+    log2c(x) = x <= 1 ? 0 : ceil(Int, log2(x))
+    max_depth = sum(log2c, sizes) + 2
+    _ensure_stack_intexact!(ws, max_depth)
+
+    moments_buf = Vector{Rational{R}}(undef, num_moments(D, Int(P)))
+
+    _copy_polytope_intexact!(ws.polys[1], poly)
+    ws.iboxes[1] = (ibox_lo, ibox_hi)
+    nstack = 1
+
+    @inbounds while nstack > 0
+        cur = ws.polys[nstack]
+        lo, hi = ws.iboxes[nstack]
+        nstack -= 1
+
+        cur.nverts <= 0 && continue
+
+        # Find the longest axis to split.
+        spax = 1
+        dmax = hi[1] - lo[1]
+        for k in 2:D
+            s = hi[k] - lo[k]
+            if s > dmax
+                dmax = s
+                spax = k
+            end
+        end
+
+        if dmax == 1
+            # Leaf cell: compute exact moments and call back.
+            moments_exact!(moments_buf, cur, Int(P))
+            idx = ntuple(k -> lo[k] - ibox_lo[k] + 1, Val(D))
+            state = callback(state, idx, moments_buf)
+            continue
+        end
+
+        # Bisect along spax at the integer cell boundary.
+        half = dmax >> 1
+        split_index = lo[spax] + half
+        split_pos = T(split_index) * d[spax]
+
+        if nstack + 2 > length(ws.polys)
+            _ensure_stack_intexact!(ws, nstack + 2)
+        end
+        # cur === ws.polys[nstack + 1] (the just-popped slot). Save into
+        # ws.polys[nstack + 2] before mutating cur in place.
+        out0 = ws.polys[nstack + 1]   # alias of cur — becomes the left half
+        out1 = ws.polys[nstack + 2]   # fresh slot — gets the right half
+
+        _copy_polytope_intexact!(out1, cur)
+
+        # Plane convention is identical to R3D.Flat: retain
+        # {x : n·x + d_plane ≥ 0}.
+        #   plane_neg = (-e_spax,  +split_pos) keeps x[spax] ≤ split_pos.
+        #   plane_pos = (+e_spax, -split_pos) keeps x[spax] ≥ split_pos.
+        n_neg = ntuple(k -> k == spax ? T(-1) : T(0), Val(D))
+        n_pos = ntuple(k -> k == spax ? T( 1) : T(0), Val(D))
+        plane_neg = Plane{D, T}(Vec{D, T}(n_neg),  split_pos)
+        plane_pos = Plane{D, T}(Vec{D, T}(n_pos), -split_pos)
+        clip!(out0, plane_neg)
+        clip!(out1, plane_pos)
+
+        hi_left  = ntuple(k -> k == spax ? split_index : hi[k], Val(D))
+        lo_right = ntuple(k -> k == spax ? split_index : lo[k], Val(D))
+        ws.iboxes[nstack + 1] = (lo, hi_left)
+        ws.iboxes[nstack + 2] = (lo_right, hi)
+        nstack += 2
+    end
+    return state
+end
+
+# ===========================================================================
+# Affine operations + construction conveniences. Pure-integer when the
+# transform's coefficients are integer; rational shared-denominator
+# representation propagates naturally through `(A_num · pos_num) / (den ·
+# A_den)`. The `rotate!` wrapper accepts only integer-orthogonal matrices
+# (signed permutations + reflections); general SO(D) requires
+# irrational entries and falls outside IntExact's scope.
+# ===========================================================================
+
+"""
+    translate!(poly::IntFlatPolytope{D, T}, t::NTuple{D, T}) -> poly
+
+Translate every vertex of `poly` by the integer offset `t`. Same
+denominator-per-vertex; numerators incremented by `t .* den`.
+Heap-free; integer arithmetic only.
+"""
+function translate!(poly::IntFlatPolytope{D, T},
+                     t::NTuple{D, T}) where {D, T}
+    @inbounds for v in 1:poly.nverts
+        den = poly.positions_den[v]
+        for k in 1:D
+            poly.positions_num[k, v] += t[k] * den
+        end
+    end
+    return poly
+end
+
+"""
+    scale!(poly::IntFlatPolytope{D, T}, s::T) -> poly
+
+Uniformly scale `poly` by the integer factor `s`. Multiplies every
+numerator; denominators unchanged. Pass a negative `s` for a
+reflection through the origin. Heap-free.
+
+For non-integer scaling pass an `(s_num, s_den)` pair: `scale!(poly,
+s_num, s_den)` multiplies every numerator by `s_num` and every
+denominator by `s_den`, then GCD-reduces per vertex.
+"""
+function scale!(poly::IntFlatPolytope{D, T}, s::T) where {D, T}
+    @inbounds for v in 1:poly.nverts
+        for k in 1:D
+            poly.positions_num[k, v] *= s
+        end
+    end
+    return poly
+end
+
+function scale!(poly::IntFlatPolytope{D, T}, s_num::T, s_den::T) where {D, T}
+    @assert s_den != zero(T) "scale! denominator must be non-zero"
+    sign_den = sign(s_den)
+    s_den_pos = sign_den * s_den
+    s_num_signed = sign_den * s_num
+    @inbounds for v in 1:poly.nverts
+        for k in 1:D
+            poly.positions_num[k, v] *= s_num_signed
+        end
+        poly.positions_den[v] *= s_den_pos
+        # GCD reduce so the representation stays tight.
+        g = abs(poly.positions_den[v])
+        for k in 1:D
+            g = gcd(g, abs(poly.positions_num[k, v]))
+            g == one(T) && break
+        end
+        if g > one(T)
+            for k in 1:D
+                poly.positions_num[k, v] = div(poly.positions_num[k, v], g)
+            end
+            poly.positions_den[v] = div(poly.positions_den[v], g)
+        end
+    end
+    return poly
+end
+
+"""
+    affine!(poly::IntFlatPolytope{D, T}, A_num::AbstractMatrix{T},
+            A_den::T = one(T)) -> poly
+
+Apply the linear map `(A_num / A_den) * x` to every vertex. The
+matrix is `D × D`; pass `A_den = 1` for an integer matrix. With a
+shared denominator A_den, new vertex denominators become
+`old_den * A_den` (then GCD-reduced).
+
+For an affine transform with translation, compose
+`affine!(poly, A_num, A_den)` then `translate!(poly, t)`. There's
+no augmented `(D+1) × (D+1)` form — the integer-by-integer
+multiplication composition is cleaner.
+"""
+function affine!(poly::IntFlatPolytope{D, T},
+                  A_num::AbstractMatrix{T},
+                  A_den::T = one(T)) where {D, T}
+    @assert size(A_num) == (D, D) "affine! matrix must be D × D = $D × $D"
+    @assert A_den != zero(T) "affine! denominator must be non-zero"
+
+    # Stack-friendly row-by-row update: cache each vertex's old
+    # numerators in locals before overwriting them.
+    @inbounds for v in 1:poly.nverts
+        if D == 2
+            old1 = poly.positions_num[1, v]
+            old2 = poly.positions_num[2, v]
+            poly.positions_num[1, v] = A_num[1, 1] * old1 + A_num[1, 2] * old2
+            poly.positions_num[2, v] = A_num[2, 1] * old1 + A_num[2, 2] * old2
+        elseif D == 3
+            old1 = poly.positions_num[1, v]
+            old2 = poly.positions_num[2, v]
+            old3 = poly.positions_num[3, v]
+            poly.positions_num[1, v] = A_num[1, 1] * old1 + A_num[1, 2] * old2 + A_num[1, 3] * old3
+            poly.positions_num[2, v] = A_num[2, 1] * old1 + A_num[2, 2] * old2 + A_num[2, 3] * old3
+            poly.positions_num[3, v] = A_num[3, 1] * old1 + A_num[3, 2] * old2 + A_num[3, 3] * old3
+        else
+            # D ≥ 4 not yet supported — Phase 6 lands the generic kernel.
+            error("affine! IntExact: D = $D not supported (D ∈ {2, 3} only).")
+        end
+        if A_den != one(T)
+            poly.positions_den[v] *= A_den
+        end
+        # Keep representation tight — GCD-reduce against the new den.
+        if A_den != one(T)
+            g = abs(poly.positions_den[v])
+            for k in 1:D
+                g = gcd(g, abs(poly.positions_num[k, v]))
+                g == one(T) && break
+            end
+            if g > one(T)
+                for k in 1:D
+                    poly.positions_num[k, v] = div(poly.positions_num[k, v], g)
+                end
+                poly.positions_den[v] = div(poly.positions_den[v], g)
+            end
+        end
+    end
+    return poly
+end
+
+"""
+    rotate!(poly::IntFlatPolytope{D, T}, A::AbstractMatrix{T}) -> poly
+
+Apply the integer-orthogonal map `A` to every vertex. Asserts
+`A * A' == I` and `det(A) == ±1`; for integer `A` this restricts
+to signed permutations (axis swaps with optional sign flips).
+General SO(D) rotations involve irrational entries and aren't
+representable in integer-only IntExact — use `R3D.Flat.rotate!`
+for those.
+"""
+function rotate!(poly::IntFlatPolytope{D, T},
+                  A::AbstractMatrix{T}) where {D, T}
+    @assert size(A) == (D, D) "rotate! matrix must be D × D"
+    # A * A' should be the identity.
+    @inbounds for i in 1:D, j in 1:D
+        s = zero(T)
+        for k in 1:D
+            s += A[i, k] * A[j, k]
+        end
+        expected = (i == j) ? one(T) : zero(T)
+        @assert s == expected (
+            "rotate! requires A * A' == I (integer-orthogonal); ",
+            "row-product[$i, $j] = $s, expected $expected. ",
+            "General rotations need irrational entries — use ",
+            "R3D.Flat.rotate! for those.")
+    end
+    return affine!(poly, A, one(T))
+end
+
+# ---------------------------------------------------------------------------
+# Convenience constructors
+# ---------------------------------------------------------------------------
+
+"""
+    box(lo::NTuple{D, T}, hi::NTuple{D, T}; capacity = 64) where {D, T<:Signed}
+
+Allocate a fresh `IntFlatPolytope{D, T}` and initialize as the
+axis-aligned integer box with the given corners. D ∈ {2, 3} only.
+"""
+# Per-D dispatch: a single `where {D, T<:Signed}` method binds both
+# parameters via `NTuple{D, T}`, which Aqua flags as unbound when
+# D could be 0. Per-D explicit methods avoid the warning and match
+# the existing R3D.Flat per-D `@eval` pattern.
+for _D in 2:3
+    @eval function box(lo::NTuple{$_D, T}, hi::NTuple{$_D, T};
+                        capacity::Integer = 64) where {T<:Signed}
+        poly = IntFlatPolytope{$_D, T}(Int(capacity))
+        init_box!(poly, [lo...], [hi...])
+        return poly
+    end
+end
+
+"""
+    simplex(verts::Vararg{NTuple{D, T}, M}; capacity = 64) where {D, T<:Signed, M}
+
+Allocate a fresh `IntFlatPolytope{D, T}` and initialize as the
+simplex with the given `D + 1` integer-coordinate vertices.
+D ∈ {2, 3} (3 vertices for a triangle, 4 for a tetrahedron).
+"""
+# Per-D dispatch (mirrors the R3D.Flat per-D `@eval` pattern for Aqua's
+# unbound-args check). For D = 2 the user supplies 3 NTuple{2}s; for
+# D = 3 the user supplies 4 NTuple{3}s.
+function simplex(v1::NTuple{2, T}, v2::NTuple{2, T}, v3::NTuple{2, T};
+                  capacity::Integer = 64) where {T<:Signed}
+    poly = IntFlatPolytope{2, T}(Int(capacity))
+    init_simplex!(poly, [v1...], [v2...], [v3...])
+    return poly
+end
+
+function simplex(v1::NTuple{3, T}, v2::NTuple{3, T}, v3::NTuple{3, T},
+                  v4::NTuple{3, T};
+                  capacity::Integer = 64) where {T<:Signed}
+    poly = IntFlatPolytope{3, T}(Int(capacity))
+    init_tet!(poly, ([v1...], [v2...], [v3...], [v4...]))
+    return poly
+end
+
 end # module IntExact

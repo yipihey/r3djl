@@ -2853,3 +2853,288 @@ end
         end
     end
 end
+
+@testset "R3D.IntExact voxelize_fold! at D ∈ {2, 3}" begin
+    @testset "D = 2 unit polytopes voxelized" begin
+        T = Int64
+        ws = R3D.IntExact.IntVoxelizeWorkspace{2,T}(64)
+
+        # Unit square voxelized over a 2x2 grid: 4 cells of vol 1//1.
+        b = R3D.IntExact.IntFlatPolytope{2,T}(64)
+        R3D.IntExact.init_box!(b, [0, 0], [2, 2])
+        cells = Tuple{NTuple{2,Int},Rational{T}}[]
+        R3D.IntExact.voxelize_fold!(cells, b, (0, 0), (2, 2),
+            (T(1), T(1)), 0; workspace = ws) do acc, idx, m
+            push!(acc, (idx, m[1]))
+            acc
+        end
+        @test length(cells) == 4
+        for (_, v) in cells
+            @test v == 1 // 1
+        end
+        @test sum(c[2] for c in cells) == 4 // 1   # exact
+
+        # Triangle [0,0]-[2,0]-[0,2] voxelized — 3 non-empty cells with
+        # closed-form rational volumes (1, 1//2, 1//2).
+        t = R3D.IntExact.IntFlatPolytope{2,T}(64)
+        R3D.IntExact.init_simplex!(t, [0, 0], [2, 0], [0, 2])
+        cells = Tuple{NTuple{2,Int},Rational{T}}[]
+        R3D.IntExact.voxelize_fold!(cells, t, (0, 0), (2, 2),
+            (T(1), T(1)), 0; workspace = ws) do acc, idx, m
+            push!(acc, (idx, m[1]))
+            acc
+        end
+        @test sum(c[2] for c in cells) == 2 // 1   # exact area of triangle
+        # Origin cell (1, 1) is fully inside, area 1.
+        idx_to_vol = Dict(c[1] => c[2] for c in cells)
+        @test idx_to_vol[(1, 1)] == 1 // 1
+        # Each "axis-corner" cell is half-inside.
+        @test idx_to_vol[(2, 1)] == 1 // 2
+        @test idx_to_vol[(1, 2)] == 1 // 2
+    end
+
+    @testset "D = 3 unit polytopes voxelized" begin
+        T = Int64
+        ws = R3D.IntExact.IntVoxelizeWorkspace{3,T}(64)
+
+        # Unit cube on 2x2x2 grid: 8 cells of vol 1//1, total 8.
+        c = R3D.IntExact.IntFlatPolytope{3,T}(64)
+        R3D.IntExact.init_box!(c, [0, 0, 0], [2, 2, 2])
+        total_cells = 0
+        total_vol = R3D.IntExact.voxelize_fold!(0 // 1, c, (0, 0, 0), (2, 2, 2),
+            (T(1), T(1), T(1)), 0; workspace = ws) do acc, idx, m
+            total_cells += 1
+            acc + m[1]
+        end
+        @test total_cells == 8
+        @test total_vol == 8 // 1   # exact
+
+        # Unit tet voxelized over its 1×1×1 box: 1 leaf, volume 1//6.
+        t = R3D.IntExact.IntFlatPolytope{3,T}(64)
+        R3D.IntExact.init_tet!(t, ([0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]))
+        total_vol = R3D.IntExact.voxelize_fold!(0 // 1, t, (0, 0, 0), (1, 1, 1),
+            (T(1), T(1), T(1)), 0; workspace = ws) do acc, idx, m
+            acc + m[1]
+        end
+        @test total_vol == 1 // 6   # exact
+    end
+
+    @testset "Per-cell moment sum equals whole-polytope moment (D = 2 / D = 3)" begin
+        # The headline correctness invariant of voxelize_fold!: ∑_cells m_cell == m_whole,
+        # exactly. With exact-rational arithmetic this is *not* an
+        # approximate equality.
+        T = Int128
+
+        # D = 2: 4×4 grid of an arbitrary integer polytope.
+        ws2 = R3D.IntExact.IntVoxelizeWorkspace{2,T}(128)
+        poly2 = R3D.IntExact.IntFlatPolytope{2,T}(128)
+        R3D.IntExact.init_box!(poly2, [0, 0], [4, 4])
+        R3D.IntExact.clip!(poly2,
+            R3D.Plane{2,T}(R3D.Vec{2,T}(1, 1), -5))   # diagonal cut producing rationals
+        whole2 = R3D.IntExact.moments_exact(poly2, 2)
+        sum2 = zeros(Rational{T}, length(whole2))
+        R3D.IntExact.voxelize_fold!(sum2, poly2, (0, 0), (4, 4),
+            (T(1), T(1)), 2; workspace = ws2) do acc, idx, m
+            @inbounds for k in eachindex(acc)
+                acc[k] += m[k]
+            end
+            acc
+        end
+        for k in eachindex(whole2)
+            @test sum2[k] == whole2[k]   # exact equality
+        end
+
+        # D = 3: 2×2×2 grid of a clipped cube.
+        ws3 = R3D.IntExact.IntVoxelizeWorkspace{3,T}(128)
+        poly3 = R3D.IntExact.IntFlatPolytope{3,T}(128)
+        R3D.IntExact.init_box!(poly3, [0, 0, 0], [2, 2, 2])
+        R3D.IntExact.clip!(poly3,
+            R3D.Plane{3,T}(R3D.Vec{3,T}(1, 1, 1), -3))
+        whole3 = R3D.IntExact.moments_exact(poly3, 1)
+        sum3 = zeros(Rational{T}, length(whole3))
+        R3D.IntExact.voxelize_fold!(sum3, poly3, (0, 0, 0), (2, 2, 2),
+            (T(1), T(1), T(1)), 1; workspace = ws3) do acc, idx, m
+            @inbounds for k in eachindex(acc)
+                acc[k] += m[k]
+            end
+            acc
+        end
+        for k in eachindex(whole3)
+            @test sum3[k] == whole3[k]   # exact equality
+        end
+    end
+
+    @testset "Cross-check vs R3D.Flat voxelize_fold! float oracle" begin
+        # Pick an integer rectangle, voxelize via both kernels, and
+        # confirm per-cell volumes agree to 1e-10. This is the
+        # consumer-relevant differential test — what an integer-coord
+        # remap workflow would see vs the float baseline.
+        T = Int64
+        rng = Random.MersenneTwister(20260430)
+
+        # D = 2
+        for _ in 1:10
+            lo = (rand(rng, -2:0), rand(rng, -2:0))
+            hi = (lo[1] + rand(rng, 2:4), lo[2] + rand(rng, 2:4))
+            int_poly   = R3D.IntExact.IntFlatPolytope{2,T}(64)
+            float_poly = R3D.Flat.FlatPolytope{2,Float64}(64)
+            R3D.IntExact.init_box!(int_poly, [lo...], [hi...])
+            R3D.Flat.init_box!(float_poly, [lo...], [hi...])
+            ws_int   = R3D.IntExact.IntVoxelizeWorkspace{2,T}(64)
+            ws_float = R3D.Flat.VoxelizeWorkspace{2,Float64}(64)
+            int_cells   = Tuple{NTuple{2,Int}, Rational{T}}[]
+            float_cells = Tuple{NTuple{2,Int}, Float64}[]
+            R3D.IntExact.voxelize_fold!(int_cells, int_poly, lo, hi,
+                (T(1), T(1)), 0; workspace = ws_int) do acc, idx, m
+                push!(acc, (idx, m[1])); acc
+            end
+            R3D.Flat.voxelize_fold!(float_cells, float_poly, lo, hi,
+                (1.0, 1.0), 0; workspace = ws_float) do acc, i, j, m
+                push!(acc, ((i, j), m[1])); acc
+            end
+            int_dict   = Dict(c[1] => Float64(c[2]) for c in int_cells)
+            float_dict = Dict(c[1] => c[2] for c in float_cells)
+            for k in keys(float_dict)
+                @test isapprox(int_dict[k], float_dict[k]; atol = 1e-10)
+            end
+        end
+    end
+end
+
+@testset "R3D.IntExact affine ops + constructors at D ∈ {2, 3}" begin
+    @testset "box / simplex constructors" begin
+        # D = 2
+        b2 = R3D.IntExact.box((0, 0), (3, 5))
+        @test b2 isa R3D.IntExact.IntFlatPolytope{2, Int}
+        @test b2.nverts == 4
+        @test R3D.IntExact.area_exact(b2) == 15 // 1
+
+        s2 = R3D.IntExact.simplex((0, 0), (1, 0), (0, 1))
+        @test s2.nverts == 3
+        @test R3D.IntExact.area_exact(s2) == 1 // 2
+
+        # D = 3
+        b3 = R3D.IntExact.box((0, 0, 0), (2, 3, 4))
+        @test b3 isa R3D.IntExact.IntFlatPolytope{3, Int}
+        @test b3.nverts == 8
+        @test R3D.IntExact.volume_exact(b3) == 24 // 1
+
+        s3 = R3D.IntExact.simplex((0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1))
+        @test s3.nverts == 4
+        @test R3D.IntExact.volume_exact(s3) == 1 // 6
+
+        # Custom storage type via explicit ctor still works
+        b3_int128 = R3D.IntExact.IntFlatPolytope{3, Int128}(64)
+        R3D.IntExact.init_box!(b3_int128, [Int128(0), Int128(0), Int128(0)],
+                                          [Int128(7), Int128(11), Int128(13)])
+        @test R3D.IntExact.volume_exact(b3_int128) == 1001 // 1
+    end
+
+    @testset "translate! preserves area / volume" begin
+        T = Int64
+        # D = 2
+        b = R3D.IntExact.box((0, 0), (3, 4))
+        R3D.IntExact.translate!(b, (T(100), T(-50)))
+        @test b.positions_num[1, 1] == 100
+        @test b.positions_num[2, 1] == -50
+        @test R3D.IntExact.area_exact(b) == 12 // 1
+        # D = 3
+        c = R3D.IntExact.box((0, 0, 0), (2, 2, 2))
+        R3D.IntExact.translate!(c, (T(10), T(20), T(30)))
+        @test R3D.IntExact.volume_exact(c) == 8 // 1
+        # Translate after a clip — surviving rational vertices get
+        # the same translation applied to numerators (× den).
+        d = R3D.IntExact.box((0, 0), (2, 2))
+        R3D.IntExact.clip!(d, R3D.Plane{2, T}(R3D.Vec{2, T}(1, 0), -1))
+        @test R3D.IntExact.area_exact(d) == 2 // 1
+        R3D.IntExact.translate!(d, (T(7), T(7)))
+        @test R3D.IntExact.area_exact(d) == 2 // 1   # translation invariant
+    end
+
+    @testset "scale! integer + rational" begin
+        T = Int64
+        # Integer scaling: vol → s^D × vol.
+        b = R3D.IntExact.box((0, 0, 0), (1, 1, 1))
+        R3D.IntExact.scale!(b, T(3))
+        @test R3D.IntExact.volume_exact(b) == 27 // 1
+
+        # Rational scaling: vol → (s_num / s_den)^D × vol. Halve a
+        # unit square — area becomes 1//4.
+        b2 = R3D.IntExact.box((0, 0), (1, 1))
+        R3D.IntExact.scale!(b2, T(1), T(2))
+        @test R3D.IntExact.area_exact(b2) == 1 // 4
+        # Ensure denominators are GCD-reduced (no shared common factor
+        # left between numerators and den at any vertex).
+        for v in 1:b2.nverts
+            den = b2.positions_den[v]
+            for k in 1:2
+                num = b2.positions_num[k, v]
+                @test num == 0 || gcd(abs(num), abs(den)) == 1
+            end
+        end
+
+        # Negative scale → reflection. Volume sign flips.
+        b3 = R3D.IntExact.box((0, 0, 0), (1, 1, 1))
+        R3D.IntExact.scale!(b3, T(-1))
+        @test R3D.IntExact.volume_exact(b3) == -1 // 1   # signed
+    end
+
+    @testset "affine! linear + rational matrices" begin
+        T = Int64
+        # Identity: invariant.
+        b = R3D.IntExact.box((0, 0), (3, 5))
+        before = R3D.IntExact.area_exact(b)
+        R3D.IntExact.affine!(b, [T(1) T(0); T(0) T(1)])
+        @test R3D.IntExact.area_exact(b) == before
+
+        # Diagonal scale [2 0; 0 1] → area doubles.
+        b2 = R3D.IntExact.box((0, 0), (1, 1))
+        R3D.IntExact.affine!(b2, [T(2) T(0); T(0) T(1)])
+        @test R3D.IntExact.area_exact(b2) == 2 // 1
+
+        # Rational A_den: integer matrix [3 0; 0 3] with A_den = 6
+        # gives a uniform 1/2 scale → area / 4.
+        b3 = R3D.IntExact.box((0, 0), (1, 1))
+        R3D.IntExact.affine!(b3, [T(3) T(0); T(0) T(3)], T(6))
+        @test R3D.IntExact.area_exact(b3) == 1 // 4
+
+        # D = 3 axis cycle [0 1 0; 0 0 1; 1 0 0]: signed permutation
+        # with det = +1, so volume preserved exactly.
+        c = R3D.IntExact.box((0, 0, 0), (1, 2, 3))
+        R3D.IntExact.affine!(c, [T(0) T(1) T(0);
+                                  T(0) T(0) T(1);
+                                  T(1) T(0) T(0)])
+        @test R3D.IntExact.volume_exact(c) == 6 // 1   # 1·2·3 = 6 unchanged
+    end
+
+    @testset "rotate! enforces integer-orthogonality" begin
+        T = Int64
+        # Identity
+        b = R3D.IntExact.box((0, 0), (1, 1))
+        R3D.IntExact.rotate!(b, [T(1) T(0); T(0) T(1)])
+        @test R3D.IntExact.area_exact(b) == 1 // 1
+
+        # 90° rotation [0 -1; 1 0]: A · A' = I.
+        b2 = R3D.IntExact.box((0, 0), (1, 1))
+        R3D.IntExact.rotate!(b2, [T(0) T(-1); T(1) T(0)])
+        @test R3D.IntExact.area_exact(b2) == 1 // 1
+
+        # Reflection [1 0; 0 -1]: also A · A' = I (det = -1; rotate!
+        # accepts orthogonal-with-det = ±1 since asserting strict +1
+        # would needlessly reject reflections that callers may want).
+        b3 = R3D.IntExact.box((0, 0), (1, 1))
+        R3D.IntExact.rotate!(b3, [T(1) T(0); T(0) T(-1)])
+        @test R3D.IntExact.area_exact(b3) == -1 // 1   # signed area flips
+
+        # Non-orthogonal: rejected.
+        b4 = R3D.IntExact.box((0, 0), (1, 1))
+        @test_throws AssertionError R3D.IntExact.rotate!(b4, [T(1) T(1); T(0) T(1)])
+
+        # D = 3 cyclic permutation: A · A' = I, det = +1.
+        c = R3D.IntExact.box((0, 0, 0), (1, 2, 3))
+        R3D.IntExact.rotate!(c, [T(0) T(1) T(0);
+                                  T(0) T(0) T(1);
+                                  T(1) T(0) T(0)])
+        @test R3D.IntExact.volume_exact(c) == 6 // 1
+    end
+end

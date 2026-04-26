@@ -1145,8 +1145,13 @@ function voxelize_fold!(callback::F,
                         workspace::Union{Nothing,VoxelizeWorkspace{D,T}} = nothing
                         ) where {F,D,T}
     @assert D >= 4 "use the D=2 / D=3 voxelize_fold! methods for those dimensions"
-    @assert order == 0 "voxelize_fold! at D = $D currently supports only order = 0; " *
-                       "higher-order moments are tracked in docs/phase3_status.md"
+    if D == 4
+        # D = 4 supports any order via Lasserre's recursive face decomposition.
+    else
+        @assert order == 0 "voxelize_fold! at D = $D currently supports only order = 0 " *
+                           "(D = 4 supports order ≥ 1 via Lasserre; D = 5 / D = 6 still need " *
+                           "additional codim-face tracking — see docs/d4plus_finalization_plan.md)"
+    end
     poly.nverts <= 0 && return state
     sizes = ntuple(k -> ibox_hi[k] - ibox_lo[k], Val(D))
     any(s -> s <= 0, sizes) && return state
@@ -4163,8 +4168,15 @@ function moments(poly::FlatPolytope{D,T}, order::Integer) where {D,T}
         _reduce_nd_zeroth!(out, poly)
         return out
     end
+    if D == 4
+        out = zeros(T, num_moments(4, Int(order)))
+        _reduce_nd_higher_d4!(out, poly, Int(order))
+        return out
+    end
     error("R3D.Flat.moments: D = $D, order ≥ 1 not yet implemented. ",
-          "Use `moments(poly, 0)` for the 0th moment. See docs/phase3_status.md.")
+          "Use `moments(poly, 0)` for the 0th moment, or D = 4 for higher orders. ",
+          "D = 5 / D = 6 require an additional 3-face / 4-face tracking layer; ",
+          "see docs/d4plus_finalization_plan.md.")
 end
 
 function moments!(out::AbstractVector{T}, poly::FlatPolytope{D,T},
@@ -4175,9 +4187,403 @@ function moments!(out::AbstractVector{T}, poly::FlatPolytope{D,T},
         _reduce_nd_zeroth!(out, poly)
         return out
     end
+    if D == 4
+        @assert length(out) >= num_moments(4, Int(order))
+        _reduce_nd_higher_d4!(out, poly, Int(order))
+        return out
+    end
     error("R3D.Flat.moments!: D = $D, order ≥ 1 not yet implemented. ",
-          "Use `moments!(out, poly, 0)` for the 0th moment. ",
-          "See docs/phase3_status.md.")
+          "Use `moments!(out, poly, 0)` for the 0th moment, or D = 4 for higher orders. ",
+          "D = 5 / D = 6 require additional codim-face tracking layers; ",
+          "see docs/d4plus_finalization_plan.md.")
+end
+
+# ===========================================================================
+# Phase A — Lasserre's recursive face decomposition for D = 4 moments at
+# polynomial order ≥ 1. The formula:
+#
+#     ∫_P x^α dV  =  (1 / (D + |α|)) Σ_F d_F ∫_F x^α dA
+#
+# where each facet F has unit outward normal n_F, signed distance d_F =
+# n_F · c_F (any c_F on F), and ∫_F x^α dA is a (D−1)-dim moment integral
+# over the facet polytope. We project F into 3D coords y via x = c_F + B y
+# (B is a 4×3 orthonormal basis for F's tangent plane), build a 3D
+# `FlatPolytope`, call existing `moments!(_, ::FlatPolytope{3,T})`, then
+# expand `(c_F + B y)^α` multinomially to map 3D y-monomials back to the
+# 4D x-monomials.
+#
+# Validation: no C oracle exists at D ≥ 4 P ≥ 1 (upstream `rNd_reduce`'s
+# higher-order branch is `#else`-blocked off). We test against closed-form
+# unit D-simplex moments (`α! / (D + |α|)!`) and unit D-box moments
+# (separable: `∏_j 1 / (α_j + 1)`), plus voxelize-fold consistency.
+# ===========================================================================
+
+"""
+    _reduce_nd_higher_d4!(out::Vector{T}, poly::FlatPolytope{4,T}, P::Int)
+
+Compute moments of `poly` for orders `0..P` via Lasserre. Writes
+`num_moments(4, P)` entries into `out` in the canonical lex-by-degree
+order returned by `_enumerate_moments_d4`.
+"""
+function _reduce_nd_higher_d4!(out::AbstractVector{T},
+                                poly::FlatPolytope{4,T}, P::Int) where {T}
+    @assert P >= 1 "_reduce_nd_higher_d4! is for P ≥ 1; use _reduce_nd_zeroth! for P = 0"
+    nmom = num_moments(4, P)
+    @assert length(out) >= nmom
+    fill!(out, zero(T))
+    poly.nverts <= 0 && return out
+
+    # Enumerate the target 4D multi-indices α (length-nmom Vector{NTuple{4,Int}}).
+    alphas = _enumerate_moments_d4(P)
+
+    # Pre-allocate a 3D facet polytope buffer, sized for the largest facet.
+    # `walk_facet_vertices` is O(nverts), and the largest facet of the unit
+    # D-box has 2^(D-1) = 8 vertices; on a heavily-clipped polytope the
+    # facet vertex count grows but stays bounded by `poly.nverts`.
+    facet3d = FlatPolytope{3,T}(max(poly.nverts, 16))
+    moments_3d = zeros(T, num_moments(3, P))
+
+    # Per-facet scratch.
+    B = zeros(T, 4, 3)
+    for_facet_vmap = zeros(Int32, poly.nverts)   # 4D vertex idx → 3D vertex idx
+    for_facet_slot = zeros(Int32, poly.nverts)   # 4D vertex idx → "wrong" slot
+                                                  #  (slot k where facets[k,v] == fid)
+    perm = zeros(Int32, 3, poly.nverts)          # 3D pnbrs slot → 4D pnbrs slot
+                                                  #  per in-facet vertex
+    bfs_queue = zeros(Int32, poly.nverts)        # BFS frontier scratch
+
+    # Sum over facets.
+    @inbounds for fid in 1:poly.nfacets
+        # Build the 3D facet polytope. Returns false if facet is degenerate
+        # (e.g. all in-facet vertices were clipped away, or the facet has
+        # < 4 vertices in 4D — degenerate sub-simplex).
+        ok = _build_facet3d!(facet3d, B, for_facet_vmap, for_facet_slot,
+                              perm, bfs_queue, poly, fid)
+        ok || continue
+        c_F = (poly.positions[1, _first_facet_vertex(poly, fid)],
+               poly.positions[2, _first_facet_vertex(poly, fid)],
+               poly.positions[3, _first_facet_vertex(poly, fid)],
+               poly.positions[4, _first_facet_vertex(poly, fid)])
+
+        # 3D moments of the projected facet.
+        moments!(moments_3d, facet3d, P)
+
+        # If `facet3d` came out CW (negative volume), flip every entry so
+        # the higher-moments use the canonical positive-area version. The
+        # outward-normal sign on the parent polytope absorbs the choice.
+        sgn = sign(moments_3d[1])
+        sgn == zero(T) && continue   # truly degenerate facet
+        if sgn < zero(T)
+            for k in eachindex(moments_3d)
+                moments_3d[k] = -moments_3d[k]
+            end
+        end
+
+        d_F = poly.facet_distances[fid]
+        # Lift each 3D y^β moment up to 4D x^α moments. For each α with
+        # |α| ≤ P, ∫_F x^α dA = Σ_β coeff(α, β; c_F, B) · moments_3d[β].
+        for ai in 1:nmom
+            α = alphas[ai]
+            order_α = α[1] + α[2] + α[3] + α[4]
+            order_α == 0 && continue   # 0th moment handled separately
+            integral = _expand_facet_monomial_d4(α, c_F, B, moments_3d, P)
+            out[ai] += d_F * integral / (4 + order_α)
+        end
+    end
+
+    # 0th moment: reuse the existing LTD-recursion zeroth-moment computation,
+    # which is bit-exact to the C upstream and dodges Lasserre's accumulated
+    # round-off on the volume term. Volume is at index 1 in the canonical
+    # enumeration.
+    zeroth = zeros(T, 1)
+    _reduce_nd_zeroth!(zeroth, poly)
+    out[1] = zeroth[1]
+    return out
+end
+
+# Find the smallest-index vertex of `poly` that lies on facet `fid`. Used
+# as the reference point `c_F` in Lasserre's per-facet projection.
+@inline function _first_facet_vertex(poly::FlatPolytope{D,T},
+                                      fid::Integer) where {D,T}
+    @inbounds for v in 1:poly.nverts
+        for k in 1:D
+            if Int(poly.facets[k, v]) == Int(fid)
+                return v
+            end
+        end
+    end
+    error("_first_facet_vertex: facet $fid has no incident vertices")
+end
+
+# Build a 3D `FlatPolytope` for the projected facet `fid` of `poly`. Writes:
+# - `facet3d.positions[:, 1..nf]` from `B^T (poly.positions[:, v_4d] - c_F)`,
+# - `facet3d.pnbrs[:, 1..nf]` from each in-facet vertex's three in-facet
+#   neighbors mapped through `vmap`,
+# - `B` (4×3 orthonormal basis perpendicular to the facet's outward normal),
+# - `vmap[v_4d] = v_3d` for in-facet vertices, 0 otherwise.
+# Returns `true` on success, `false` if the facet is too degenerate to
+# project (< 4 vertices, or rank-deficient projection).
+function _build_facet3d!(facet3d::FlatPolytope{3,T},
+                          B::Matrix{T},
+                          vmap::Vector{Int32},
+                          wrong_slot::Vector{Int32},
+                          perm::Matrix{Int32},
+                          bfs_queue::Vector{Int32},
+                          poly::FlatPolytope{4,T},
+                          fid::Integer) where {T}
+    fid_i = Int(fid)
+    nf = 0
+    fill!(vmap, Int32(0))
+    fill!(wrong_slot, Int32(0))
+
+    # Pass 1: enumerate in-facet vertices and record vmap + wrong slot.
+    @inbounds for v in 1:poly.nverts
+        for k in 1:4
+            if Int(poly.facets[k, v]) == fid_i
+                nf += 1
+                vmap[v] = Int32(nf)
+                wrong_slot[v] = Int32(k)
+                break
+            end
+        end
+    end
+    nf < 4 && return false   # facet has < 4 vertices: degenerate
+    facet3d.capacity >= nf || return false
+
+    # Compute 3D basis B (4 × 3) ⊥ to the facet's outward normal.
+    _orthonormal_perp_basis!(B, poly.facet_normals, fid_i)
+
+    # Reference point c_F: position of the first in-facet vertex.
+    v0 = _first_facet_vertex(poly, fid_i)
+    c1 = poly.positions[1, v0]; c2 = poly.positions[2, v0]
+    c3 = poly.positions[3, v0]; c4 = poly.positions[4, v0]
+
+    # Pass 2: project positions and write a CONSISTENTLY-ORIENTED 3D
+    # pnbrs table.
+    #
+    # The 3D moments code (`moments!(::FlatPolytope{3,T})`) walks faces
+    # by cycling pnbrs slots via `next3`. For a face walk to close,
+    # every vertex along the walk must have its 3 in-facet edges
+    # ordered with consistent handedness — i.e. all "right-handed"
+    # frames or all "left-handed" frames in the projected 3D
+    # coordinate system.
+    #
+    # We achieve this purely geometrically: for each vertex v, lay
+    # down the 3 in-facet edges in numerical-slot order, then check
+    # `det(e_1, e_2, e_3)`. If its sign disagrees with the seed
+    # vertex's sign, swap two slots to flip handedness.
+    facet3d.nverts = nf
+    seed_sign = zero(T)
+    @inbounds for v in 1:poly.nverts
+        v3d = Int(vmap[v])
+        v3d == 0 && continue
+        # Project position
+        for j in 1:3
+            facet3d.positions[j, v3d] =
+                B[1, j] * (poly.positions[1, v] - c1) +
+                B[2, j] * (poly.positions[2, v] - c2) +
+                B[3, j] * (poly.positions[3, v] - c3) +
+                B[4, j] * (poly.positions[4, v] - c4)
+        end
+    end
+    @inbounds for v in 1:poly.nverts
+        v3d = Int(vmap[v])
+        v3d == 0 && continue
+        # Gather the 3 in-facet edges in numerical-slot order.
+        wrong = Int(wrong_slot[v])
+        slot3d = 0
+        nbr3d = (Int32(0), Int32(0), Int32(0))
+        e = (zero(T), zero(T), zero(T))
+        e1 = e2 = e3 = (zero(T), zero(T), zero(T))
+        nbr_3d_a = Int32(0); nbr_3d_b = Int32(0); nbr_3d_c = Int32(0)
+        for k in 1:4
+            k == wrong && continue
+            slot3d += 1
+            nbr_4d = Int(poly.pnbrs[k, v])
+            n3d = vmap[nbr_4d]
+            ex = facet3d.positions[1, n3d] - facet3d.positions[1, v3d]
+            ey = facet3d.positions[2, n3d] - facet3d.positions[2, v3d]
+            ez = facet3d.positions[3, n3d] - facet3d.positions[3, v3d]
+            if slot3d == 1
+                nbr_3d_a = n3d; e1 = (ex, ey, ez)
+            elseif slot3d == 2
+                nbr_3d_b = n3d; e2 = (ex, ey, ez)
+            else
+                nbr_3d_c = n3d; e3 = (ex, ey, ez)
+            end
+        end
+        # det([e1 e2 e3]) — signed volume of parallelepiped.
+        det_v = e1[1] * (e2[2] * e3[3] - e2[3] * e3[2]) -
+                e1[2] * (e2[1] * e3[3] - e2[3] * e3[1]) +
+                e1[3] * (e2[1] * e3[2] - e2[2] * e3[1])
+        if seed_sign == zero(T)
+            seed_sign = sign(det_v)
+        end
+        # If this vertex's handedness disagrees with the seed, swap
+        # slots 2 and 3 to flip it.
+        if det_v == zero(T)
+            return false   # degenerate vertex (collinear edges)
+        end
+        if sign(det_v) != seed_sign
+            nbr_3d_b, nbr_3d_c = nbr_3d_c, nbr_3d_b
+        end
+        facet3d.pnbrs[1, v3d] = nbr_3d_a
+        facet3d.pnbrs[2, v3d] = nbr_3d_b
+        facet3d.pnbrs[3, v3d] = nbr_3d_c
+    end
+
+    # Reset moment scratch so the 3D moments! resizes lazily for `P` only.
+    facet3d.moment_order = -1
+    return true
+end
+
+# Compute a 4×3 orthonormal basis whose columns are perpendicular to
+# `poly.facet_normals[:, fid]`. Writes the basis into `B`. The basis is
+# computed by Gram-Schmidt against the standard 4D unit vectors, dropping
+# the one most-parallel to the normal.
+@inline function _orthonormal_perp_basis!(B::Matrix{T},
+                                           facet_normals::Matrix{T},
+                                           fid::Int) where {T}
+    n1 = facet_normals[1, fid]; n2 = facet_normals[2, fid]
+    n3 = facet_normals[3, fid]; n4 = facet_normals[4, fid]
+    # Drop the unit axis most-parallel to n (largest |n_k|), to avoid a
+    # near-zero residual in the Gram-Schmidt step.
+    abs_n = (abs(n1), abs(n2), abs(n3), abs(n4))
+    drop = argmax(abs_n)
+    col = 0
+    @inbounds for k in 1:4
+        k == drop && continue
+        col += 1
+        # e_k orthogonalized against n.
+        # First column of B = e_k - (n_k) * n  (since n is unit length).
+        nk = facet_normals[k, fid]
+        B[1, col] = (k == 1 ? T(1) : T(0)) - nk * n1
+        B[2, col] = (k == 2 ? T(1) : T(0)) - nk * n2
+        B[3, col] = (k == 3 ? T(1) : T(0)) - nk * n3
+        B[4, col] = (k == 4 ? T(1) : T(0)) - nk * n4
+    end
+    # Now classical Gram-Schmidt across columns 1..3 of B.
+    @inbounds for c in 1:3
+        for cprev in 1:(c - 1)
+            dotp = B[1, c] * B[1, cprev] + B[2, c] * B[2, cprev] +
+                   B[3, c] * B[3, cprev] + B[4, c] * B[4, cprev]
+            B[1, c] -= dotp * B[1, cprev]
+            B[2, c] -= dotp * B[2, cprev]
+            B[3, c] -= dotp * B[3, cprev]
+            B[4, c] -= dotp * B[4, cprev]
+        end
+        len2 = B[1, c]^2 + B[2, c]^2 + B[3, c]^2 + B[4, c]^2
+        len = sqrt(len2)
+        @assert len > eps(T) "_orthonormal_perp_basis!: degenerate facet normal"
+        B[1, c] /= len; B[2, c] /= len
+        B[3, c] /= len; B[4, c] /= len
+    end
+    return B
+end
+
+# Enumerate all 4D multi-indices α = (α_1, α_2, α_3, α_4) with
+# |α| ≤ P, in the canonical "lex by total degree, then lex within
+# each degree" order matching `num_moments(4, P)`. Returned as a
+# vector of NTuple{4,Int}, length = num_moments(4, P).
+#
+# The order matches what `moments!` writes for D = 4: index 1 is the
+# zeroth moment (volume), then degree-1 moments in order
+# (1,0,0,0), (0,1,0,0), (0,0,1,0), (0,0,0,1), then degree-2, etc.
+function _enumerate_moments_d4(P::Int)
+    out = NTuple{4,Int}[]
+    for total in 0:P
+        for a in total:-1:0, b in (total - a):-1:0, c in (total - a - b):-1:0
+            d = total - a - b - c
+            push!(out, (a, b, c, d))
+        end
+    end
+    return out
+end
+
+# Return the index of 3D multi-index β = (β_1, β_2, β_3) within the
+# canonical D = 3 moments enumeration. Matches the order produced by
+# `moments!(::FlatPolytope{3,T})`'s outer loop:
+#   for total in 0..P
+#     for i in total..0, j in (total-i)..0
+#       k = total - i - j
+@inline function _moment_index_d3(β::NTuple{3,Int})
+    total = β[1] + β[2] + β[3]
+    # Skip count: number of multi-indices with total < `total`.
+    idx = 0
+    for t in 0:(total - 1)
+        idx += div((t + 1) * (t + 2), 2)
+    end
+    # Within `total`, position of β = (i, j, k) with i + j + k = total,
+    # ordered by i descending, then j descending. The index of (i, j, k)
+    # in the per-degree block is computed as:
+    #   sum_{i' > i} (total - i' + 1)   +   (total - β[1] - β[2])
+    i_cur = β[1]
+    sub = 0
+    for i_above in (total):-1:(i_cur + 1)
+        sub += total - i_above + 1
+    end
+    sub += (total - β[1]) - β[2]   # (total - i) - j gives offset within row
+    return idx + sub + 1
+end
+
+# Compute ∫_F x^α dA expressed in terms of 3D moments of the projected
+# facet. Substitutes x_j = c_F[j] + Σ_k B[j, k] y_k into x^α and
+# multinomially expands, summing each y^β monomial weighted by
+# `moments_3d[_moment_index_d3(β)]`.
+#
+# Implementation: build the polynomial as a dense `Array{T,3}` of size
+# `(P+1) × (P+1) × (P+1)` indexed by β = (b_1, b_2, b_3) where the entry
+# is the coefficient. Multiply factor-by-factor. For P ≤ 3 this stays
+# tiny (≤ 64 entries) so we don't sweat allocation.
+function _expand_facet_monomial_d4(α::NTuple{4,Int},
+                                    c::NTuple{4,T},
+                                    B::Matrix{T},
+                                    moments_3d::Vector{T},
+                                    P::Int) where {T}
+    # Polynomial in y: poly[b1+1, b2+1, b3+1] = coefficient of y_1^b1 y_2^b2 y_3^b3.
+    nb = P + 1
+    poly_buf = zeros(T, nb, nb, nb)
+    poly_new = zeros(T, nb, nb, nb)
+    @inbounds poly_buf[1, 1, 1] = one(T)   # start with constant 1
+
+    @inbounds for j in 1:4
+        αj = α[j]
+        αj == 0 && continue
+        # Multiply poly_buf by (c_j + B[j,1] y_1 + B[j,2] y_2 + B[j,3] y_3)^{αj}.
+        # Do it αj times, multiplying by the linear factor each time.
+        cj  = c[j]
+        Bj1 = B[j, 1]; Bj2 = B[j, 2]; Bj3 = B[j, 3]
+        for _step in 1:αj
+            fill!(poly_new, zero(T))
+            for b1 in 0:(P), b2 in 0:(P - b1), b3 in 0:(P - b1 - b2)
+                pv = poly_buf[b1 + 1, b2 + 1, b3 + 1]
+                pv == zero(T) && continue
+                # constant term: c_j * y^β
+                poly_new[b1 + 1, b2 + 1, b3 + 1] += cj * pv
+                # B[j,1] * y_1 * y^β = B[j,1] * y^(β + e_1)
+                if b1 + 1 < nb
+                    poly_new[b1 + 2, b2 + 1, b3 + 1] += Bj1 * pv
+                end
+                if b2 + 1 < nb
+                    poly_new[b1 + 1, b2 + 2, b3 + 1] += Bj2 * pv
+                end
+                if b3 + 1 < nb
+                    poly_new[b1 + 1, b2 + 1, b3 + 2] += Bj3 * pv
+                end
+            end
+            # Swap roles via copy (small array, fine for now).
+            poly_buf, poly_new = poly_new, poly_buf
+        end
+    end
+
+    # Sum poly_buf[β] * moments_3d[index_of(β)] over all β with |β| ≤ P.
+    s = zero(T)
+    @inbounds for b1 in 0:P, b2 in 0:(P - b1), b3 in 0:(P - b1 - b2)
+        coeff = poly_buf[b1 + 1, b2 + 1, b3 + 1]
+        coeff == zero(T) && continue
+        s += coeff * moments_3d[_moment_index_d3((b1, b2, b3))]
+    end
+    return s
 end
 
 # Port of rNd_reduce (`src/rNd.c:252-315`) for the 0th moment only.

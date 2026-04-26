@@ -856,6 +856,105 @@ using LinearAlgebra: I
         end
     end
 
+    @testset "Phase A: D = 4 Lasserre moments (P ≥ 1) closed-form validation" begin
+        # Closed-form unit D-simplex moments: ∫_{Δ_D} x^α dV = α! / (D + |α|)!
+        # Closed-form unit D-box moments:     ∫_{[0,1]^D} x^α dV = ∏ 1 / (α_j + 1)
+        factorial_int(n) = prod(1:n; init = 1)
+        function expected_simplex(α::NTuple{4,Int})
+            num = prod(factorial_int(a) for a in α; init = 1)
+            return num / factorial_int(4 + sum(α))
+        end
+        expected_box(α::NTuple{4,Int}) = prod(1.0 / (a + 1) for a in α; init = 1.0)
+
+        # Up through P = 3 — all 35 multi-indices must match.
+        for P in 1:3
+            sim = R3D.Flat.simplex((0.0, 0.0, 0.0, 0.0),
+                                    (1.0, 0.0, 0.0, 0.0),
+                                    (0.0, 1.0, 0.0, 0.0),
+                                    (0.0, 0.0, 1.0, 0.0),
+                                    (0.0, 0.0, 0.0, 1.0))
+            m_sim = R3D.Flat.moments(sim, P)
+            box = R3D.Flat.box((0.0, 0.0, 0.0, 0.0), (1.0, 1.0, 1.0, 1.0))
+            m_box = R3D.Flat.moments(box, P)
+            for (i, α) in enumerate(R3D.Flat._enumerate_moments_d4(P))
+                @test isapprox(m_sim[i], expected_simplex(α); atol = 1e-10)
+                @test isapprox(m_box[i], expected_box(α); atol = 1e-10)
+            end
+        end
+
+        # Coordinate-permutation symmetry on the unit hypercube: any
+        # moment with α invariant under a coordinate permutation must
+        # equal the moment with the permuted α.
+        let
+            box = R3D.Flat.box((0.0, 0.0, 0.0, 0.0), (1.0, 1.0, 1.0, 1.0))
+            m = R3D.Flat.moments(box, 3)
+            alphas = R3D.Flat._enumerate_moments_d4(3)
+            idx = Dict(α => i for (i, α) in enumerate(alphas))
+            for α in alphas
+                # Try a coordinate swap (1, 2): if α has α[1] != α[2],
+                # the swapped α is a different multi-index and must
+                # have the same moment value (since the unit hypercube
+                # is invariant under that swap).
+                α_swap = (α[2], α[1], α[3], α[4])
+                @test isapprox(m[idx[α]], m[idx[α_swap]]; atol = 1e-12)
+            end
+        end
+
+        # Clipped simplex: ∫ x_1 dV checked against analytic decomposition.
+        # P_clip = unit-D=4 simplex ∩ {x_1 ≤ 0.5}. By inclusion-exclusion:
+        #   vol(P_clip) = 1/24 - vol(corner)
+        #   ∫_{P_clip} x_1 dV = ∫_simplex x_1 - ∫_corner x_1
+        # corner = {x_1 ∈ [0.5, 1], rest in (1/2)-scaled simplex translate}.
+        # Substituting u = (x - 0.5*e_1)/0.5 (so x_1 = 0.5 + u_1/2, others
+        # = u_i/2), the corner integral closes via standard simplex
+        # moments: vol(corner) = 1/384, ∫_corner x_1 = 1/640.
+        let
+            poly = R3D.Flat.simplex((0.0, 0.0, 0.0, 0.0),
+                                     (1.0, 0.0, 0.0, 0.0),
+                                     (0.0, 1.0, 0.0, 0.0),
+                                     (0.0, 0.0, 1.0, 0.0),
+                                     (0.0, 0.0, 0.0, 1.0))
+            R3D.Flat.clip!(poly,
+                R3D.Plane{4,Float64}(R3D.Vec{4,Float64}(-1.0, 0.0, 0.0, 0.0), 0.5))
+            m = R3D.Flat.moments(poly, 1)
+            @test isapprox(m[1], 1/24 - 1/384; atol = 1e-12)
+            @test isapprox(m[2], 1/120 - 1/640; atol = 1e-10)
+            # By symmetry under (x_2, x_3, x_4) permutation, the
+            # other three first-moments are equal.
+            @test isapprox(m[3], m[4]; atol = 1e-12)
+            @test isapprox(m[3], m[5]; atol = 1e-12)
+        end
+
+        # Voxelize-fold consistency: per-cell moment sum equals whole
+        # polytope moment to fp precision. Uses n = 2 — at non-power-of-2
+        # grid sizes, voxelize_fold! at D ≥ 4 has a pre-existing
+        # bisection-loop bug (tracked separately, see task list).
+        let
+            poly = R3D.Flat.simplex((0.0, 0.0, 0.0, 0.0),
+                                     (1.0, 0.0, 0.0, 0.0),
+                                     (0.0, 1.0, 0.0, 0.0),
+                                     (0.0, 0.0, 1.0, 0.0),
+                                     (0.0, 0.0, 0.0, 1.0))
+            whole = R3D.Flat.moments(poly, 2)
+            ws = R3D.Flat.VoxelizeWorkspace{4,Float64}(64)
+            n = 2
+            d_grid  = ntuple(_ -> 1.0 / n, Val(4))
+            ibox_lo = ntuple(_ -> 0,       Val(4))
+            ibox_hi = ntuple(_ -> n,       Val(4))
+            sum_cells = zeros(Float64, length(whole))
+            R3D.Flat.voxelize_fold!(sum_cells, poly, ibox_lo, ibox_hi, d_grid,
+                                    2; workspace = ws) do acc, idx, m
+                @inbounds for k in eachindex(acc)
+                    acc[k] += m[k]
+                end
+                acc
+            end
+            for k in eachindex(whole)
+                @test isapprox(sum_cells[k], whole[k]; atol = 1e-10, rtol = 1e-10)
+            end
+        end
+    end
+
     @testset "R3D.Flat facet normals + signed distances (D ≥ 4, Phase A foundation)" begin
         # Box facets: outward axis-aligned, signed-distance matches
         # the corresponding lo/hi coordinate.
@@ -987,11 +1086,24 @@ using LinearAlgebra: I
             @test isapprox(R3D.Flat.volume(box), 0.5; atol=1e-12, rtol=1e-10)
         end
 
-        # Order ≥ 1 stays stubbed with informative error.
+        # D = 4 order ≥ 1 now lands via Lasserre (Phase A). D = 5 / D = 6
+        # still require additional codim-face tracking layers and stay
+        # stubbed with an informative error.
         buf4 = R3D.Flat.FlatPolytope{4,Float64}(64)
         R3D.Flat.init_box!(buf4, zeros(4), ones(4))
-        @test_throws ErrorException R3D.Flat.moments(buf4, 1)
-        @test_throws ErrorException R3D.Flat.moments!(zeros(5), buf4, 1)
+        m4 = R3D.Flat.moments(buf4, 1)
+        @test length(m4) == R3D.num_moments(4, 1)
+        @test isapprox(m4[1], 1.0; atol = 1e-12)   # zeroth moment = vol = 1
+        # First moments of unit hypercube = 0.5 each.
+        for i in 2:5
+            @test isapprox(m4[i], 0.5; atol = 1e-12)
+        end
+        for D in 5:6
+            buf = R3D.Flat.FlatPolytope{D,Float64}(64)
+            R3D.Flat.init_box!(buf, zeros(D), ones(D))
+            @test_throws ErrorException R3D.Flat.moments(buf, 1)
+            @test_throws ErrorException R3D.Flat.moments!(zeros(D + 1), buf, 1)
+        end
 
         # Differential vs C (only when the per-dimension rNd library is loaded).
         if HAVE_C && !isempty(R3D_C.libr3d_4d[])
@@ -1044,13 +1156,36 @@ using LinearAlgebra: I
             @test all(isapprox.(grid, cell_vol; atol=1e-12, rtol=1e-10))
         end
 
-        # Higher orders are stubbed.
-        buf = R3D.Flat.FlatPolytope{4,Float64}(64)
-        R3D.Flat.init_box!(buf, zeros(4), ones(4))
-        ws = R3D.Flat.VoxelizeWorkspace{4,Float64}(64)
-        @test_throws AssertionError R3D.Flat.voxelize_fold!(0.0, buf, (0,0,0,0),
-            (4,4,4,4), (0.25,0.25,0.25,0.25), 1; workspace = ws) do acc, idx, m
-            acc + m[1]
+        # D = 4 voxelize_fold! at order ≥ 1 lands via Lasserre. D = 5 / D = 6
+        # still throw.
+        buf4 = R3D.Flat.FlatPolytope{4,Float64}(64)
+        R3D.Flat.init_box!(buf4, zeros(4), ones(4))
+        ws4 = R3D.Flat.VoxelizeWorkspace{4,Float64}(64)
+        # Sum-over-voxels of order-1 moments == whole-polytope order-1 moment.
+        whole = R3D.Flat.moments(buf4, 1)
+        sum_over_cells = zeros(Float64, 5)
+        R3D.Flat.voxelize_fold!(sum_over_cells, buf4, (0,0,0,0),
+            (4,4,4,4), (0.25,0.25,0.25,0.25), 1; workspace = ws4) do acc, idx, m
+            @inbounds for k in 1:5
+                acc[k] += m[k]
+            end
+            acc
+        end
+        for k in 1:5
+            @test isapprox(sum_over_cells[k], whole[k]; atol = 1e-10, rtol = 1e-10)
+        end
+        # D = 5 / D = 6 still throw on order ≥ 1 (no Lasserre yet).
+        for D in 5:6
+            buf = R3D.Flat.FlatPolytope{D,Float64}(64)
+            R3D.Flat.init_box!(buf, zeros(D), ones(D))
+            ws = R3D.Flat.VoxelizeWorkspace{D,Float64}(64)
+            d_grid = ntuple(_ -> 0.5, D)
+            ibox_lo = ntuple(_ -> 0, D)
+            ibox_hi = ntuple(_ -> 2, D)
+            @test_throws AssertionError R3D.Flat.voxelize_fold!(0.0, buf, ibox_lo,
+                ibox_hi, d_grid, 1; workspace = ws) do acc, idx, m
+                acc + m[1]
+            end
         end
     end
 
@@ -1371,11 +1506,17 @@ using LinearAlgebra: I
         end
 
         # `clip!` and `moments(., 0)` are now real for D ≥ 4 (Phase 3c
-        # + 3d). Higher-order moments stay stubbed.
+        # + 3d). D = 4 higher-order moments now via Lasserre (Phase A);
+        # D = 5 / D = 6 still stubbed.
         buf4 = R3D.Flat.FlatPolytope{4,Float64}(64)
         R3D.Flat.init_box!(buf4, zeros(4), ones(4))
         @test isapprox(R3D.Flat.moments(buf4, 0)[1], 1.0; atol=1e-12)
-        @test_throws ErrorException R3D.Flat.moments(buf4, 1)
+        @test isapprox(R3D.Flat.moments(buf4, 1)[1], 1.0; atol=1e-12)
+        for D in 5:6
+            buf = R3D.Flat.FlatPolytope{D,Float64}(64)
+            R3D.Flat.init_box!(buf, zeros(D), ones(D))
+            @test_throws ErrorException R3D.Flat.moments(buf, 1)
+        end
     end
 
     @testset "Hot-loop overlap pattern is 0-alloc end-to-end" begin

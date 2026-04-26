@@ -100,10 +100,20 @@ mutable struct FlatPolytope{D,T}
     # containing v's edges to neighbours a and b. Sentinel `0` = unset.
     finds::Array{Int32,3}
     nfaces::Int
+
+    # (D−1)-face ("facet") IDs for D ≥ 4. For D ≤ 3 this stays at the
+    # empty (0, 0) sentinel. For D ≥ 4: shape `D × capacity`, with
+    # `facets[k, v]` = ID of the facet OPPOSITE edge-slot k of vertex
+    # v (i.e., the facet that contains all of v's edges except slot k).
+    # Sentinel `0` = unset. Used by Lasserre-style higher-order moment
+    # integration (added on top of this in a follow-up session).
+    facets::Matrix{Int32}
+    nfacets::Int
 end
 
 function FlatPolytope{D,T}(capacity::Int = 512) where {D,T}
-    finds = D >= 4 ? zeros(Int32, D, D, capacity) : Array{Int32,3}(undef, 0, 0, 0)
+    finds  = D >= 4 ? zeros(Int32, D, D, capacity) : Array{Int32,3}(undef, 0, 0, 0)
+    facets = D >= 4 ? zeros(Int32, D,    capacity) : Matrix{Int32}(undef, 0, 0)
     FlatPolytope{D,T}(zeros(T, D, capacity),
                       zeros(Int32, D, capacity),
                       0, capacity,
@@ -115,6 +125,8 @@ function FlatPolytope{D,T}(capacity::Int = 512) where {D,T}
                       Array{T,3}(undef, 0, 0, 0),
                       -1,
                       finds,
+                      0,
+                      facets,
                       0)
 end
 
@@ -934,14 +946,67 @@ end
         for k in 1:D
             dst.positions[k, v] = src.positions[k, v]
             dst.pnbrs[k, v]     = src.pnbrs[k, v]
+            dst.facets[k, v]    = src.facets[k, v]
         end
         for j in 1:D, i in 1:D
             dst.finds[i, j, v] = src.finds[i, j, v]
         end
     end
-    dst.nverts = n
-    dst.nfaces = src.nfaces
+    dst.nverts  = n
+    dst.nfaces  = src.nfaces
+    dst.nfacets = src.nfacets
     return dst
+end
+
+"""
+    walk_facet_vertices(callback::F, poly::FlatPolytope{D,T}, fid::Integer) where {F,D,T}
+
+Call `callback(v)` for each vertex `v` incident to facet `fid` in the
+D ≥ 4 polytope `poly`. Linear scan over the polytope's vertices —
+zero allocations.
+"""
+function walk_facet_vertices(callback::F, poly::FlatPolytope{D,T},
+                             fid::Integer) where {F,D,T}
+    @assert D >= 4 "walk_facet_vertices is for D ≥ 4 only"
+    fid_i = Int32(fid)
+    @inbounds for v in 1:poly.nverts
+        # A vertex is on facet `fid` iff some slot of its facets row
+        # equals `fid`.
+        on_facet = false
+        for k in 1:D
+            if poly.facets[k, v] == fid_i
+                on_facet = true
+                break
+            end
+        end
+        on_facet && callback(v)
+    end
+    return nothing
+end
+
+"""
+    walk_facets(callback::F, poly::FlatPolytope{D,T}) where {F,D,T}
+
+Enumerate each facet ID of the D ≥ 4 polytope exactly once, calling
+`callback(fid::Int)` for each. Pair with [`walk_facet_vertices`](@ref)
+to get the vertex set per facet.
+
+Allocates a `BitVector` of length `poly.nfacets` for visited tracking;
+free if `poly.nfacets` is small.
+"""
+function walk_facets(callback::F, poly::FlatPolytope{D,T}) where {F,D,T}
+    @assert D >= 4 "walk_facets is for D ≥ 4 only"
+    poly.nfacets <= 0 && return nothing
+    seen = falses(poly.nfacets)
+    @inbounds for v in 1:poly.nverts, k in 1:D
+        fid = Int(poly.facets[k, v])
+        (fid <= 0 || fid > poly.nfacets) && continue
+        if !seen[fid]
+            seen[fid] = true
+            callback(fid)
+        end
+    end
+    return nothing
 end
 
 """
@@ -2986,6 +3051,18 @@ function init_box!(poly::FlatPolytope{D,T},
         end
     end
     poly.nfaces = f
+
+    # Facet ((D−1)-face) IDs. A D-box has 2D facets — one per axis-side.
+    # Convention: facet 2k-1 is "x[k] = lo[k]"; facet 2k is "x[k] = hi[k]".
+    # For vertex v (bit pattern), the facet OPPOSITE edge slot k is the
+    # facet on v's OWN side along axis k (since v is on that facet, and
+    # the edge in slot k crosses to the OTHER side).
+    @inbounds for v in 0:(nv - 1), k in 1:D
+        stride = 1 << (k - 1)
+        on_hi = (v & stride) != 0
+        poly.facets[k, v + 1] = Int32(on_hi ? 2k : 2k - 1)
+    end
+    poly.nfacets = 2D
     return poly
 end
 
@@ -3039,6 +3116,15 @@ function init_simplex!(poly::FlatPolytope{D,T}, vertices) where {D,T}
         poly.finds[np1_at_v2, np0_at_v2, v2] = Int32(f)
     end
     poly.nfaces = f
+
+    # Facet IDs for the D-simplex. A D-simplex has D+1 facets — facet `u`
+    # is the one OPPOSITE vertex u (i.e., the (D−1)-simplex on all other
+    # D vertices). For vertex v, the facet opposite edge-slot k of v is
+    # the facet opposite the OTHER endpoint of that edge: pnbrs[k, v].
+    @inbounds for v in 1:nv, k in 1:D
+        poly.facets[k, v] = poly.pnbrs[k, v]
+    end
+    poly.nfacets = nv
     return poly
 end
 
@@ -3444,6 +3530,16 @@ function _clip_plane_nd!(poly::FlatPolytope{D,T}, plane::Plane{D,T}) where {D,T}
     # insert a new vertex at the cut. The new vertex inherits a partial
     # `finds` connectivity from `vcur` (the row 0 / column 0 entries are
     # populated; the rest are sentinel-zero for the linker to fill).
+    #
+    # Facet propagation: each clip creates ONE new facet (the cut
+    # hyperplane). Every new vertex's slot 1 points back to vcur (the
+    # kept side) — so the facet OPPOSITE that slot is the cut. Other
+    # slots inherit facets from vcur (a facet that contains both vcur
+    # and vnext stays intact through the cut, so the new vertex is on
+    # it too). new_v slot k (k = 2..D) inherits from vcur slot np_k,
+    # using the same k_new → k_orig mapping as the finds row-0 fill
+    # above (i.e., vcur's non-np slots in order).
+    new_facet_id = Int32(poly.nfacets + 1)
     @inbounds for vcur in 1:onv
         clipped[vcur] != 0 && continue
         for np in 1:D
@@ -3471,10 +3567,15 @@ function _clip_plane_nd!(poly::FlatPolytope{D,T}, plane::Plane{D,T}) where {D,T}
             # vcur's slot for vnext now points at the new vertex.
             poly.pnbrs[np, vcur] = Int32(new_v)
 
-            # Carry 2-face IDs from vcur into the new vertex's row 0 /
-            # column 0 of finds. For each np0 ≠ np in vcur's pnbrs, the
-            # 2-face vcur.finds[np][np0] becomes the 2-face
-            # new_v.finds[0][np1] / .finds[np1][0] for np1 = 1..D-1.
+            # Slot 1 of new_v opposite vcur ⇒ the new cut facet.
+            poly.facets[1, new_v] = new_facet_id
+
+            # Carry 2-face IDs and facet IDs from vcur into new_v.
+            # For each np0 ≠ np in vcur's pnbrs, the 2-face
+            # vcur.finds[np][np0] becomes new_v.finds[0][np1] / [np1][0]
+            # AND the facet vcur.facets[np0] is also incident to new_v
+            # via slot np1. (np1 = 2..D in new_v, in the same enumeration
+            # order as np0 = 1..D excluding np in vcur.)
             np1 = 1
             for np0 in 1:D
                 np0 == np && continue
@@ -3482,6 +3583,7 @@ function _clip_plane_nd!(poly::FlatPolytope{D,T}, plane::Plane{D,T}) where {D,T}
                 fid = poly.finds[np, np0, vcur]
                 poly.finds[1,   np1, new_v] = fid
                 poly.finds[np1, 1,   new_v] = fid
+                poly.facets[np1, new_v] = poly.facets[np0, vcur]
             end
             # Mark everything else (interior of the finds matrix) as 0
             # for the linker to fill.
@@ -3491,6 +3593,12 @@ function _clip_plane_nd!(poly::FlatPolytope{D,T}, plane::Plane{D,T}) where {D,T}
             clipped[new_v] = Int32(0)
         end
     end
+
+    # If we got past the trivial accept/reject checks, at least one
+    # edge was cut (the polytope is connected and has vertices on both
+    # sides), so we have inserted at least one new vertex onto the cut
+    # facet. Commit the new facet ID.
+    poly.nfacets += 1
 
     # --- Step 4: walk 2-face boundaries to close all new 2-faces.
     # For each new vertex `vstart` and each pair of unset slot-pairs
@@ -3560,6 +3668,8 @@ function _clip_plane_nd!(poly::FlatPolytope{D,T}, plane::Plane{D,T}) where {D,T}
     poly.nfaces = nfaces
 
     # --- Step 5: compact (same as 3D, generalized to D pnbrs slots).
+    # facets[k, v] is also moved with v but does NOT need re-indexing
+    # — facet IDs are global, not vertex-relative.
     numunclipped = 0
     @inbounds for v in 1:poly.nverts
         if clipped[v] == 0
@@ -3568,6 +3678,7 @@ function _clip_plane_nd!(poly::FlatPolytope{D,T}, plane::Plane{D,T}) where {D,T}
                 for i in 1:D
                     poly.positions[i, numunclipped] = poly.positions[i, v]
                     poly.pnbrs[i, numunclipped]     = poly.pnbrs[i, v]
+                    poly.facets[i, numunclipped]    = poly.facets[i, v]
                 end
                 for i in 1:D, j in 1:D
                     poly.finds[i, j, numunclipped] = poly.finds[i, j, v]

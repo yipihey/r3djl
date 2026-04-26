@@ -5,10 +5,12 @@
 | Capability                                          | D=2,3 | D=4,5,6                  |
 |-----------------------------------------------------|:-----:|:--------------------------|
 | `init_box!` / `init_simplex!` (incl. `finds[][]`)   | ✓     | ✓                        |
+| **Facet (`(D−1)`-face) tracking**                   | n/a   | **✓** (`facets`, `nfacets`)  |
 | `num_moments(D, P)`                                 | ✓     | ✓ (`binomial(D+P, P)`)   |
-| `clip!`                                             | ✓     | **✓** (port of `rNd_clip`)  |
+| `clip!` (incl. facet propagation)                   | ✓     | **✓** (port of `rNd_clip` + facet bump per cut) |
 | `moments` / `moments!` order = 0 (≡ `volume`)       | ✓     | **✓** (port of `rNd_reduce`) |
-| `moments` / `moments!` order ≥ 1                    | ✓     | ⛔ (informative stub)     |
+| `moments` / `moments!` order ≥ 1                    | ✓     | ⛔ (Lasserre on top of facets — next session) |
+| `voxelize_fold!` / `voxelize!`                      | ✓     | ✓ (order = 0 only)       |
 | Differential validation vs C `rNd`                  | ✓     | ✓ at D = 4 (100 trials, max diff 3e-15) |
 
 ### What landed in this push
@@ -73,10 +75,14 @@ expectations (Vertex4 = 112 bytes, Vertex5 = 160, Vertex6 = 216).
 
 ### What's still missing for full Phase 3 acceptance
 
-1. **Higher-order moments (P ≥ 1) for D ≥ 4.** This needs either
-   Lasserre's recursive face-by-face decomposition or a D-generic
-   Koehl. Not yet implemented; `moments(poly, P ≥ 1)` raises an
-   informative error for `D ≥ 4`.
+1. **Higher-order moments (P ≥ 1) for D ≥ 4.** Facet tracking
+   infrastructure is now in place (`facets`, `nfacets`, `walk_facets`,
+   `walk_facet_vertices`) — that was the universal building block.
+   Next: implement Lasserre's recursive formula on top, which at
+   D = 4 closes the loop using facets + 2-faces. D = 5 needs an
+   additional 3-face tracking layer (same structural pattern). Until
+   then, `moments(poly, P ≥ 1)` raises an informative error for
+   `D ≥ 4`.
 2. **CI integration of D = 4/5/6 differential tests.** The CI
    workflow doesn't yet build `libr3d_{4,5,6}d.dylib`; the new
    testset gracefully skips when those env vars are absent. Adding

@@ -765,6 +765,82 @@ using LinearAlgebra: I
         @test (@allocated R3D.Flat.copy!(dst3, src3)) == 0
     end
 
+    @testset "R3D.Flat facet ((D−1)-face) tracking" begin
+        # Box: 2D facets, each shared by 2^(D-1) vertices.
+        for D in 4:6
+            box = R3D.Flat.FlatPolytope{D,Float64}(128)
+            R3D.Flat.init_box!(box, zeros(D), ones(D))
+            @test box.nfacets == 2D
+            counts = zeros(Int, box.nfacets)
+            for v in 1:box.nverts, k in 1:D
+                counts[box.facets[k, v]] += 1
+            end
+            # Every (vertex, slot) entry contributes 1 occurrence; total
+            # = nverts × D = 2^D × D = 2D × 2^(D-1) ⇒ each facet
+            # appears in exactly 2^(D-1) vertices.
+            @test all(counts .== 2^(D - 1))
+            @test all(box.facets[k, v] != 0 for v in 1:box.nverts, k in 1:D)
+            # walk_facets visits each ID exactly once.
+            visited = Set{Int}()
+            R3D.Flat.walk_facets(box) do fid; push!(visited, fid); end
+            @test visited == Set(1:2D)
+            # walk_facet_vertices returns the right cardinality.
+            for fid in 1:2D
+                count = 0
+                R3D.Flat.walk_facet_vertices(box, fid) do v; count += 1; end
+                @test count == 2^(D - 1)
+            end
+        end
+
+        # Simplex: D+1 facets, each shared by D vertices (everyone except
+        # the vertex it's opposite).
+        for D in 4:6
+            verts = [ntuple(j -> j == i ? 1.0 : 0.0, D) for i in 0:D]
+            sim = R3D.Flat.FlatPolytope{D,Float64}(64)
+            R3D.Flat.init_simplex!(sim, verts)
+            @test sim.nfacets == D + 1
+            counts = zeros(Int, sim.nfacets)
+            for v in 1:sim.nverts, k in 1:D
+                counts[sim.facets[k, v]] += 1
+            end
+            @test all(counts .== D)
+            visited = Set{Int}()
+            R3D.Flat.walk_facets(sim) do fid; push!(visited, fid); end
+            @test visited == Set(1:(D + 1))
+        end
+
+        # Single clip on a D=4 unit box: facet count = 2D + 1 = 9. The
+        # new facet ID = 9 appears in exactly the new vertices' slot 1.
+        buf = R3D.Flat.FlatPolytope{4,Float64}(64)
+        R3D.Flat.init_box!(buf, zeros(4), ones(4))
+        nverts_pre = buf.nverts
+        R3D.Flat.clip!(buf, [R3D.Plane{4,Float64}(R3D.Vec{4,Float64}(1.0,0,0,0), -0.5)])
+        @test buf.nfacets == 9
+        cut_count = sum(buf.facets[1, v] == 9 for v in 1:buf.nverts)
+        # The kept-side edge (slot 1) of each NEW vertex points back
+        # at an original kept vertex; the facet opposite that edge is
+        # the cut. Half of the post-clip vertices are new (the cut
+        # creates one new vertex per cut edge ≈ half the box's vertices).
+        @test cut_count > 0
+        # Cut facet's vertex set: all newly-inserted vertices.
+        cut_verts = Int[]
+        R3D.Flat.walk_facet_vertices(buf, 9) do v; push!(cut_verts, v); end
+        @test length(cut_verts) == 8   # the 8 new vertices on the x[1]=0.5 cut
+
+        # Sequential clips: 3 orthogonal cuts at D = 4, 5, 6 → nfacets += 3.
+        for D in 4:6
+            buf = R3D.Flat.FlatPolytope{D,Float64}(128)
+            R3D.Flat.init_box!(buf, zeros(D), ones(D))
+            base = buf.nfacets
+            for axis in 1:3
+                R3D.Flat.clip!(buf, [R3D.Plane{D,Float64}(
+                    R3D.Vec{D,Float64}(ntuple(k -> k == axis ? 1.0 : 0.0, D)),
+                    -0.5)])
+                @test buf.nfacets == base + axis
+            end
+        end
+    end
+
     @testset "R3D.Flat ND (D ≥ 4) — clip + 0th-moment closed forms + diff vs C" begin
         # Closed-form: unit D-simplex volume = 1/D!, unit D-box volume = 1.
         for D in 4:6

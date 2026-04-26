@@ -7,6 +7,50 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Facet ((D−1)-face) tracking foundation for D ≥ 4
+
+Universal building block for the deferred higher-order moments work.
+Standard analytic moment schemes (Lasserre's recursive face
+decomposition, simplex-fan triangulation, divergence-theorem
+recursion) all need facet enumeration, which the existing data
+structure didn't expose: `pnbrs` gives 1-faces, `finds` gives
+2-faces, but nothing tracked codim-1.
+
+- New fields on `FlatPolytope{D,T}`: `facets::Matrix{Int32}` (lazy
+  `D × capacity` for D ≥ 4, empty placeholder for D ≤ 3) and
+  `nfacets::Int`. `facets[k, v]` = ID of the facet OPPOSITE edge slot
+  k of vertex v. Sentinel 0 = unset.
+- `init_box!(::FlatPolytope{D,T})` for D ≥ 4: `2D` facets indexed
+  `(2k-1, 2k)` for the (lo, hi) sides of axis k. Each vertex's
+  facets[k, v] determined by its bit k.
+- `init_simplex!(::FlatPolytope{D,T}, vertices)` for D ≥ 4: D+1
+  facets where facet `u` is opposite vertex u. For vertex v,
+  facets[k, v] = pnbrs[k, v] (the facet opposite the edge to slot
+  k's neighbour is the one opposite that neighbour).
+- `_clip_plane_nd!`: each clip creates ONE new facet (the cut
+  hyperplane). Step 3 sets `facets[1, new_v] = new_facet_id` for
+  every newly-inserted vertex (slot 1 points back to the kept-side
+  vcur, so the facet opposite slot 1 IS the cut). Other slots
+  inherit from vcur using the same k_new → k_orig mapping as the
+  finds row-0 fill. Step 5 compaction copies facets columns
+  alongside positions/pnbrs/finds. `nfacets` bumped by 1 per cut.
+- `walk_facets(callback, poly)` enumerates each facet ID exactly
+  once. `walk_facet_vertices(callback, poly, fid)` calls callback
+  for each vertex incident to a given facet (zero-alloc).
+- `_copy_polytope_nd!` copies the facets table too (used by D ≥ 4
+  voxelize fold/split).
+
+Tests (~30 new): box/simplex closed-form facet counts for D = 4, 5,
+6; per-facet vertex-count invariants; single-clip facet propagation
+(D=4 box clipped by `x[1] ≥ 0.5` → 9 facets, the new cut facet
+contains exactly the 8 newly-inserted vertices); 3 sequential
+orthogonal clips bump `nfacets` by 3.
+
+The Lasserre moment recursion on top of facets (closing
+higher-order moments at D = 4) is the natural next session's work.
+D = 5 / D = 6 need additional intermediate codim-face tracking
+layers (same structural pattern).
+
 ### `voxelize_fold!` / `voxelize!` extended to D ≥ 4 (order = 0)
 
 - D-generic `get_ibox`, `voxelize_fold!`, and `voxelize!` for D = 4, 5, 6.

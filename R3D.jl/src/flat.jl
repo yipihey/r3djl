@@ -3911,20 +3911,27 @@ function clip_plane!(poly::FlatPolytope{D,T}, plane::Plane{D,T}) where {D,T}
     # using the same k_new → k_orig mapping as the finds row-0 fill
     # above (i.e., vcur's non-np slots in order).
     new_facet_id = Int32(poly.nfacets + 1)
-    # ε-nudge for the cut-position formula. When sdists[vcur] is exactly
-    # zero (vcur lies on the cut plane), the formula
-    # (vnext * sd_vcur - vcur * sd_vnext) / (sd_vcur - sd_vnext)
-    # collapses to vcur, creating duplicate vertices that break the
+    # ε-nudge for the cut-position formula. The formula
+    #   (vnext * sd_vcur - vcur * sd_vnext) / (sd_vcur - sd_vnext)
+    # collapses to vcur when sd_vcur ≈ 0, and to vnext when sd_vnext ≈ 0,
+    # producing a duplicate vertex either way. That breaks the
     # simple-polytope invariant the LTD moments recursion assumes.
-    # That manifested as wrong volumes for D ≥ 4 sequential `clip!` on
-    # simplex-like polytopes (e.g. axis-aligned half-plane clips at 0.5
-    # of a unit D = 4 simplex; the upstream C `rNd` has the same bug,
-    # producing NaN). Nudging sd_vcur up by `tol_nudge` shifts the new
-    # vertex ε-close-but-distinct from vcur, preserving simplicity. The
-    # volume error is O(eps(T)) — well below floating-point precision
-    # in any realistic moments computation, and only triggered on the
-    # measure-zero case sd_vcur == 0 (random clip planes never hit it,
-    # so existing diff-tests against C remain bit-exact).
+    #
+    # The c4496ab fix nudged sd_vcur for the kept-side case (sd_vcur is
+    # >= 0 by classification, but exactly zero on a boundary vertex).
+    # The mirror case is when a clipped vertex's `sd_vnext` is just
+    # below zero by FP-rounding noise (e.g. -1e-16 because an axis-
+    # aligned clip plane sits at exactly the value of a previously-
+    # interpolated vertex's coordinate). The classification rounds it
+    # to "clipped", but the cut-position formula then produces a new
+    # vertex coincident with vnext.
+    #
+    # We nudge BOTH: sd_vcur up to at least `+tol_nudge`, and sd_vnext
+    # down to at most `-tol_nudge`. The new vertex ends up
+    # ε-close-but-distinct from BOTH vcur and vnext, preserving
+    # simplicity. The volume error is O(eps(T)) and only triggers on
+    # measure-zero events (random clip planes never hit them, so
+    # existing diff-tests against C remain bit-exact).
     tol_nudge = eps(T) * max(abs(smin), abs(smax), one(T)) * 256
     @inbounds for vcur in 1:onv
         clipped[vcur] != 0 && continue
@@ -3936,14 +3943,19 @@ function clip_plane!(poly::FlatPolytope{D,T}, plane::Plane{D,T}) where {D,T}
             poly.nverts >= poly.capacity && return false
             new_v = (poly.nverts += 1)
 
+            # Mirror nudge for sd_vnext: clamp it down to ≤ -tol_nudge
+            # so the new vertex doesn't coincide with vnext when an
+            # earlier clip placed vnext essentially on this clip plane.
+            sd_vnext = sdists[vnext] > -tol_nudge ? -tol_nudge : sdists[vnext]
+
             # Position: weighted average between vcur and vnext.
             # Match the C formula exactly to keep diff-test agreement at
             # floating-point precision: (vnext * sd_vcur - vcur * sd_vnext) / (sd_vcur - sd_vnext)
             for i in 1:D
                 poly.positions[i, new_v] =
                     (poly.positions[i, vnext] * sd_vcur -
-                     poly.positions[i, vcur]  * sdists[vnext]) /
-                    (sd_vcur - sdists[vnext])
+                     poly.positions[i, vcur]  * sd_vnext) /
+                    (sd_vcur - sd_vnext)
             end
 
             # pnbrs[1] = vcur (the kept vertex side); rest sentinel-zero.

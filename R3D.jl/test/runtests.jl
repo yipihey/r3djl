@@ -926,9 +926,7 @@ using LinearAlgebra: I
         end
 
         # Voxelize-fold consistency: per-cell moment sum equals whole
-        # polytope moment to fp precision. Uses n = 2 — at non-power-of-2
-        # grid sizes, voxelize_fold! at D ≥ 4 has a pre-existing
-        # bisection-loop bug (tracked separately, see task list).
+        # polytope moment to fp precision.
         let
             poly = R3D.Flat.simplex((0.0, 0.0, 0.0, 0.0),
                                      (1.0, 0.0, 0.0, 0.0),
@@ -1319,6 +1317,63 @@ using LinearAlgebra: I
                 @test isapprox(R3D.Flat.volume(buf), 1.0 / 2^axis;
                                atol=1e-12, rtol=1e-10)
             end
+        end
+    end
+
+    @testset "D ≥ 4 clip! handles FP-boundary clipped vertex (sd_vnext ≈ 0)" begin
+        # Regression for the symmetric case of the c4496ab boundary-vertex
+        # bug: a previously-interpolated vertex's coordinate may exactly
+        # match a later clip plane, but FP rounding places it 1 ULP on
+        # the clipped side (sd_vnext ≈ -eps). The cut-position formula
+        # then collapses the new vertex onto vnext, breaking the
+        # simple-polytope invariant the LTD recursion assumes.
+        # Manifests at D = 4 when 4 axis-aligned clips at irrational
+        # constants (e.g. 1/3) accumulate FP noise.
+        for c in (1/3, 1/3 + 1e-9, 1/3 - 1e-9, 0.333, 0.4)
+            poly = R3D.Flat.simplex((0.0, 0.0, 0.0, 0.0),
+                                     (1.0, 0.0, 0.0, 0.0),
+                                     (0.0, 1.0, 0.0, 0.0),
+                                     (0.0, 0.0, 1.0, 0.0),
+                                     (0.0, 0.0, 0.0, 1.0))
+            for k in 1:4
+                nrm = ntuple(j -> j == k ? -1.0 : 0.0, Val(4))
+                R3D.Flat.clip!(poly,
+                    R3D.Plane{4,Float64}(R3D.Vec{4,Float64}(nrm), c))
+            end
+            # Closed-form volume of simplex ∩ [0, c]^4 (D = 4):
+            #   vol = sum_{k=0}^{floor(1/c)} (-1)^k C(4,k) (1 - k*c)^4 / 4!
+            expected = sum((-1)^k * binomial(4, k) * max(0, 1 - k * c)^4
+                           for k in 0:4) / 24
+            # Relative tolerance reflects that the ε-nudge fix produces
+            # O(eps(T)*scale) error per cut and 4 cuts compound to ~1e-7.
+            # Pre-fix, the c=1/3 case returned ~0 here.
+            @test isapprox(R3D.Flat.volume(poly), expected; rtol = 1e-7)
+        end
+
+        # Voxelize-fold across small grid sizes — at non-power-of-2
+        # n the bisection produces clip planes at coordinates that
+        # coincide with previously-interpolated vertices, hitting the
+        # symmetric boundary case. Pre-fix, n = 3 gave 5 % of expected
+        # total. Tolerance reflects accumulated ε-nudge error: each
+        # nudge perturbs a cell's volume by O(eps(T)*scale), and the
+        # bisection produces O(n^D) cells, giving total error
+        # ~ n^D * eps. Relative-tolerance budget 1e-3 covers up to
+        # n = 8 with margin to spare.
+        ws = R3D.Flat.VoxelizeWorkspace{4,Float64}(64)
+        for n in 2:8
+            poly = R3D.Flat.simplex((0.0, 0.0, 0.0, 0.0),
+                                     (1.0, 0.0, 0.0, 0.0),
+                                     (0.0, 1.0, 0.0, 0.0),
+                                     (0.0, 0.0, 1.0, 0.0),
+                                     (0.0, 0.0, 0.0, 1.0))
+            d_grid  = ntuple(_ -> 1.0 / n, Val(4))
+            ibox_lo = ntuple(_ -> 0,       Val(4))
+            ibox_hi = ntuple(_ -> n,       Val(4))
+            total = R3D.Flat.voxelize_fold!(0.0, poly, ibox_lo, ibox_hi,
+                                            d_grid, 0; workspace = ws) do acc, idx, m
+                acc + m[1]
+            end
+            @test isapprox(total, 1/24; rtol = 1e-3)
         end
     end
 

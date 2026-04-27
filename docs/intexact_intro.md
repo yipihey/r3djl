@@ -28,11 +28,11 @@ Pick `R3D.Flat` when:
 - Coordinates are inherently real (smoothed-particle-hydro positions,
   Lagrangian advection, anything where the input came from a
   floating-point integration).
-- You need polynomial moments at `D >= 4`. IntExact's
-  `moments_exact` covers `D in {2, 3}` only; `D >= 4` would need a
-  sqrt-free alternative to the Lasserre formula and is research-grade.
-  (Volume at `D = 4` IS available via `volume_exact`, sqrt-free; see
-  Limitations.)
+- You need maximum throughput on D ∈ {2, 3} polynomial moments.
+  IntExact's `D in {2, 3}` Koehl recursion is exact-rational
+  but slower than Flat's float kernel. (Polynomial moments at
+  `D ∈ {4, 5, 6}` are now available via simplex-decomposition,
+  see below — and unlike Flat at `D ≥ 4`, they're exact.)
 - Maximum throughput beats reproducibility. The integer kernel runs
   GCD reductions and multi-word multiplies that float skips.
 
@@ -273,18 +273,25 @@ sum would remain integer (mass conservation).
 
 ## Limitations called out explicitly
 
-- Polynomial moments at `D >= 4` are not supported. The moment
-  recursion uses `R3D.Flat.moments!`'s Koehl form for `D in {2, 3}`;
-  for `D >= 4` the analytic alternatives (Lasserre) introduce
-  `sqrt`, which has no exact-rational evaluation. *Volume* at
-  `D in {4, 5, 6}` IS supported (`volume_exact(::IntFlatPolytope{D, T})`)
-  via sqrt-free fan triangulation. The `D = 4` path uses
-  facet/2-face/edge boundary walks; `D in {5, 6}` use a generic
-  recursive enumeration of the facet-intersection lattice, with the
-  same canonical-vertex pre-pass for boundary degeneracies. Cost
-  scales as `O(M^D)` where `M = poly.nfacets` — fine at unit-test
-  scale, slow for production hot loops at `D = 6` (a future
-  optimization could memoize the facet-intersection lattice).
+- Polynomial moments at `D ∈ {2, 3}` use the divergence-theorem Koehl
+  recursion (a direct exact-rational port of `R3D.Flat.moments!`).
+  Polynomial moments at `D ∈ {4, 5, 6}` use simplex decomposition:
+  fan-triangulate into D-simplices via the same recursive walker that
+  `volume_exact` uses, and on each leaf evaluate the closed-form
+  `∫_S x^α dV = |det(A)| · ∫_{Δ_D} (v_0 + A·t)^α dt` with the
+  multinomial expansion of `(v_0 + A·t)^α` integrated termwise via
+  the Dirichlet identity `∫_{Δ_D} t^β dt = β!/(D + |β|)!`. Sqrt-free,
+  exact-rational throughout — and unlike Flat's Lasserre at `D ≥ 4`
+  (which orthonormalizes via `sqrt` and accumulates significant FP
+  error on clipped polytopes), the IntExact moments are bit-exact by
+  construction.
+- Volume and polynomial moments at `D ∈ {4, 5, 6}` use a generic
+  recursive enumeration of the facet-intersection lattice. Cost
+  scales as `O(M^D)` where `M = poly.nfacets`, plus per-simplex
+  `O((P+1)^D)` for moment evaluation at order P. Fine at unit-test
+  scale, slow for production hot loops at high `D` and `P` (a future
+  optimization could memoize the polynomial-in-`t` representations
+  shared across α values).
 - `D = 4` `clip!` does not ε-nudge boundary vertices (the float
   `R3D.Flat.clip_plane!` does, with `eps(T) * 256`). When two
   sequential axis-aligned cuts intersect exactly at a vertex of the

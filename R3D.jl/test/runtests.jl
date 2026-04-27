@@ -3466,3 +3466,148 @@ end
         @test R3D.IntExact.volume_exact(b) == 32 // 1
     end
 end
+
+@testset "R3D.IntExact polynomial moments at D ∈ {4, 5, 6}" begin
+    @testset "D = 4 closed-form simplex moments" begin
+        # Standard unit D = 4 simplex: ∫_{Δ_D} x^α dV = α! / (D + |α|)!.
+        s = R3D.IntExact.IntFlatPolytope{4,Int64}(64)
+        verts = [[0, 0, 0, 0], [1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]
+        R3D.IntExact.init_simplex!(s, verts)
+
+        # P = 1: vol + 4 first moments = 5 total.
+        m1 = R3D.IntExact.moments_exact(s, 1)
+        @test length(m1) == 5
+        @test m1[1] == 1 // 24                          # vol
+        @test all(m1[2:5] .== 1 // 120)                  # x_j = 1/120
+
+        # P = 2: 15 total. x_j x_k = 1/720 for j ≠ k, x_j^2 = 2/720 = 1/360.
+        m2 = R3D.IntExact.moments_exact(s, 2)
+        @test length(m2) == 15
+        @test m2[1]  == 1 // 24
+        @test m2[6]  == 1 // 360   # (2,0,0,0)
+        @test m2[7]  == 1 // 720   # (1,1,0,0)
+        @test m2[10] == 1 // 360   # (0,2,0,0)
+        @test m2[13] == 1 // 360   # (0,0,2,0)
+        @test m2[15] == 1 // 360   # (0,0,0,2)
+    end
+
+    @testset "D = 4 closed-form box moments" begin
+        # Box [0,1]^4 separable: ∫_box ∏ x_j^α_j = ∏ 1/(α_j + 1).
+        b = R3D.IntExact.IntFlatPolytope{4,Int64}(64)
+        R3D.IntExact.init_box!(b, [0, 0, 0, 0], [1, 1, 1, 1])
+        m = R3D.IntExact.moments_exact(b, 2)
+        @test m[1]  == 1 // 1
+        @test m[2]  == 1 // 2     # x_1
+        @test m[3]  == 1 // 2     # x_2
+        @test m[6]  == 1 // 3     # x_1^2
+        @test m[7]  == 1 // 4     # x_1 x_2
+    end
+
+    @testset "D = 4 m[1] == volume_exact on clipped polytopes" begin
+        # Cross-check the 0th moment against `volume_exact` (independent
+        # algorithm: fan triangulation summed via |det|/D! at the leaves
+        # vs. fan triangulation accumulating polynomial-moment integrals
+        # over each leaf simplex). They MUST agree exactly.
+        # NB: We don't cross-check P ≥ 1 against `R3D.Flat`'s Lasserre at
+        # D ≥ 4 — Lasserre uses orthonormal projection (sqrt) and
+        # accumulates significant FP error on clipped polytopes; it's not
+        # a reliable oracle at this level. The IntExact moments are
+        # exact-rational by construction.
+        Random.seed!(20260427)
+        for _ in 1:10
+            s = R3D.IntExact.IntFlatPolytope{4,Int128}(256)
+            verts = [[Int128(0), 0, 0, 0],
+                     [Int128(10), 0, 0, 0],
+                     [Int128(0), 10, 0, 0],
+                     [Int128(0), 0, 10, 0],
+                     [Int128(0), 0, 0, 10]]
+            R3D.IntExact.init_simplex!(s, verts)
+            n = ntuple(_ -> rand(-3:3), Val(4))
+            d = rand(-7:7)
+            all(==(0), n) && continue
+            R3D.IntExact.clip!(s, R3D.Plane{4,Int128}(Int128.(n), Int128(d)))
+            s.nverts == 0 && continue
+
+            v = R3D.IntExact.volume_exact(s, BigInt)
+            m = R3D.IntExact.moments_exact(s, 2; R = BigInt)
+            @test m[1] == v   # zeroth moment == volume, bit-exact
+        end
+    end
+
+    @testset "D = 4 hand-computed clipped-simplex moments" begin
+        # 2× D = 4 simplex (vertices at origin + 2·e_i for i = 1..4)
+        # clipped by x_1 ≤ 1 → kept volume = 5/8.
+        # Hand-computed first-order moments using `∫ x_j dV =
+        # ∫_full x_j - ∫_{x_1>1} x_j`:
+        #   ∫ x_1 dV = 4/15 - 1/20 = 13/60
+        #   ∫ x_j dV (j ≠ 1) = 4/15 - 1/120 = 31/120 (by symmetry)
+        s = R3D.IntExact.IntFlatPolytope{4,Int64}(128)
+        R3D.IntExact.init_simplex!(s,
+            [[0, 0, 0, 0], [2, 0, 0, 0], [0, 2, 0, 0], [0, 0, 2, 0], [0, 0, 0, 2]])
+        R3D.IntExact.clip!(s, R3D.Plane{4,Int64}((-1, 0, 0, 0), 1))
+        m = R3D.IntExact.moments_exact(s, 1; R = BigInt)
+        @test m[1] == big(5) // big(8)
+        @test m[2] == big(13) // big(60)
+        @test m[3] == big(31) // big(120)
+        @test m[4] == big(31) // big(120)
+        @test m[5] == big(31) // big(120)
+    end
+
+    @testset "D = 5 closed-form simplex / box moments" begin
+        # D = 5 unit simplex P = 1: vol = 1/120, x_j = 1/720.
+        s = R3D.IntExact.IntFlatPolytope{5,Int64}(64)
+        verts = [[0, 0, 0, 0, 0], [1, 0, 0, 0, 0], [0, 1, 0, 0, 0],
+                 [0, 0, 1, 0, 0], [0, 0, 0, 1, 0], [0, 0, 0, 0, 1]]
+        R3D.IntExact.init_simplex!(s, verts)
+        m1 = R3D.IntExact.moments_exact(s, 1)
+        @test length(m1) == 6                  # 1 + 5 first moments
+        @test m1[1] == 1 // 120
+        @test all(m1[2:6] .== 1 // 720)         # 1!/(5+1)! = 1/720
+
+        # D = 5 unit box P = 1.
+        b = R3D.IntExact.IntFlatPolytope{5,Int64}(64)
+        R3D.IntExact.init_box!(b, fill(0, 5), fill(1, 5))
+        mb = R3D.IntExact.moments_exact(b, 1)
+        @test mb[1] == 1 // 1
+        @test all(mb[2:6] .== 1 // 2)
+    end
+
+    @testset "D = 6 closed-form simplex / box moments" begin
+        s = R3D.IntExact.IntFlatPolytope{6,Int64}(128)
+        verts = [[0, 0, 0, 0, 0, 0], [1, 0, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0],
+                 [0, 0, 1, 0, 0, 0], [0, 0, 0, 1, 0, 0], [0, 0, 0, 0, 1, 0], [0, 0, 0, 0, 0, 1]]
+        R3D.IntExact.init_simplex!(s, verts)
+        m1 = R3D.IntExact.moments_exact(s, 1)
+        @test length(m1) == 7
+        @test m1[1] == 1 // 720
+        @test all(m1[2:7] .== 1 // 5040)         # 1!/(6+1)! = 1/5040
+
+        # Box.
+        b = R3D.IntExact.IntFlatPolytope{6,Int64}(128)
+        R3D.IntExact.init_box!(b, fill(0, 6), fill(1, 6))
+        mb = R3D.IntExact.moments_exact(b, 1)
+        @test mb[1] == 1 // 1
+        @test all(mb[2:7] .== 1 // 2)
+    end
+
+    @testset "BigInt accumulator and ordering matches Flat" begin
+        # BigInt promotion path.
+        s = R3D.IntExact.IntFlatPolytope{4,Int64}(64)
+        R3D.IntExact.init_simplex!(s,
+            [[0, 0, 0, 0], [1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
+        m_big = R3D.IntExact.moments_exact(s, 2; R = BigInt)
+        @test eltype(m_big) === Rational{BigInt}
+        @test m_big[1] == big(1) // big(24)
+
+        # Ordering: each entry of moments_exact should match Flat's moments
+        # at the same index (canonical lex-by-degree).
+        s_f = R3D.Flat.FlatPolytope{4,Float64}(64)
+        R3D.Flat.init_simplex!(s_f,
+            [[0.0, 0, 0, 0], [1.0, 0, 0, 0], [0.0, 1, 0, 0],
+             [0.0, 0, 1, 0], [0.0, 0, 0, 1]])
+        m_f = R3D.Flat.moments(s_f, 2)
+        for (vi, vf) in zip(m_big, m_f)
+            @test isapprox(Float64(vi), vf; atol = 1e-12)
+        end
+    end
+end

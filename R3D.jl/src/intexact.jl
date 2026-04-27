@@ -757,11 +757,11 @@ function moments_exact!(out::AbstractVector{Rational{R}},
         return _moments_exact_d2!(out, poly, Int(P), R)
     elseif D == 3
         return _moments_exact_d3!(out, poly, Int(P), R)
+    elseif D == 4 || D == 5 || D == 6
+        return _moments_exact_dgeneric_4plus!(out, poly, Int(P), R)
     else
-        error("moments_exact!: D = $D not supported in IntExact (D ∈ {2, 3} only). ",
-              "Phase 6 of d4plus_finalization_plan.md will add D ≥ 4 volume; ",
-              "polynomial moments at D ≥ 4 are research-grade (sqrt-free " *
-              "alternatives to Lasserre).")
+        error("moments_exact!: D = $D not supported in IntExact ",
+              "(D ∈ {2, 3, 4, 5, 6} only).")
     end
 end
 
@@ -2440,6 +2440,280 @@ function volume_exact(poly::IntFlatPolytope{D,T},
                                             sub, R)
     end
     return sum_rat
+end
+
+# ---------------------------------------------------------------------------
+# Polynomial moments at D ∈ {4, 5, 6} via simplex decomposition
+# ---------------------------------------------------------------------------
+#
+# The exact-rational alternative to `R3D.Flat`'s Lasserre formula (which
+# orthonormalizes via `sqrt` and so isn't compatible with exact integer
+# arithmetic). For each D-simplex `S = (v_0, v_1, ..., v_D)` enumerated
+# by the same fan triangulation that `volume_exact` uses, the moment
+#
+#     ∫_S x^α dV = |det(A)| · ∫_{Δ_D} (v_0 + A · t)^α dt
+#
+# where `A = [v_1 - v_0 | ... | v_D - v_0]` (D × D), `Δ_D` is the
+# standard simplex in `R^D`, and `(v_0 + A · t)^α` is expanded
+# multinomially into a polynomial in `t = (t_1, ..., t_D)`. Each
+# monomial `t^β` integrates exactly:
+#
+#     ∫_{Δ_D} t^β dt = (∏_k β_k!) / (D + |β|)!
+#
+# So the per-simplex moment is a finite sum of rationals — fully
+# exact, sqrt-free.
+#
+# Computational cost: O((P+1)^D) per (α, simplex). Manageable for
+# `P ≤ 3` and `D ≤ 6`. Higher orders or higher D get expensive; a
+# Phase-9 follow-up could memoize the polynomial-in-t representations
+# across α values that share a leading factor.
+
+# Enumerate every multi-index α = (α_1, ..., α_D) with |α| ≤ P, in
+# the canonical lex-by-degree order matching `R3D.Flat.moments`.
+function _enumerate_moments_dgeneric(D::Int, P::Int)
+    out = NTuple{D,Int}[]
+    buf = zeros(Int, D)
+    function recurse(axis::Int, remaining::Int)
+        if axis == D
+            buf[D] = remaining
+            push!(out, ntuple(k -> buf[k], D))
+            return
+        end
+        for v in remaining:-1:0
+            buf[axis] = v
+            recurse(axis + 1, remaining - v)
+        end
+    end
+    for total in 0:P
+        recurse(1, total)
+    end
+    return out
+end
+
+# `n!` as `R` (with promotion). For our use case (n ≤ D + P with
+# D ≤ 6 and P typically ≤ 3), n! ≤ 9! = 362,880, fits in any `Signed`
+# wider than Int8.
+@inline function _fact_R(n::Int, ::Type{R}) where {R<:Signed}
+    f = one(R)
+    @inbounds for k in 2:n
+        f *= R(k)
+    end
+    return f
+end
+
+# Compute `∫_S x^α dV` where `S` is the D-simplex with vertices
+# `vertex_indices = [v_0, v_1, ..., v_D]` (canonical IDs). Returns a
+# `Rational{R}`.
+function _simplex_moment_alpha(poly::IntFlatPolytope{D,T},
+                                vertex_indices::Vector{Int},
+                                α::NTuple{D,Int},
+                                ::Type{R}) where {D,T,R<:Signed}
+    @assert length(vertex_indices) == D + 1
+
+    # Apex `v_0` rational coordinates and per-axis edge denominators.
+    v0_idx = vertex_indices[1]
+    d0 = R(poly.positions_den[v0_idx])
+    v0 = ntuple(j -> R(poly.positions_num[j, v0_idx]) // d0, D)
+
+    # `A[j, k]` = coordinate `j` of edge from `v_0` to `v_k`.
+    A = Matrix{Rational{R}}(undef, D, D)
+    @inbounds for k in 1:D
+        vk = vertex_indices[k + 1]
+        dk = R(poly.positions_den[vk])
+        for j in 1:D
+            A[j, k] = R(poly.positions_num[j, vk]) // dk - v0[j]
+        end
+    end
+
+    # |det(A)| via Laplace recursion on the rational matrix.
+    det_A = abs(_det_rat_recursive(A, D, R))
+    det_A == zero(Rational{R}) && return zero(Rational{R})
+
+    P = sum(α)
+    # Polynomial in `t` (D variables, each up to degree P). Dense
+    # `(P+1)^D` array indexed by 1-based index = (β_1 + 1, ..., β_D + 1).
+    dims = ntuple(_ -> P + 1, D)
+    poly_buf = zeros(Rational{R}, dims)
+    poly_new = zeros(Rational{R}, dims)
+    @inbounds poly_buf[ntuple(_ -> 1, D)...] = one(Rational{R})
+
+    # Multiply by `x_j^{α_j}` for each j. For each multiplication
+    # by `x_j = v_0[j] + Σ_k A[j, k] · t_k`, distribute over the
+    # current `poly_buf` and accumulate into `poly_new`; then swap.
+    @inbounds for j in 1:D
+        αj = α[j]
+        αj == 0 && continue
+        v0j = v0[j]
+        Aj = ntuple(k -> A[j, k], D)
+        for _ in 1:αj
+            fill!(poly_new, zero(Rational{R}))
+            for I in CartesianIndices(poly_buf)
+                c = poly_buf[I]
+                c == zero(Rational{R}) && continue
+                # constant term `v_0[j]` keeps the index.
+                poly_new[I] += c * v0j
+                # `A[j, k] · t_k` shifts axis `k` by one.
+                for k in 1:D
+                    new_k = I.I[k] + 1
+                    new_k > P + 1 && continue
+                    Inew = CartesianIndex(ntuple(kk -> kk == k ? new_k : I.I[kk], D))
+                    poly_new[Inew] += c * Aj[k]
+                end
+            end
+            poly_buf, poly_new = poly_new, poly_buf
+        end
+    end
+
+    # Integrate each `t^β` over `Δ_D`: contributes `(∏ β_k!) / (D + |β|)!`.
+    moment = zero(Rational{R})
+    @inbounds for I in CartesianIndices(poly_buf)
+        c = poly_buf[I]
+        c == zero(Rational{R}) && continue
+        β = ntuple(k -> I.I[k] - 1, D)
+        sumβ = 0
+        prod_fact = one(R)
+        for b in β
+            sumβ += b
+            prod_fact *= _fact_R(b, R)
+        end
+        denom = _fact_R(D + sumβ, R)
+        moment += c * (prod_fact // denom)
+    end
+
+    return det_A * moment
+end
+
+# Recursive Laplace expansion of an `n × n` rational matrix.
+function _det_rat_recursive(M::AbstractMatrix{Rational{R}}, n::Int,
+                             ::Type{R}) where {R<:Signed}
+    n == 1 && return M[1, 1]
+    n == 2 && return M[1, 1] * M[2, 2] - M[1, 2] * M[2, 1]
+    s = zero(Rational{R})
+    sign = 1
+    sub = Matrix{Rational{R}}(undef, n - 1, n - 1)
+    @inbounds for col in 1:n
+        for i in 2:n
+            jj = 0
+            for j in 1:n
+                j == col && continue
+                jj += 1
+                sub[i - 1, jj] = M[i, j]
+            end
+        end
+        contribution = M[1, col] * _det_rat_recursive(sub, n - 1, R)
+        s += sign * contribution
+        sign = -sign
+    end
+    return s
+end
+
+# Recursive fan-triangulation that accumulates per-simplex moment
+# contributions instead of per-simplex volume. Mirrors
+# `_vol_recursive_dgeneric` exactly except for the leaf operation.
+function _moments_recursive_dgeneric(poly::IntFlatPolytope{D,T},
+                                      canon::Vector{Int32},
+                                      vof::BitMatrix,
+                                      facet_path::Vector{Int},
+                                      apex_stack::Vector{Int},
+                                      vertex_set::BitVector,
+                                      out::AbstractVector{Rational{R}},
+                                      alphas::Vector{NTuple{D,Int}}) where {D,T,R<:Signed}
+    cell_dim = D - length(facet_path)
+
+    if cell_dim == 1
+        endpoints = Int[]
+        @inbounds for c in 1:length(vertex_set)
+            vertex_set[c] && push!(endpoints, c)
+        end
+        length(endpoints) == 2 || return
+        a, b = endpoints[1], endpoints[2]
+        verts = vcat(apex_stack, [a, b])
+        @inbounds for (idx, α) in enumerate(alphas)
+            out[idx] += _simplex_moment_alpha(poly, verts, α, R)
+        end
+        return
+    end
+
+    if cell_dim == 2
+        cycle = Int[]
+        ok = _walk_polygon_dgeneric!(cycle, poly, vertex_set, canon)
+        ok || return
+        z_0 = cycle[1]
+        @inbounds for i in 2:(length(cycle) - 1)
+            verts = vcat(apex_stack, [z_0, cycle[i], cycle[i + 1]])
+            for (idx, α) in enumerate(alphas)
+                out[idx] += _simplex_moment_alpha(poly, verts, α, R)
+            end
+        end
+        return
+    end
+
+    # cell_dim ≥ 3: pick `w_0` and recurse over each parent facet that
+    # adds a sub-cell.
+    w_0 = 0
+    @inbounds for c in 1:length(vertex_set)
+        if vertex_set[c]
+            w_0 = c; break
+        end
+    end
+    w_0 == 0 && return
+
+    nf = poly.nfacets
+    sub_vertex_set = falses(length(vertex_set))
+    @inbounds for fid in 1:nf
+        in_path = false
+        for f in facet_path
+            if f == fid; in_path = true; break; end
+        end
+        in_path && continue
+        vof[w_0, fid] && continue
+        any_in = false
+        for c in 1:length(vertex_set)
+            in_sub = vertex_set[c] && vof[c, fid]
+            sub_vertex_set[c] = in_sub
+            in_sub && (any_in = true)
+        end
+        any_in || continue
+        sub_path = vcat(facet_path, fid)
+        sub_apex = vcat(apex_stack, w_0)
+        _moments_recursive_dgeneric(poly, canon, vof, sub_path, sub_apex,
+                                     sub_vertex_set, out, alphas)
+    end
+    return
+end
+
+# Top-level entry for `moments_exact!` at D ∈ {4, 5, 6}.
+function _moments_exact_dgeneric_4plus!(out::AbstractVector{Rational{R}},
+                                         poly::IntFlatPolytope{D,T},
+                                         P::Int,
+                                         ::Type{R}) where {D,T,R<:Signed}
+    nv = poly.nverts
+    nv == 0 && return out
+
+    canon = _build_canonical_dgeneric(poly)
+    apex = Int(canon[1])
+    vof = _vertex_on_facet_table(poly, canon)
+    alphas = _enumerate_moments_dgeneric(D, P)
+
+    vertex_set = falses(nv)
+    @inbounds for v in 1:nv
+        vertex_set[Int(canon[v])] = true
+    end
+
+    @inbounds for fid in 1:poly.nfacets
+        vof[apex, fid] && continue
+        sub = falses(nv)
+        any_in = false
+        for c in 1:nv
+            in_sub = vertex_set[c] && vof[c, fid]
+            sub[c] = in_sub
+            in_sub && (any_in = true)
+        end
+        any_in || continue
+        _moments_recursive_dgeneric(poly, canon, vof, [fid], [apex],
+                                     sub, out, alphas)
+    end
+    return out
 end
 
 end # module IntExact

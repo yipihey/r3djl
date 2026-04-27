@@ -215,6 +215,13 @@ Allocate the workspace once and reuse it across many calls — the
 inner bisection loop is heap-free apart from the per-call exact-
 rational moment scratch.
 
+`voxelize_fold!` works at `D ∈ {2, 3, 4, 5, 6}`. The `D ≥ 4` path
+inherits the canonical-vertex pre-pass from `volume_exact` /
+`moments_exact!`, so axis-aligned grid cuts that hit polytope
+vertices exactly (which is the common case for integer-coordinate
+voxelization) give the correct moment per cell — no special-casing
+needed at the call site.
+
 ## End-to-end remap-style example
 
 This is the use case IntExact was built for: source mesh against

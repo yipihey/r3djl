@@ -3611,3 +3611,128 @@ end
         end
     end
 end
+
+@testset "R3D.IntExact voxelize_fold! at D ∈ {4, 5, 6}" begin
+    @testset "D = 4 box voxelization is exact + mass-conserving" begin
+        # [0, 2]^4 box voxelized over a 2 × 2 × 2 × 2 grid:
+        # 16 cells, each volume 1 // 1, total 16.
+        b = R3D.IntExact.IntFlatPolytope{4,Int64}(256)
+        R3D.IntExact.init_box!(b, [0, 0, 0, 0], [2, 2, 2, 2])
+        n = 2
+        d = ntuple(_ -> 1, Val(4))
+        ibox_lo = ntuple(_ -> 0, Val(4))
+        ibox_hi = ntuple(_ -> n, Val(4))
+
+        cells = Tuple{NTuple{4,Int}, Rational{Int}}[]
+        R3D.IntExact.voxelize_fold!(cells, b, ibox_lo, ibox_hi, d, 0) do acc, idx, m
+            push!(acc, (idx, m[1]))
+            acc
+        end
+        @test length(cells) == n^4   # = 16
+        @test sum(c[2] for c in cells) == 16 // 1
+        @test all(c[2] == 1 // 1 for c in cells)
+    end
+
+    @testset "D = 4 simplex voxelization mass-conserving + symmetric" begin
+        # [0, 2]^4 simplex voxelized over a 2^4 grid: total = 2^4 / 24 = 2//3.
+        # Cells along the four axes (one per axis) should be equal by
+        # coordinate-swap symmetry of the standard simplex.
+        s = R3D.IntExact.IntFlatPolytope{4,Int64}(512)
+        R3D.IntExact.init_simplex!(s,
+            [[0, 0, 0, 0], [2, 0, 0, 0], [0, 2, 0, 0], [0, 0, 2, 0], [0, 0, 0, 2]])
+        d = ntuple(_ -> 1, Val(4))
+        ibox_lo = ntuple(_ -> 0, Val(4))
+        ibox_hi = ntuple(_ -> 2, Val(4))
+
+        cells = Dict{NTuple{4,Int}, Rational{Int}}()
+        R3D.IntExact.voxelize_fold!(cells, s, ibox_lo, ibox_hi, d, 0) do acc, idx, m
+            acc[idx] = m[1]
+            acc
+        end
+        # Mass conservation.
+        @test sum(values(cells)) == 2 // 3
+
+        # Symmetry: cells along each axis (e.g., (2,1,1,1) vs (1,2,1,1))
+        # should have the same volume — these are the four "off-origin"
+        # cells in the standard simplex grid.
+        v_ax1 = get(cells, (2, 1, 1, 1), 0 // 1)
+        v_ax2 = get(cells, (1, 2, 1, 1), 0 // 1)
+        v_ax3 = get(cells, (1, 1, 2, 1), 0 // 1)
+        v_ax4 = get(cells, (1, 1, 1, 2), 0 // 1)
+        @test v_ax1 == v_ax2 == v_ax3 == v_ax4
+    end
+
+    @testset "D = 4 voxelization with P = 1 moments" begin
+        # Same simplex, but with first-order moments. Aggregate moments
+        # over the grid should equal the polytope's moments.
+        s = R3D.IntExact.IntFlatPolytope{4,Int64}(512)
+        R3D.IntExact.init_simplex!(s,
+            [[0, 0, 0, 0], [2, 0, 0, 0], [0, 2, 0, 0], [0, 0, 2, 0], [0, 0, 0, 2]])
+        full = R3D.IntExact.moments_exact(s, 1; R = BigInt)
+
+        d = ntuple(_ -> 1, Val(4))
+        ibox_lo = ntuple(_ -> 0, Val(4))
+        ibox_hi = ntuple(_ -> 2, Val(4))
+        nm = R3D.num_moments(4, 1)
+        accum = R3D.IntExact.voxelize_fold!(zeros(Rational{BigInt}, nm), s,
+                                             ibox_lo, ibox_hi, d, 1;
+                                             R = BigInt) do acc, idx, m
+            acc .+ m
+        end
+        @test accum == full
+    end
+
+    @testset "D = 5 box and simplex voxelization mass-conserving" begin
+        # [0, 2]^5 box, n=2 grid → 32 cells of vol 1 each.
+        b = R3D.IntExact.IntFlatPolytope{5,Int64}(256)
+        R3D.IntExact.init_box!(b, fill(0, 5), fill(2, 5))
+        d = ntuple(_ -> 1, Val(5))
+        ibox_lo = ntuple(_ -> 0, Val(5))
+        ibox_hi = ntuple(_ -> 2, Val(5))
+        total = R3D.IntExact.voxelize_fold!(0 // 1, b, ibox_lo, ibox_hi, d, 0) do acc, idx, m
+            acc + m[1]
+        end
+        @test total == 32 // 1
+
+        # Simplex
+        s = R3D.IntExact.IntFlatPolytope{5,Int64}(512)
+        R3D.IntExact.init_simplex!(s,
+            [[0, 0, 0, 0, 0], [2, 0, 0, 0, 0], [0, 2, 0, 0, 0],
+             [0, 0, 2, 0, 0], [0, 0, 0, 2, 0], [0, 0, 0, 0, 2]])
+        total_s = R3D.IntExact.voxelize_fold!(0 // 1, s, ibox_lo, ibox_hi, d, 0) do acc, idx, m
+            acc + m[1]
+        end
+        @test total_s == 2^5 // 120   # = 32//120 = 4//15
+    end
+
+    @testset "D = 6 box voxelization mass-conserving" begin
+        b = R3D.IntExact.IntFlatPolytope{6,Int64}(512)
+        R3D.IntExact.init_box!(b, fill(0, 6), fill(2, 6))
+        d = ntuple(_ -> 1, Val(6))
+        ibox_lo = ntuple(_ -> 0, Val(6))
+        ibox_hi = ntuple(_ -> 2, Val(6))
+        total = R3D.IntExact.voxelize_fold!(0 // 1, b, ibox_lo, ibox_hi, d, 0) do acc, idx, m
+            acc + m[1]
+        end
+        @test total == 64 // 1
+    end
+
+    @testset "Workspace reuse across calls" begin
+        # Allocate workspace once, pass it to multiple voxelize_fold! calls.
+        # Each call should give the same result as a fresh-workspace call.
+        ws = R3D.IntExact.IntVoxelizeWorkspace{4,Int64}(256; max_depth = 32)
+        d = ntuple(_ -> 1, Val(4))
+        ibox_lo = ntuple(_ -> 0, Val(4))
+        ibox_hi = ntuple(_ -> 2, Val(4))
+
+        for _ in 1:3
+            b = R3D.IntExact.IntFlatPolytope{4,Int64}(256)
+            R3D.IntExact.init_box!(b, [0, 0, 0, 0], [2, 2, 2, 2])
+            total = R3D.IntExact.voxelize_fold!(0 // 1, b, ibox_lo, ibox_hi, d, 0;
+                                                 workspace = ws) do acc, idx, m
+                acc + m[1]
+            end
+            @test total == 16 // 1
+        end
+    end
+end

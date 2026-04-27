@@ -989,7 +989,7 @@ end
 """
     IntVoxelizeWorkspace{D, T}
 
-Reusable scratch storage for [`voxelize_fold!`](@ref) at D ∈ {2, 3}.
+Reusable scratch storage for [`voxelize_fold!`](@ref) at D ∈ {2, 3, 4, 5, 6}.
 Holds a stack of `IntFlatPolytope{D, T}` buffers (one per recursion
 depth) plus the `(ibox_lo, ibox_hi)` index ranges for each. Allocate
 once, reuse across many `voxelize_fold!` calls — the bisection-loop
@@ -1004,7 +1004,7 @@ end
 
 function IntVoxelizeWorkspace{D, T}(capacity::Integer = 64;
                                      max_depth::Integer = 64) where {D, T<:Signed}
-    @assert D == 2 || D == 3 "IntVoxelizeWorkspace: D ∈ {2, 3} supported"
+    @assert D >= 2 "IntVoxelizeWorkspace: D ≥ 2 required"
     polys = [IntFlatPolytope{D, T}(Int(capacity)) for _ in 1:Int(max_depth)]
     iboxes = Vector{Tuple{NTuple{D, Int}, NTuple{D, Int}}}(undef, Int(max_depth))
     IntVoxelizeWorkspace{D, T}(polys, iboxes, Int(capacity))
@@ -1020,9 +1020,10 @@ end
     return ws
 end
 
-# Copy positions_num + positions_den + pnbrs + nverts. Used by the
-# voxelize bisection loop's two-clips-per-split pattern (parallel to
-# `R3D.Flat._copy_polytope!`).
+# Copy positions_num + positions_den + pnbrs + nverts (and at D ≥ 4,
+# also facets / finds / nfaces / nfacets — the clip kernel at D ≥ 4
+# reads/writes all of these). Used by the voxelize bisection loop's
+# two-clips-per-split pattern (parallel to `R3D.Flat._copy_polytope!`).
 @inline function _copy_polytope_intexact!(dst::IntFlatPolytope{D, T},
                                            src::IntFlatPolytope{D, T}) where {D, T}
     n = src.nverts
@@ -1035,6 +1036,18 @@ end
         dst.positions_den[v] = src.positions_den[v]
     end
     dst.nverts = n
+    if D >= 4
+        @inbounds for v in 1:n
+            for k in 1:D
+                dst.facets[k, v] = src.facets[k, v]
+            end
+            for i in 1:D, j in 1:D
+                dst.finds[i, j, v] = src.finds[i, j, v]
+            end
+        end
+        dst.nfaces = src.nfaces
+        dst.nfacets = src.nfacets
+    end
     return dst
 end
 
@@ -1065,7 +1078,10 @@ polytope coordinates first.
 
 Returns the final `state`.
 
-D ∈ {2, 3} only at this writing; D ≥ 4 lands in Phase 6.
+D ∈ {2, 3, 4, 5, 6} supported. The D ≥ 4 path uses the same
+canonical-vertex pre-pass as `volume_exact` / `moments_exact!` to
+handle the boundary-vertex degeneracies that axis-aligned grid cuts
+inevitably produce on integer-coord polytopes.
 """
 function voxelize_fold!(callback::F,
                         state,
@@ -1074,7 +1090,7 @@ function voxelize_fold!(callback::F,
                         d::NTuple{D, T}, P::Integer;
                         workspace::Union{Nothing, IntVoxelizeWorkspace{D, T}} = nothing,
                         R::Type{<:Signed} = T) where {F, D, T}
-    @assert D == 2 || D == 3 "voxelize_fold! IntExact: D ∈ {2, 3} only"
+    @assert 2 <= D <= 6 "voxelize_fold! IntExact: D ∈ {2, 3, 4, 5, 6} supported"
     sizes = ntuple(k -> ibox_hi[k] - ibox_lo[k], Val(D))
     (poly.nverts <= 0 || any(s -> s <= 0, sizes)) && return state
 

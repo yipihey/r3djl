@@ -73,17 +73,39 @@ mutable struct IntFlatPolytope{D,T<:Signed}
     # Per-clip scratch (signed-distance numerators; den is positions_den[v]).
     sd_num::Vector{T}           # capacity
     clipped::Vector{Int32}      # capacity
+
+    # 2-face connectivity for D ≥ 4 (rNd port). Empty for D ≤ 3.
+    # `finds[a, b, v]` = `finds[b, a, v]` = the index of the 2-face
+    # containing v's edges to neighbours a and b. Sentinel `0` = unset.
+    # Used by the D ≥ 4 clip linker (Step 4) and by `volume_exact`'s
+    # fan-triangulation to enumerate 2-faces incident to each facet.
+    finds::Array{Int32, 3}
+    nfaces::Int
+
+    # (D−1)-face ("facet") IDs for D ≥ 4. Empty for D ≤ 3. Same
+    # semantics as `R3D.Flat.FlatPolytope.facets`: `facets[k, v]` is
+    # the facet OPPOSITE edge-slot k of vertex v. Used by
+    # `volume_exact` D ≥ 4 to enumerate facets and their incident
+    # vertex sets for the fan triangulation.
+    facets::Matrix{Int32}
+    nfacets::Int
 end
 
 function IntFlatPolytope{D,T}(capacity::Integer = 64) where {D,T<:Signed}
-    @assert D == 2 || D == 3 "IntFlatPolytope: D ∈ {2, 3} supported; D ≥ 4 is Phase 6"
+    @assert D >= 2 "IntFlatPolytope: D ≥ 2 required"
     capacity = Int(capacity)
+    finds  = D >= 4 ? zeros(Int32, D, D, capacity) :
+                      Array{Int32, 3}(undef, 0, 0, 0)
+    facets = D >= 4 ? zeros(Int32, D, capacity) :
+                      Matrix{Int32}(undef, 0, 0)
     IntFlatPolytope{D,T}(zeros(T, D, capacity),
                          ones(T, capacity),
                          zeros(Int32, D, capacity),
                          0, capacity,
                          Vector{T}(undef, capacity),
-                         Vector{Int32}(undef, capacity))
+                         Vector{Int32}(undef, capacity),
+                         finds, 0,
+                         facets, 0)
 end
 
 # ---------------------------------------------------------------------------
@@ -1337,6 +1359,642 @@ function simplex(v1::NTuple{3, T}, v2::NTuple{3, T}, v3::NTuple{3, T},
     poly = IntFlatPolytope{3, T}(Int(capacity))
     init_tet!(poly, ([v1...], [v2...], [v3...], [v4...]))
     return poly
+end
+
+# ===========================================================================
+# D ≥ 4 — exact-rational kernel mirroring `R3D.Flat`'s D ≥ 4 path.
+# Vertex storage stays shared-denom integer; the new fields `finds[a, b, v]`
+# (2-face IDs) and `facets[k, v]` (codim-1 IDs) carry the same meaning as
+# in `FlatPolytope`. The clip kernel ports `R3D.Flat.clip_plane!`'s D ≥ 4
+# 5-step algorithm verbatim, swapping the cut-position formula for the
+# integer shared-denominator one. `volume_exact` at D = 4 fan-triangulates
+# the polytope into 4-simplices through the existing facet/2-face/edge
+# walk and sums signed `det(M) / 4!` per simplex — fully sqrt-free.
+# ===========================================================================
+
+"""
+    init_box!(poly::IntFlatPolytope{D,T}, lo, hi) -> poly  (D ≥ 4)
+
+Initialize as the axis-aligned integer box with corners `lo` and `hi`.
+Vertex labelling, `pnbrs`, `finds`, and `facets` tables match
+`R3D.Flat.init_box!` D ≥ 4.
+"""
+function init_box!(poly::IntFlatPolytope{D,T},
+                   lo::AbstractVector, hi::AbstractVector) where {D,T}
+    @assert D >= 4 "use the D=2 / D=3 init_box! methods for those dimensions"
+    nv = 1 << D
+    @assert poly.capacity >= nv "init_box! D=$D needs capacity ≥ $nv, got $(poly.capacity)"
+    @assert length(lo) == D && length(hi) == D
+    poly.nverts = nv
+    @inbounds for v in 0:(nv - 1)
+        for i in 1:D
+            stride = 1 << (i - 1)
+            poly.positions_num[i, v + 1] = T((v & stride) != 0 ? hi[i] : lo[i])
+            poly.pnbrs[i, v + 1] = Int32((v ⊻ stride) + 1)
+        end
+        poly.positions_den[v + 1] = one(T)
+    end
+
+    # 2-face connectivity: one 2-face per axis pair (np, np1) with np < np1.
+    f = 0
+    @inbounds for np in 1:D, np1 in (np + 1):D
+        f += 1
+        for v in 1:nv
+            poly.finds[np,  np1, v] = Int32(f)
+            poly.finds[np1, np,  v] = Int32(f)
+        end
+    end
+    poly.nfaces = f
+
+    # 2D facets per axis-side, IDed by axis convention.
+    @inbounds for v in 0:(nv - 1), k in 1:D
+        stride = 1 << (k - 1)
+        on_hi = (v & stride) != 0
+        poly.facets[k, v + 1] = Int32(on_hi ? 2k : 2k - 1)
+    end
+    poly.nfacets = 2D
+    return poly
+end
+
+"""
+    init_simplex!(poly::IntFlatPolytope{D,T}, vertices) -> poly  (D ≥ 4)
+
+D-simplex constructor for `D ≥ 4`. Takes a length-`(D+1)` collection of
+integer vertex positions. Mirrors `R3D.Flat.init_simplex!` D ≥ 4: vertex
+v's neighbours are `(v + i) mod (D + 1)` for `i ∈ 1:D` in cyclic order;
+2-face IDs from `C(D+1, 3)` triples; facet IDs `pnbrs[k, v]` (facet
+opposite v's slot k = facet opposite the OTHER endpoint of that edge).
+"""
+function init_simplex!(poly::IntFlatPolytope{D,T}, vertices) where {D,T}
+    @assert D >= 4 "use the D=2 / D=3 init_simplex! methods for those dimensions"
+    nv = D + 1
+    @assert length(vertices) == nv "D=$D simplex needs $(D+1) vertices, got $(length(vertices))"
+    @assert poly.capacity >= nv
+    poly.nverts = nv
+    @inbounds for v in 1:nv
+        p = vertices[v]
+        for i in 1:D
+            poly.positions_num[i, v] = T(p[i])
+            poly.pnbrs[i, v] = Int32(((v - 1 + i) % nv) + 1)
+        end
+        poly.positions_den[v] = one(T)
+    end
+
+    f = 0
+    @inbounds for v0 in 1:nv, v1 in (v0+1):nv, v2 in (v1+1):nv
+        f += 1
+        np1_at_v0 = _find_pnbr_slot(poly, v0, v1, D)
+        np2_at_v0 = _find_pnbr_slot(poly, v0, v2, D)
+        poly.finds[np1_at_v0, np2_at_v0, v0] = Int32(f)
+        poly.finds[np2_at_v0, np1_at_v0, v0] = Int32(f)
+        np0_at_v1 = _find_pnbr_slot(poly, v1, v0, D)
+        np2_at_v1 = _find_pnbr_slot(poly, v1, v2, D)
+        poly.finds[np0_at_v1, np2_at_v1, v1] = Int32(f)
+        poly.finds[np2_at_v1, np0_at_v1, v1] = Int32(f)
+        np0_at_v2 = _find_pnbr_slot(poly, v2, v0, D)
+        np1_at_v2 = _find_pnbr_slot(poly, v2, v1, D)
+        poly.finds[np0_at_v2, np1_at_v2, v2] = Int32(f)
+        poly.finds[np1_at_v2, np0_at_v2, v2] = Int32(f)
+    end
+    poly.nfaces = f
+
+    @inbounds for v in 1:nv, k in 1:D
+        poly.facets[k, v] = poly.pnbrs[k, v]
+    end
+    poly.nfacets = nv
+    return poly
+end
+
+@inline function _find_pnbr_slot(poly::IntFlatPolytope, v::Int, target::Int, D::Int)
+    @inbounds for k in 1:D
+        Int(poly.pnbrs[k, v]) == target && return k
+    end
+    error("_find_pnbr_slot: vertex $target not a neighbour of $v")
+end
+
+@inline function _find_pnbr_slot_or0_int(poly::IntFlatPolytope, v::Int, target::Int, D::Int)
+    @inbounds for k in 1:D
+        Int(poly.pnbrs[k, v]) == target && return k
+    end
+    return 0
+end
+
+@inline function _find_face_in_row0_int(poly::IntFlatPolytope, vcur::Int, target::Int, D::Int)
+    @inbounds for k in 2:D
+        Int(poly.finds[1, k, vcur]) == target && return k
+    end
+    error("_find_face_in_row0_int: face $target not in row 0 of vertex $vcur")
+end
+
+@inline function _find_face_in_finds_row_int(poly::IntFlatPolytope, vcur::Int, pprev::Int,
+                                              target::Int, D::Int)
+    @inbounds for k in 1:D
+        k == pprev && continue
+        Int(poly.finds[pprev, k, vcur]) == target && return k
+    end
+    error("_find_face_in_finds_row_int: face $target not in row $pprev of vertex $vcur")
+end
+
+@inline function _find_face_in_finds_col_int(poly::IntFlatPolytope, vcur::Int, pprev::Int,
+                                              target::Int, D::Int)
+    @inbounds for k in 1:D
+        k == pprev && continue
+        Int(poly.finds[k, pprev, vcur]) == target && return k
+    end
+    error("_find_face_in_finds_col_int: face $target not in col $pprev of vertex $vcur")
+end
+
+"""
+    clip!(poly::IntFlatPolytope{D,T}, planes) -> Bool  (D ≥ 4)
+
+Clip in-place against an iterable of integer-coefficient `Plane{D,T}`s.
+Returns `false` on capacity exhaust, `true` otherwise. Same five-step
+structure as `R3D.Flat.clip!` D ≥ 4 (signed-distance numerators →
+trivial accept/reject → vertex insertion via shared-denom integer
+linear combination → 2-face boundary walk linker → compaction).
+"""
+function clip!(poly::IntFlatPolytope{D,T},
+               planes::AbstractVector{Plane{D,T}}) where {D,T}
+    @assert D >= 4 "this method is for D ≥ 4 only; D = 2 / D = 3 have specialized methods"
+    poly.nverts <= 0 && return false
+    @inbounds for plane in planes
+        ok = clip_plane!(poly, plane)
+        ok || return false
+        poly.nverts == 0 && return true
+    end
+    return true
+end
+
+function clip!(poly::IntFlatPolytope{D,T}, plane::Plane{D,T}) where {D,T}
+    @assert D >= 4 "this method is for D ≥ 4 only; D = 2 / D = 3 have specialized methods"
+    poly.nverts <= 0 && return false
+    return clip_plane!(poly, plane)
+end
+
+"""
+    clip_plane!(poly::IntFlatPolytope{D,T}, plane::Plane{D,T}) -> Bool  (D ≥ 4)
+
+Apply a single half-space clip to a `D ≥ 4` integer polytope. Direct
+exact-rational port of `R3D.Flat.clip_plane!` D ≥ 4: same Step-1
+signed-distance pass, Step-2 trivial accept/reject, Step-3 cut-vertex
+insertion (using the shared-denom integer cut formula), Step-4 2-face
+boundary walk to close new 2-faces, Step-5 compaction. The plane
+convention matches Flat: keeps `{x : n · x + d ≥ 0}`. Coordinates of
+`n` and `d` must be integers of type `T`.
+"""
+function clip_plane!(poly::IntFlatPolytope{D,T}, plane::Plane{D,T}) where {D,T}
+    @assert D >= 4 "this method is for D ≥ 4 only; D = 2 / D = 3 have specialized methods"
+    sd_num  = poly.sd_num
+    clipped = poly.clipped
+    onv     = poly.nverts
+
+    # --- Step 1: signed-distance numerators (denom = positions_den[v] > 0).
+    any_inside = false; any_outside = false
+    @inbounds for v in 1:onv
+        s = plane.d * poly.positions_den[v]
+        for i in 1:D
+            s += poly.positions_num[i, v] * plane.n[i]
+        end
+        sd_num[v] = s
+        if s >= zero(T)
+            any_inside = true
+            clipped[v] = Int32(0)
+        else
+            any_outside = true
+            clipped[v] = Int32(1)
+        end
+    end
+
+    # --- Step 2: trivial accept/reject.
+    any_outside || return true
+    if !any_inside
+        poly.nverts = 0
+        return true
+    end
+
+    # --- Step 3: insert new vertices on each cut edge. Same connectivity
+    # bookkeeping as Flat's D ≥ 4 step 3 — partial finds row/column from
+    # vcur, partial facet propagation, slot 1 reserved for the new cut
+    # facet.
+    new_facet_id = Int32(poly.nfacets + 1)
+    @inbounds for vcur in 1:onv
+        clipped[vcur] != 0 && continue
+        Sa = sd_num[vcur]      # ≥ 0
+        da = poly.positions_den[vcur]
+        for np in 1:D
+            vnext = Int(poly.pnbrs[np, vcur])
+            (vnext == 0 || clipped[vnext] == 0) && continue
+
+            poly.nverts >= poly.capacity && return false
+            new_v = (poly.nverts += 1)
+
+            Sb = sd_num[vnext]      # < 0
+            db = poly.positions_den[vnext]
+
+            # Cut formula in shared-denom form:
+            #   new_den  = Sa * db - Sb * da   (> 0 strictly, since Sa ≥ 0,
+            #                                   Sb < 0, da, db > 0)
+            #   new_num_i = Sa * pos_num[i, vnext] - Sb * pos_num[i, vcur]
+            new_den = Sa * db - Sb * da
+            g = new_den
+            for i in 1:D
+                num_i = Sa * poly.positions_num[i, vnext] -
+                        Sb * poly.positions_num[i, vcur]
+                poly.positions_num[i, new_v] = num_i
+                g = gcd(g, num_i)
+            end
+            if g > one(T)
+                new_den = div(new_den, g)
+                for i in 1:D
+                    poly.positions_num[i, new_v] = div(poly.positions_num[i, new_v], g)
+                end
+            end
+            poly.positions_den[new_v] = new_den
+
+            poly.pnbrs[1, new_v] = Int32(vcur)
+            for k in 2:D
+                poly.pnbrs[k, new_v] = Int32(0)
+            end
+            poly.pnbrs[np, vcur] = Int32(new_v)
+
+            # Slot 1 of new_v opposite vcur ⇒ the new cut facet.
+            poly.facets[1, new_v] = new_facet_id
+
+            # Carry 2-face IDs and facets from vcur into new_v.
+            np1 = 1
+            for np0 in 1:D
+                np0 == np && continue
+                np1 += 1
+                fid = poly.finds[np, np0, vcur]
+                poly.finds[1,   np1, new_v] = fid
+                poly.finds[np1, 1,   new_v] = fid
+                poly.facets[np1, new_v] = poly.facets[np0, vcur]
+            end
+            for np0 in 2:D, np1b in 2:D
+                poly.finds[np0, np1b, new_v] = Int32(0)
+            end
+            clipped[new_v] = Int32(0)
+        end
+    end
+
+    poly.nfacets += 1
+
+    # --- Step 4: walk 2-face boundaries (verbatim from Flat D ≥ 4).
+    nfaces = poly.nfaces
+    @inbounds for vstart in (onv + 1):poly.nverts, np0 in 2:D, np1 in (np0 + 1):D
+        if poly.finds[np0, np1, vstart] != 0
+            continue
+        end
+        fcur = Int(poly.finds[1, np0, vstart])
+        fadj = Int(poly.finds[1, np1, vstart])
+        vprev = vstart
+        vcur  = Int(poly.pnbrs[1, vstart])
+        prevnewvert = vstart
+        new_fid = Int32(nfaces + 1)
+        while true
+            if vcur > onv
+                pprev = _find_face_in_row0_int(poly, vcur, fcur, D)
+                pnext = _find_face_in_row0_int(poly, prevnewvert, fcur, D)
+                npx   = _find_face_in_row0_int(poly, vcur, fadj, D)
+                poly.pnbrs[pprev, vcur]            = Int32(prevnewvert)
+                poly.pnbrs[pnext, prevnewvert]     = Int32(vcur)
+                poly.finds[pprev, npx, vcur]       = new_fid
+                poly.finds[npx, pprev, vcur]       = new_fid
+                fcur, fadj = fadj, fcur
+                prevnewvert = vcur
+                vprev = vcur
+                vcur  = Int(poly.pnbrs[1, vcur])
+            end
+            pprev = _find_pnbr_slot_or0_int(poly, vcur, vprev, D)
+            pnext = _find_face_in_finds_row_int(poly, vcur, pprev, fcur, D)
+            npx   = _find_face_in_finds_col_int(poly, vcur, pprev, fadj, D)
+            fadj = Int(poly.finds[npx, pnext, vcur])
+            vprev = vcur
+            vcur  = Int(poly.pnbrs[pnext, vcur])
+            vcur == vstart && break
+        end
+        pprev = _find_face_in_row0_int(poly, vcur, fcur, D)
+        pnext = _find_face_in_row0_int(poly, prevnewvert, fcur, D)
+        npx   = _find_face_in_row0_int(poly, vcur, fadj, D)
+        poly.pnbrs[pprev, vcur]        = Int32(prevnewvert)
+        poly.pnbrs[pnext, prevnewvert] = Int32(vcur)
+        poly.finds[pprev, npx, vcur]   = new_fid
+        poly.finds[npx, pprev, vcur]   = new_fid
+        nfaces += 1
+    end
+    poly.nfaces = nfaces
+
+    # --- Step 5: compact, dropping clipped vertices. `facets[k, v]`
+    # follows v but the ID is global (no remap).
+    numunclipped = 0
+    @inbounds for v in 1:poly.nverts
+        if clipped[v] == 0
+            numunclipped += 1
+            if numunclipped != v
+                for i in 1:D
+                    poly.positions_num[i, numunclipped] = poly.positions_num[i, v]
+                    poly.pnbrs[i, numunclipped]         = poly.pnbrs[i, v]
+                    poly.facets[i, numunclipped]        = poly.facets[i, v]
+                end
+                poly.positions_den[numunclipped] = poly.positions_den[v]
+                for i in 1:D, j in 1:D
+                    poly.finds[i, j, numunclipped] = poly.finds[i, j, v]
+                end
+            end
+            clipped[v] = Int32(numunclipped)
+        else
+            clipped[v] = Int32(0)
+        end
+    end
+    poly.nverts = numunclipped
+    @inbounds for v in 1:poly.nverts, np in 1:D
+        old = Int(poly.pnbrs[np, v])
+        poly.pnbrs[np, v] = old == 0 ? Int32(0) : clipped[old]
+    end
+    return true
+end
+
+# ---------------------------------------------------------------------------
+# Exact volume at D = 4 via fan triangulation
+# ---------------------------------------------------------------------------
+
+# `volume_exact` at D = 4 produces an exact `Rational{R}` by fan-triangulating
+# the polytope into 4-simplices and summing |det|/4! per simplex.
+#
+# Triangulation: pick polytope apex `v0` (vertex 1). For each facet `f` not
+# containing `v0`, recursively fan-triangulate `f` (a 3-polytope) into
+# tetrahedra. For each tet, form a 4-simplex with `v0` as the fifth vertex
+# and add |det(M)|/4! to the running rational sum.
+#
+# The 3-polytope facet triangulation is done WITHOUT relying on `finds[]`'s
+# 2-face IDs (which are ambiguous for boxes — `init_box!` assigns one ID
+# per axis pair, conflating all opposite parallel 2-faces). Instead, we
+# walk 2-face boundaries using GEOMETRIC coplanarity tests in exact
+# integer arithmetic. The polytope's `pnbrs[]` graph restricted to the
+# facet vertices gives the in-facet adjacency; from `w_0 = first vertex
+# on f` we enumerate "link edges" (pairs of in-facet neighbours that are
+# themselves connected by an in-facet edge). Each link edge bounds one
+# 2-face NOT containing `w_0`; we walk that 2-face's boundary cycle by
+# choosing each next vertex via a 4×3 minor-vanish coplanarity test.
+
+# Signed volume of a 4-simplex with apex `vap` and base vertices
+# (w0, z0, a, b) — all integer-coordinate IntExact vertex IDs. Returns
+# the contribution as a `Rational{R}`: |det(M)| / 24 where M's columns
+# are the four edges from `vap`. det is computed in the rational
+# numerator system, so the denominator is the product of all five
+# vertex denoms.
+@inline function _vol_4simplex(poly::IntFlatPolytope{4,T}, vap::Int, w0::Int,
+                                z0::Int, a::Int, b::Int,
+                                ::Type{R}) where {T,R<:Signed}
+    da = R(poly.positions_den[vap])
+    dw = R(poly.positions_den[w0])
+    dz = R(poly.positions_den[z0])
+    de1 = R(poly.positions_den[a])
+    de2 = R(poly.positions_den[b])
+
+    # Edge vectors from `vap`. Numerator (vertex_num * d_apex - apex_num * d_vertex);
+    # the shared denominator factors out cleanly.
+    # M[i, j] for j in 1:4 corresponds to edges to (w0, z0, a, b).
+    # Each entry stays as a rational (num, denom).
+    e_num = ntuple(j -> ntuple(i -> begin
+        v = (j == 1) ? w0 : (j == 2) ? z0 : (j == 3) ? a : b
+        dv = R(poly.positions_den[v])
+        R(poly.positions_num[i, v]) * da - R(poly.positions_num[i, vap]) * dv
+    end, Val(4)), Val(4))
+    e_den = (dw, dz, de1, de2) .* da
+
+    # det of 4×4 via Laplace expansion along row 1.
+    @inline minor3(c1, c2, c3, r1, r2, r3) = begin
+        m11 = e_num[c1][r1]; m12 = e_num[c2][r1]; m13 = e_num[c3][r1]
+        m21 = e_num[c1][r2]; m22 = e_num[c2][r2]; m23 = e_num[c3][r2]
+        m31 = e_num[c1][r3]; m32 = e_num[c2][r3]; m33 = e_num[c3][r3]
+        m11 * (m22 * m33 - m23 * m32) -
+        m12 * (m21 * m33 - m23 * m31) +
+        m13 * (m21 * m32 - m22 * m31)
+    end
+
+    det_num =
+        e_num[1][1] * minor3(2, 3, 4, 2, 3, 4) -
+        e_num[2][1] * minor3(1, 3, 4, 2, 3, 4) +
+        e_num[3][1] * minor3(1, 2, 4, 2, 3, 4) -
+        e_num[4][1] * minor3(1, 2, 3, 2, 3, 4)
+
+    # Common denominator across all four columns.
+    det_den = e_den[1] * e_den[2] * e_den[3] * e_den[4]
+    # |det| / 24 — abs at the end so all fan pieces add up positively.
+    return abs(det_num) // (det_den * R(24))
+end
+
+"""
+    volume_exact(poly::IntFlatPolytope{4,T}, ::Type{R} = T) -> Rational{R}
+
+Return the polytope's 4-volume as an exact `Rational{R}`. Sqrt-free —
+fan-triangulates the polytope into 4-simplices through the existing
+facet → 2-face → edge boundary walk and sums `|det(M)| / 4!` per
+simplex. Each piece is a clean rational `(integer numerator) /
+(product of vertex denominators × 24)`.
+
+The default accumulator type `R = T` keeps the calculation in the
+polytope's storage type; pass `R = BigInt` (or another wider integer
+type) to defend against overflow at the per-4-simplex 4-fold numerator
+product.
+
+The polytope must be convex (which all `clip!`-derived polytopes are);
+non-convex polytopes will give wrong answers because fan triangulation
+relies on convexity.
+"""
+function volume_exact(poly::IntFlatPolytope{4,T},
+                      ::Type{R} = T) where {T,R<:Signed}
+    nv = poly.nverts
+    nv == 0 && return zero(Rational{R})
+
+    apex = 1   # polytope apex
+    sum_rat = zero(Rational{R})
+
+    # Enumerate each facet exactly once.
+    seen_f = falses(poly.nfacets)
+    @inbounds for v in 1:nv, k in 1:4
+        fid = Int(poly.facets[k, v])
+        (fid <= 0 || fid > poly.nfacets) && continue
+        seen_f[fid] && continue
+        seen_f[fid] = true
+
+        # Skip if `apex` is on this facet.
+        on_apex = false
+        for ka in 1:4
+            if Int(poly.facets[ka, apex]) == fid
+                on_apex = true; break
+            end
+        end
+        on_apex && continue
+
+        sum_rat += _vol_facet_d4(poly, fid, apex, R)
+    end
+    return sum_rat
+end
+
+# Test whether 4 vertices `ref, p1, p2, p3` of a D = 4 IntExact polytope
+# are coplanar (the three difference vectors `p_i - ref` lie in a 2D
+# subspace of R^4). Equivalent to: every 3 × 3 minor of the 4 × 3 matrix
+# of difference numerators vanishes. Uses pure integer arithmetic — no
+# rationals constructed (the per-column denominators are positive scalars
+# that don't change minor vanishing).
+@inline function _coplanar_d4(poly::IntFlatPolytope{4,T},
+                               ref::Int, p1::Int, p2::Int, p3::Int) where {T}
+    dr = poly.positions_den[ref]
+    d1 = poly.positions_den[p1]
+    d2 = poly.positions_den[p2]
+    d3 = poly.positions_den[p3]
+    @inline diff_num(p::Int, dp::T, k::Int) =
+        poly.positions_num[k, p] * dr - poly.positions_num[k, ref] * dp
+    @inbounds for omit in 1:4
+        # 3 × 3 minor over the rows other than `omit`. det formula on
+        # the explicit entries of the 3 × 3 submatrix.
+        ks = (omit == 1 ? (2, 3, 4) :
+              omit == 2 ? (1, 3, 4) :
+              omit == 3 ? (1, 2, 4) : (1, 2, 3))
+        a11 = diff_num(p1, d1, ks[1])
+        a12 = diff_num(p2, d2, ks[1])
+        a13 = diff_num(p3, d3, ks[1])
+        a21 = diff_num(p1, d1, ks[2])
+        a22 = diff_num(p2, d2, ks[2])
+        a23 = diff_num(p3, d3, ks[2])
+        a31 = diff_num(p1, d1, ks[3])
+        a32 = diff_num(p2, d2, ks[3])
+        a33 = diff_num(p3, d3, ks[3])
+        det = a11 * (a22 * a33 - a23 * a32) -
+              a12 * (a21 * a33 - a23 * a31) +
+              a13 * (a21 * a32 - a22 * a31)
+        det != zero(T) && return false
+    end
+    return true
+end
+
+# Walk the boundary cycle of the 2-face of facet `fid` (encoded by
+# `in_facet`) at vertex `v` along edges (v, n_a) and (v, n_b). Pushes
+# the cycle vertices in order onto `cycle` (cleared first). Returns
+# `true` on success; `false` on a degenerate walk (no coplanar next).
+function _walk_2face_d4!(cycle::Vector{Int},
+                          poly::IntFlatPolytope{4,T},
+                          in_facet::Vector{Bool},
+                          v::Int, n_a::Int, n_b::Int) where {T}
+    empty!(cycle)
+    push!(cycle, v); push!(cycle, n_a)
+    v_prev = v; v_curr = n_a
+    nv = poly.nverts
+    steps = 0
+    while true
+        steps += 1
+        steps > nv + 4 && return false
+        v_next = 0
+        @inbounds for k in 1:4
+            cand = Int(poly.pnbrs[k, v_curr])
+            cand == 0 && continue
+            in_facet[cand] || continue
+            cand == v_prev && continue
+            if _coplanar_d4(poly, v, n_a, n_b, cand)
+                v_next = cand; break
+            end
+        end
+        v_next == 0 && return false
+        if v_next == v
+            return true
+        end
+        push!(cycle, v_next)
+        v_prev = v_curr
+        v_curr = v_next
+    end
+end
+
+# Fan-triangulate facet `fid` of a D = 4 polytope (a 3-polytope embedded
+# in a 3-hyperplane of R^4). Picks `w_0 = smallest in-facet vertex`,
+# enumerates each 2-face of `fid` exactly once via "smallest-vertex of
+# cycle" deduplication, fan-triangulates each 2-face NOT containing
+# `w_0` into triangles, and combines with `apex` to form 4-simplices.
+function _vol_facet_d4(poly::IntFlatPolytope{4,T}, fid::Int, apex::Int,
+                        ::Type{R}) where {T,R<:Signed}
+    fid_i = Int32(fid)
+    nv = poly.nverts
+
+    in_facet = Vector{Bool}(undef, nv)
+    @inbounds for v in 1:nv
+        on = false
+        for k in 1:4
+            if poly.facets[k, v] == fid_i
+                on = true; break
+            end
+        end
+        in_facet[v] = on
+    end
+
+    w_0 = 0
+    @inbounds for v in 1:nv
+        if in_facet[v]
+            w_0 = v; break
+        end
+    end
+    @assert w_0 != 0 "_vol_facet_d4: facet $fid has no vertices"
+
+    sum_rat = zero(Rational{R})
+    cycle = Int[]
+    in_nbrs_v = Int[]   # reused per vertex
+
+    # Walk every 2-face of `fid` exactly once: at each vertex `v` on
+    # `fid`, enumerate ordered pairs (n_a, n_b) of v's in-facet
+    # neighbours; the 2-face containing edges (v, n_a) and (v, n_b) is
+    # processed iff `v` is the smallest-indexed vertex of that 2-face's
+    # cycle (and additionally we use the lexicographically-smallest
+    # (n_a, n_b) pair at v for the 2-face — by walking via n_a first;
+    # walking via n_b would trace the same cycle in reverse).
+    @inbounds for v in 1:nv
+        in_facet[v] || continue
+
+        empty!(in_nbrs_v)
+        for k in 1:4
+            n = Int(poly.pnbrs[k, v])
+            n != 0 && in_facet[n] && push!(in_nbrs_v, n)
+        end
+        n_inn = length(in_nbrs_v)
+        n_inn >= 2 || continue
+
+        for ii in 1:n_inn, jj in (ii + 1):n_inn
+            n_a = in_nbrs_v[ii]
+            n_b = in_nbrs_v[jj]
+
+            ok = _walk_2face_d4!(cycle, poly, in_facet, v, n_a, n_b)
+            ok || continue
+
+            # Smallest-vertex dedup. Also: at the canonical vertex `v`,
+            # the 2-face determines a UNIQUE pair {n_a, n_b}; we must
+            # skip if (n_a, n_b) isn't the canonical pair (e.g. swapped).
+            # Since we only iterate ii < jj, each unordered pair is
+            # visited once, so this is automatic. But each 2-face has 3
+            # pairs at v if v has > 2 in-facet neighbours and the 2-face
+            # only uses 2 of them — we must verify the cycle's 2nd vertex
+            # is `n_a` (not some unrelated vertex from the same plane).
+            cycle_min = cycle[1]
+            for c in cycle
+                c < cycle_min && (cycle_min = c)
+            end
+            cycle_min != v && continue
+
+            # Skip if w_0 is on this 2-face (cone has zero 4-volume).
+            on_w0 = false
+            for c in cycle
+                if c == w_0; on_w0 = true; break; end
+            end
+            on_w0 && continue
+
+            # Fan-triangulate cycle from cycle[1].
+            z_0 = cycle[1]
+            for i in 2:(length(cycle) - 1)
+                sum_rat += _vol_4simplex(poly, apex, w_0, z_0,
+                                          cycle[i], cycle[i + 1], R)
+            end
+        end
+    end
+
+    return sum_rat
 end
 
 end # module IntExact

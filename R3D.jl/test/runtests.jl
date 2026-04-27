@@ -3138,3 +3138,162 @@ end
         @test R3D.IntExact.volume_exact(c) == 6 // 1
     end
 end
+
+@testset "R3D.IntExact D = 4 (volume_exact)" begin
+    @testset "init_box! D = 4" begin
+        for T in (Int64, Int128)
+            box4 = R3D.IntExact.IntFlatPolytope{4,T}(64)
+            R3D.IntExact.init_box!(box4, [0, 0, 0, 0], [1, 1, 1, 1])
+            @test box4.nverts == 16
+            @test box4.nfacets == 8
+            @test box4.nfaces == 6
+            @test R3D.IntExact.volume_exact(box4) == 1 // 1
+
+            # Non-unit box: 2 × 3 × 4 × 5 = 120.
+            b2 = R3D.IntExact.IntFlatPolytope{4,T}(64)
+            R3D.IntExact.init_box!(b2, [0, 0, 0, 0], [2, 3, 4, 5])
+            @test R3D.IntExact.volume_exact(b2) == 120 // 1
+
+            # Negative-corner box: 3^4 = 81.
+            b3 = R3D.IntExact.IntFlatPolytope{4,T}(64)
+            R3D.IntExact.init_box!(b3, [-2, -3, -1, -4], [1, 0, 2, -1])
+            @test R3D.IntExact.volume_exact(b3) == 81 // 1
+        end
+    end
+
+    @testset "init_simplex! D = 4 closed-form" begin
+        for T in (Int64, Int128)
+            # Standard unit D = 4 simplex: vol = 1 / 4! = 1/24.
+            s = R3D.IntExact.IntFlatPolytope{4,T}(64)
+            verts = [[T(0), 0, 0, 0],
+                     [T(1), 0, 0, 0],
+                     [T(0), 1, 0, 0],
+                     [T(0), 0, 1, 0],
+                     [T(0), 0, 0, 1]]
+            R3D.IntExact.init_simplex!(s, verts)
+            @test s.nverts == 5
+            @test s.nfacets == 5
+            @test R3D.IntExact.volume_exact(s) == 1 // 24
+
+            # Scale-k simplex: vol = k^4 / 24.
+            for k in (2, 3, 5)
+                sk = R3D.IntExact.IntFlatPolytope{4,T}(64)
+                kverts = [[T(0), 0, 0, 0],
+                          [T(k), 0, 0, 0],
+                          [T(0), k, 0, 0],
+                          [T(0), 0, k, 0],
+                          [T(0), 0, 0, k]]
+                R3D.IntExact.init_simplex!(sk, kverts)
+                @test R3D.IntExact.volume_exact(sk) == T(k)^4 // 24
+            end
+        end
+    end
+
+    @testset "single clip on D = 4 box" begin
+        # Cut box [0,2]^4 by x[1] ≥ 1: volume = 8.
+        box = R3D.IntExact.IntFlatPolytope{4,Int64}(128)
+        R3D.IntExact.init_box!(box, [0, 0, 0, 0], [2, 2, 2, 2])
+        ok = R3D.IntExact.clip!(box, R3D.Plane{4,Int64}((1, 0, 0, 0), -1))
+        @test ok
+        @test R3D.IntExact.volume_exact(box) == 8 // 1
+
+        # Complementary half also gives 8.
+        box2 = R3D.IntExact.IntFlatPolytope{4,Int64}(128)
+        R3D.IntExact.init_box!(box2, [0, 0, 0, 0], [2, 2, 2, 2])
+        ok2 = R3D.IntExact.clip!(box2, R3D.Plane{4,Int64}((-1, 0, 0, 0), 1))
+        @test ok2
+        @test R3D.IntExact.volume_exact(box2) == 8 // 1
+
+        # Three orthogonal clips on box [0,2]^4 → [1,2]^3 × [0,2] = 2.
+        box3 = R3D.IntExact.IntFlatPolytope{4,Int64}(128)
+        R3D.IntExact.init_box!(box3, [0, 0, 0, 0], [2, 2, 2, 2])
+        for k in 1:3
+            n = ntuple(i -> Int64(i == k ? 1 : 0), Val(4))
+            R3D.IntExact.clip!(box3, R3D.Plane{4,Int64}(n, Int64(-1)))
+        end
+        @test R3D.IntExact.volume_exact(box3) == 2 // 1
+    end
+
+    @testset "single clip on D = 4 simplex" begin
+        # Whole 2× simplex = 16/24 = 2/3.
+        # Clip x[1] ≤ 1 keeps 16/24 - 1/24 = 15/24 = 5/8.
+        s = R3D.IntExact.IntFlatPolytope{4,Int64}(128)
+        verts = [[0, 0, 0, 0], [2, 0, 0, 0], [0, 2, 0, 0], [0, 0, 2, 0], [0, 0, 0, 2]]
+        R3D.IntExact.init_simplex!(s, verts)
+        ok = R3D.IntExact.clip!(s, R3D.Plane{4,Int64}((-1, 0, 0, 0), 1))
+        @test ok
+        @test R3D.IntExact.volume_exact(s) == 5 // 8
+    end
+
+    @testset "sequential clips on D = 4 simplex (non-degenerate)" begin
+        # 3× simplex with x[1] ≤ 1 then x[2] ≤ 1: corner (1, 1, 0, 0)
+        # is interior — no degenerate coincident vertex.
+        # Cross-checked against Flat float kernel at FP precision.
+        s = R3D.IntExact.IntFlatPolytope{4,Int64}(512)
+        verts = [[0, 0, 0, 0], [3, 0, 0, 0], [0, 3, 0, 0], [0, 0, 3, 0], [0, 0, 0, 3]]
+        R3D.IntExact.init_simplex!(s, verts)
+        @test R3D.IntExact.volume_exact(s) == 27 // 8
+        R3D.IntExact.clip!(s, R3D.Plane{4,Int64}((-1, 0, 0, 0), 1))
+        v_after_one = R3D.IntExact.volume_exact(s)
+        R3D.IntExact.clip!(s, R3D.Plane{4,Int64}((0, -1, 0, 0), 1))
+        v_after_two = R3D.IntExact.volume_exact(s)
+
+        # Cross-check vs Flat (float) to fp precision.
+        s_f = R3D.Flat.FlatPolytope{4,Float64}(512)
+        R3D.Flat.init_simplex!(s_f, [Vector{Float64}(v) for v in verts])
+        R3D.Flat.clip!(s_f, R3D.Plane{4,Float64}((-1.0, 0, 0, 0), 1.0))
+        out = zeros(Float64, 1)
+        R3D.Flat.moments!(out, s_f, 0)
+        @test isapprox(Float64(v_after_one), out[1]; rtol = 1e-10)
+        R3D.Flat.clip!(s_f, R3D.Plane{4,Float64}((0.0, -1, 0, 0), 1.0))
+        R3D.Flat.moments!(out, s_f, 0)
+        @test isapprox(Float64(v_after_two), out[1]; rtol = 1e-10)
+    end
+
+    @testset "random clips differential vs Flat" begin
+        # Random non-degenerate clips on the (10×) D = 4 simplex,
+        # cross-checked against `R3D.Flat`'s float volume to 1e-9.
+        # Some axis-aligned random clips happen to land on exact-integer
+        # boundary vertices (sd_num == 0), producing the coincident-
+        # vertex degeneracy that exact integer arithmetic cannot ε-nudge
+        # past — accept up to 25 % failure on those.
+        Random.seed!(20260426)
+        agreed = 0
+        nontrivial = 0
+        for _ in 1:30
+            s = R3D.IntExact.IntFlatPolytope{4,Int128}(512)
+            verts = [[Int128(0), 0, 0, 0],
+                     [Int128(10), 0, 0, 0],
+                     [Int128(0), 10, 0, 0],
+                     [Int128(0), 0, 10, 0],
+                     [Int128(0), 0, 0, 10]]
+            R3D.IntExact.init_simplex!(s, verts)
+            s_f = R3D.Flat.FlatPolytope{4,Float64}(512)
+            R3D.Flat.init_simplex!(s_f, [Vector{Float64}(v) for v in verts])
+            ok = true
+            for _ in 1:2
+                n = ntuple(_ -> rand(-3:3), Val(4))
+                d = rand(-7:7)
+                if all(==(0), n)
+                    ok = false; break
+                end
+                ok2 = R3D.IntExact.clip!(s, R3D.Plane{4,Int128}(Int128.(n), Int128(d)))
+                R3D.Flat.clip!(s_f, R3D.Plane{4,Float64}(Float64.(n), Float64(d)))
+                if !ok2 || s.nverts == 0 || s_f.nverts == 0
+                    ok = false; break
+                end
+            end
+            ok || continue
+            v_int = R3D.IntExact.volume_exact(s, BigInt)
+            out = zeros(1)
+            R3D.Flat.moments!(out, s_f, 0)
+            v_flt = out[1]
+            abs(v_flt) < 1e-12 && continue
+            nontrivial += 1
+            err = abs(Float64(v_int) - v_flt) / max(abs(v_flt), 1e-12)
+            err < 1e-9 && (agreed += 1)
+        end
+        @test nontrivial >= 5
+        @test agreed >= div(nontrivial * 3, 4)
+    end
+end

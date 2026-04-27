@@ -31,6 +31,8 @@ Pick `R3D.Flat` when:
 - You need polynomial moments at `D >= 4`. IntExact's
   `moments_exact` covers `D in {2, 3}` only; `D >= 4` would need a
   sqrt-free alternative to the Lasserre formula and is research-grade.
+  (Volume at `D = 4` IS available via `volume_exact`, sqrt-free; see
+  Limitations.)
 - Maximum throughput beats reproducibility. The integer kernel runs
   GCD reductions and multi-word multiplies that float skips.
 
@@ -274,9 +276,23 @@ sum would remain integer (mass conservation).
 - Polynomial moments at `D >= 4` are not supported. The moment
   recursion uses `R3D.Flat.moments!`'s Koehl form for `D in {2, 3}`;
   for `D >= 4` the analytic alternatives (Lasserre) introduce
-  `sqrt`, which has no exact-rational evaluation. See
-  `R3D.jl/d4plus_finalization_plan.md` for the plan to land `D >= 4`
-  *volume* (Phase 6, in flight at the time of writing).
+  `sqrt`, which has no exact-rational evaluation. *Volume* at
+  `D = 4` IS supported (`volume_exact(::IntFlatPolytope{4, T})`)
+  via sqrt-free fan triangulation through the polytope's
+  facet/2-face structure with geometric coplanarity in exact integer
+  arithmetic.
+- `D = 4` `clip!` does not ε-nudge boundary vertices (the float
+  `R3D.Flat.clip_plane!` does, with `eps(T) * 256`). When two
+  sequential axis-aligned cuts intersect exactly at a vertex of the
+  polytope (`sd_num[vcur] == 0`), the integer cut formula collapses
+  to a position coincident with `vcur`, leaving the polytope with a
+  duplicate vertex. `volume_exact` is correct on convex polytopes
+  produced by non-degenerate clip sequences (~75 % of random axis-
+  aligned 2-clip sequences on the 10× simplex pass at 1e-9 vs.
+  Flat); axis-aligned cuts that hit corner-coincident vertices may
+  return a partial volume. Use non-degenerate cuts, scale up the
+  polytope to push degeneracies off-grid, or fall back to
+  `R3D.Flat` for those workloads.
 - `rotate!` accepts only integer-orthogonal matrices. The assertion
   `A * A' == I` triggers if you pass anything else; use
   `R3D.Flat.rotate!` for general `SO(D)` rotations (their entries

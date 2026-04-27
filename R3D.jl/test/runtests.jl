@@ -3360,3 +3360,109 @@ end
         @test count(v -> canon[v] != Int32(v), 1:poly.nverts) == 1
     end
 end
+
+@testset "R3D.IntExact D ∈ {5, 6} (volume_exact)" begin
+    @testset "D = 5 closed-form box / simplex" begin
+        for T in (Int64, Int128)
+            # Unit D = 5 box: vol = 1.
+            b = R3D.IntExact.IntFlatPolytope{5,T}(64)
+            R3D.IntExact.init_box!(b, fill(0, 5), fill(1, 5))
+            @test b.nverts == 32
+            @test b.nfacets == 10
+            @test R3D.IntExact.volume_exact(b) == 1 // 1
+
+            # Non-unit box: 2 × 3 × 4 × 5 × 2 = 240.
+            b2 = R3D.IntExact.IntFlatPolytope{5,T}(64)
+            R3D.IntExact.init_box!(b2, [0, 0, 0, 0, 0], [2, 3, 4, 5, 2])
+            @test R3D.IntExact.volume_exact(b2) == 240 // 1
+
+            # Unit D = 5 simplex: vol = 1 / 5! = 1/120.
+            s = R3D.IntExact.IntFlatPolytope{5,T}(64)
+            verts = [[T(0), 0, 0, 0, 0],
+                     [T(1), 0, 0, 0, 0],
+                     [T(0), 1, 0, 0, 0],
+                     [T(0), 0, 1, 0, 0],
+                     [T(0), 0, 0, 1, 0],
+                     [T(0), 0, 0, 0, 1]]
+            R3D.IntExact.init_simplex!(s, verts)
+            @test s.nverts == 6
+            @test s.nfacets == 6
+            @test R3D.IntExact.volume_exact(s) == 1 // 120
+
+            # k-scale simplex: vol = k^5 / 120.
+            for k in (2, 3)
+                sk = R3D.IntExact.IntFlatPolytope{5,T}(64)
+                kverts = [[T(0), 0, 0, 0, 0],
+                          [T(k), 0, 0, 0, 0],
+                          [T(0), k, 0, 0, 0],
+                          [T(0), 0, k, 0, 0],
+                          [T(0), 0, 0, k, 0],
+                          [T(0), 0, 0, 0, k]]
+                R3D.IntExact.init_simplex!(sk, kverts)
+                @test R3D.IntExact.volume_exact(sk) == T(k)^5 // 120
+            end
+        end
+    end
+
+    @testset "D = 5 single clip cross-checks Flat" begin
+        # Clip the [0,2]^5 box by x[1] ≥ 1: volume halves to 16.
+        b = R3D.IntExact.IntFlatPolytope{5,Int64}(128)
+        R3D.IntExact.init_box!(b, [0, 0, 0, 0, 0], [2, 2, 2, 2, 2])
+        ok = R3D.IntExact.clip!(b, R3D.Plane{5,Int64}((1, 0, 0, 0, 0), -1))
+        @test ok
+        @test R3D.IntExact.volume_exact(b) == 16 // 1
+
+        # Clip a 3× simplex by x[1] ≤ 1; cross-check vs Flat to FP.
+        s = R3D.IntExact.IntFlatPolytope{5,Int64}(256)
+        verts = [[0, 0, 0, 0, 0], [3, 0, 0, 0, 0], [0, 3, 0, 0, 0],
+                 [0, 0, 3, 0, 0], [0, 0, 0, 3, 0], [0, 0, 0, 0, 3]]
+        R3D.IntExact.init_simplex!(s, verts)
+        R3D.IntExact.clip!(s, R3D.Plane{5,Int64}((-1, 0, 0, 0, 0), 1))
+        v_int = R3D.IntExact.volume_exact(s)
+
+        s_f = R3D.Flat.FlatPolytope{5,Float64}(256)
+        R3D.Flat.init_simplex!(s_f, [Vector{Float64}(v) for v in verts])
+        R3D.Flat.clip!(s_f, R3D.Plane{5,Float64}((-1.0, 0, 0, 0, 0), 1.0))
+        out = zeros(1)
+        R3D.Flat.moments!(out, s_f, 0)
+        @test isapprox(Float64(v_int), out[1]; rtol = 1e-10)
+    end
+
+    @testset "D = 6 closed-form box / simplex" begin
+        for T in (Int64, Int128)
+            # Unit D = 6 box: vol = 1.
+            b = R3D.IntExact.IntFlatPolytope{6,T}(128)
+            R3D.IntExact.init_box!(b, fill(0, 6), fill(1, 6))
+            @test b.nverts == 64
+            @test b.nfacets == 12
+            @test R3D.IntExact.volume_exact(b) == 1 // 1
+
+            # Non-unit box.
+            b2 = R3D.IntExact.IntFlatPolytope{6,T}(128)
+            R3D.IntExact.init_box!(b2, [0, 0, 0, 0, 0, 0], [2, 2, 2, 2, 2, 2])
+            @test R3D.IntExact.volume_exact(b2) == 64 // 1
+
+            # Unit D = 6 simplex: vol = 1 / 6! = 1/720.
+            s = R3D.IntExact.IntFlatPolytope{6,T}(128)
+            verts = [[T(0), 0, 0, 0, 0, 0],
+                     [T(1), 0, 0, 0, 0, 0],
+                     [T(0), 1, 0, 0, 0, 0],
+                     [T(0), 0, 1, 0, 0, 0],
+                     [T(0), 0, 0, 1, 0, 0],
+                     [T(0), 0, 0, 0, 1, 0],
+                     [T(0), 0, 0, 0, 0, 1]]
+            R3D.IntExact.init_simplex!(s, verts)
+            @test s.nverts == 7
+            @test s.nfacets == 7
+            @test R3D.IntExact.volume_exact(s) == 1 // 720
+        end
+    end
+
+    @testset "D = 6 single clip on box" begin
+        b = R3D.IntExact.IntFlatPolytope{6,Int64}(256)
+        R3D.IntExact.init_box!(b, [0, 0, 0, 0, 0, 0], [2, 2, 2, 2, 2, 2])
+        ok = R3D.IntExact.clip!(b, R3D.Plane{6,Int64}((1, 0, 0, 0, 0, 0), -1))
+        @test ok
+        @test R3D.IntExact.volume_exact(b) == 32 // 1
+    end
+end

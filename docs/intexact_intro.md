@@ -277,10 +277,14 @@ sum would remain integer (mass conservation).
   recursion uses `R3D.Flat.moments!`'s Koehl form for `D in {2, 3}`;
   for `D >= 4` the analytic alternatives (Lasserre) introduce
   `sqrt`, which has no exact-rational evaluation. *Volume* at
-  `D = 4` IS supported (`volume_exact(::IntFlatPolytope{4, T})`)
-  via sqrt-free fan triangulation through the polytope's
-  facet/2-face structure with geometric coplanarity in exact integer
-  arithmetic.
+  `D in {4, 5, 6}` IS supported (`volume_exact(::IntFlatPolytope{D, T})`)
+  via sqrt-free fan triangulation. The `D = 4` path uses
+  facet/2-face/edge boundary walks; `D in {5, 6}` use a generic
+  recursive enumeration of the facet-intersection lattice, with the
+  same canonical-vertex pre-pass for boundary degeneracies. Cost
+  scales as `O(M^D)` where `M = poly.nfacets` — fine at unit-test
+  scale, slow for production hot loops at `D = 6` (a future
+  optimization could memoize the facet-intersection lattice).
 - `D = 4` `clip!` does not ε-nudge boundary vertices (the float
   `R3D.Flat.clip_plane!` does, with `eps(T) * 256`). When two
   sequential axis-aligned cuts intersect exactly at a vertex of the

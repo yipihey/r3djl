@@ -2065,4 +2065,381 @@ function _vol_facet_d4(poly::IntFlatPolytope{4,T}, fid::Int, apex::Int,
     return sum_rat
 end
 
+# ---------------------------------------------------------------------------
+# D-generic exact volume for D ∈ {5, 6} via recursive fan triangulation
+# ---------------------------------------------------------------------------
+#
+# Same shape as the D = 4 algorithm — fan-triangulate from a chosen apex,
+# recursing through facets / sub-facets / 2-faces / edges — but the
+# enumeration of sub-cells now uses the FACET-INTERSECTION structure
+# (each k-face of a convex polytope = intersection of D - k facets) so
+# the recursion depth scales with `D`. At each level we pick `w_0` =
+# smallest canonical vertex in the current sub-cell, then for each
+# parent-polytope facet not in the current path with `w_0` not on it,
+# we add that facet to the path and recurse one level deeper. The
+# recursion bottoms out at:
+#
+#   * cell_dim == 2 — polygon: walk the boundary cycle using the same
+#     `_walk_polygon_dgeneric!` cycle walker (D-generic coplanarity test)
+#     and fan-triangulate the cycle from its first vertex.
+#   * cell_dim == 1 — edge: vertex set has exactly 2 canonical vertices;
+#     contribute one D-simplex (apex_stack..., a, b).
+#
+# Each leaf D-simplex contributes `|det(M)| / D!` where M is the D × D
+# matrix of column-rational edge vectors from `apex_stack[1]`.
+#
+# Costs: O(M^D) outer iterations × O(N) per filter step. For typical
+# polytopes (M ≈ 2D facets, N ≈ 2^D vertices) this stays ≤ a few
+# million ops at D = 5 and ≤ ~50 M ops at D = 6 — fine for unit-test
+# scale, slow for production hot loops (a Phase 8 follow-up could
+# memoize the facet-intersection lattice).
+
+# Build the canonical-vertex map for any D ≥ 4. Same logic as the
+# D = 4 specialized version; lifted to be generic.
+function _build_canonical_dgeneric(poly::IntFlatPolytope{D,T}) where {D,T}
+    nv = poly.nverts
+    canon = Vector{Int32}(undef, nv)
+    @inbounds for v in 1:nv
+        canon[v] = Int32(v)
+    end
+    @inbounds for v in 1:nv
+        canon[v] != Int32(v) && continue
+        for w in (v + 1):nv
+            canon[w] != Int32(w) && continue
+            poly.positions_den[v] == poly.positions_den[w] || continue
+            same = true
+            for i in 1:D
+                if poly.positions_num[i, v] != poly.positions_num[i, w]
+                    same = false; break
+                end
+            end
+            same && (canon[w] = Int32(v))
+        end
+    end
+    return canon
+end
+
+# Precompute `vertex_on_facet[c, fid] = true` iff some instance of
+# canonical vertex `c` (i.e., some `w` with `canon[w] == c`) lies on
+# facet `fid`. Returned as a `BitMatrix(nv, nfacets)` for O(1) lookup
+# in the recursion's hot path.
+function _vertex_on_facet_table(poly::IntFlatPolytope{D,T},
+                                  canon::Vector{Int32}) where {D,T}
+    nv = poly.nverts
+    nf = poly.nfacets
+    vof = falses(nv, nf)
+    @inbounds for w in 1:nv
+        c = Int(canon[w])
+        for k in 1:D
+            fid = Int(poly.facets[k, w])
+            (fid <= 0 || fid > nf) && continue
+            vof[c, fid] = true
+        end
+    end
+    return vof
+end
+
+# D-generic coplanarity test. 4 vertices `ref, p1, p2, p3` are coplanar
+# in R^D iff the difference vectors `p_i - ref` span a subspace of
+# dimension ≤ 2, iff every 3 × 3 minor of the D × 3 matrix vanishes.
+# Iterates over `C(D, 3)` minors — bearable for D ≤ 6 (4, 10, 20).
+@inline function _coplanar_dgeneric(poly::IntFlatPolytope{D,T},
+                                     ref::Int, p1::Int, p2::Int, p3::Int) where {D,T}
+    dr = poly.positions_den[ref]
+    d1 = poly.positions_den[p1]
+    d2 = poly.positions_den[p2]
+    d3 = poly.positions_den[p3]
+    @inline diff_num(p::Int, dp::T, k::Int) =
+        poly.positions_num[k, p] * dr - poly.positions_num[k, ref] * dp
+    @inbounds for r1 in 1:(D - 2), r2 in (r1 + 1):(D - 1), r3 in (r2 + 1):D
+        a11 = diff_num(p1, d1, r1)
+        a12 = diff_num(p2, d2, r1)
+        a13 = diff_num(p3, d3, r1)
+        a21 = diff_num(p1, d1, r2)
+        a22 = diff_num(p2, d2, r2)
+        a23 = diff_num(p3, d3, r2)
+        a31 = diff_num(p1, d1, r3)
+        a32 = diff_num(p2, d2, r3)
+        a33 = diff_num(p3, d3, r3)
+        det = a11 * (a22 * a33 - a23 * a32) -
+              a12 * (a21 * a33 - a23 * a31) +
+              a13 * (a21 * a32 - a22 * a31)
+        det != zero(T) && return false
+    end
+    return true
+end
+
+# Compute `|det(M)| // (D! · ∏ d_j · da^D)` for the D-simplex with
+# `apex` = `vertex_indices[1]` and base = `vertex_indices[2:end]`,
+# returned as a `Rational{R}`. M[i, j] = `pos_num[i, v_{j+1}] · da -
+# pos_num[i, apex] · d_j` where d_j = pos_den[v_{j+1}]. The shared
+# per-column denominator factors out cleanly into `det_den`. Det is
+# computed by recursive Laplace expansion along row 1 (cost ~ D!).
+function _vol_dsimplex_generic(poly::IntFlatPolytope{D,T},
+                                vertex_indices::Vector{Int},
+                                ::Type{R}) where {D,T,R<:Signed}
+    @assert length(vertex_indices) == D + 1
+    apex = vertex_indices[1]
+    da = R(poly.positions_den[apex])
+
+    # Build D × D matrix of edge numerators (M[i, j]) and column denominators.
+    M = Matrix{R}(undef, D, D)
+    col_den = Vector{R}(undef, D)
+    @inbounds for j in 1:D
+        v = vertex_indices[j + 1]
+        dv = R(poly.positions_den[v])
+        col_den[j] = dv * da
+        for i in 1:D
+            M[i, j] = R(poly.positions_num[i, v]) * da -
+                      R(poly.positions_num[i, apex]) * dv
+        end
+    end
+
+    det_num = _det_recursive_R(M, D, R)
+    det_den = R(_factorial_int(D))
+    @inbounds for j in 1:D
+        det_den *= col_den[j]
+    end
+    return abs(det_num) // det_den
+end
+
+# Recursive Laplace expansion of the leading `n × n` block of `M`.
+# In-place column removal via stride magic would be faster; we copy a
+# (n − 1) × (n − 1) block and recurse — fine for D ≤ 6 (worst-case
+# cost is 6! = 720 leaf computations).
+function _det_recursive_R(M::AbstractMatrix{R}, n::Int, ::Type{R}) where {R<:Signed}
+    n == 1 && return M[1, 1]
+    n == 2 && return M[1, 1] * M[2, 2] - M[1, 2] * M[2, 1]
+    s = zero(R)
+    sign = one(R)
+    sub = Matrix{R}(undef, n - 1, n - 1)
+    @inbounds for col in 1:n
+        # Build the (n-1) × (n-1) minor: drop row 1, drop column `col`.
+        for i in 2:n
+            ii = i - 1
+            jj = 0
+            for j in 1:n
+                j == col && continue
+                jj += 1
+                sub[ii, jj] = M[i, j]
+            end
+        end
+        s += sign * M[1, col] * _det_recursive_R(sub, n - 1, R)
+        sign = -sign
+    end
+    return s
+end
+
+@inline _factorial_int(n::Int) = n <= 1 ? 1 : n * _factorial_int(n - 1)
+
+# Walk a polygon (2-cell) defined by `vertex_set` (a subset of canonical
+# vertex IDs) on the polytope. Returns the cycle of canonical vertex IDs
+# in boundary order via `cycle`. Picks the smallest-ID canonical vertex
+# as start, walks via in-cell adjacency (canonical pnbrs filtered to
+# `vertex_set`), and chooses each next vertex via D-generic coplanarity
+# against the start's spanning plane.
+function _walk_polygon_dgeneric!(cycle::Vector{Int},
+                                  poly::IntFlatPolytope{D,T},
+                                  vertex_set::AbstractVector{Bool},
+                                  canon::Vector{Int32}) where {D,T}
+    empty!(cycle)
+    nv = poly.nverts
+
+    # Smallest canonical vertex in the polygon.
+    z_0 = 0
+    @inbounds for c in 1:nv
+        if vertex_set[c]
+            z_0 = c; break
+        end
+    end
+    z_0 == 0 && return false
+
+    # In-cell canonical neighbours of `z_0`: for each instance `w` with
+    # `canon[w] == z_0`, take pnbrs[k, w] (canonicalized) restricted to
+    # `vertex_set`, excluding self-loops.
+    nbrs_z0 = Int[]
+    @inbounds for w in 1:nv
+        Int(canon[w]) != z_0 && continue
+        for k in 1:D
+            n = Int(poly.pnbrs[k, w])
+            n == 0 && continue
+            cn = Int(canon[n])
+            cn == z_0 && continue
+            vertex_set[cn] || continue
+            already = false
+            for x in nbrs_z0
+                if x == cn; already = true; break; end
+            end
+            already || push!(nbrs_z0, cn)
+        end
+    end
+
+    # A polygon vertex has exactly 2 in-polygon neighbours.
+    length(nbrs_z0) >= 2 || return false
+    n_a = nbrs_z0[1]
+    n_b = nbrs_z0[2]
+
+    push!(cycle, z_0); push!(cycle, n_a)
+    v_prev = z_0; v_curr = n_a
+    steps = 0
+    while true
+        steps += 1
+        steps > nv + 4 && return false
+
+        # In-cell canonical neighbours of v_curr (excluding self).
+        v_next = 0
+        @inbounds for w in 1:nv
+            Int(canon[w]) != v_curr && continue
+            for k in 1:D
+                n = Int(poly.pnbrs[k, w])
+                n == 0 && continue
+                cn = Int(canon[n])
+                cn == v_curr && continue
+                cn == v_prev && continue
+                vertex_set[cn] || continue
+                if _coplanar_dgeneric(poly, z_0, n_a, n_b, cn)
+                    v_next = cn; break
+                end
+            end
+            v_next != 0 && break
+        end
+        v_next == 0 && return false
+        if v_next == z_0
+            return true
+        end
+        push!(cycle, v_next)
+        v_prev = v_curr
+        v_curr = v_next
+    end
+end
+
+# Generic recursive fan triangulator. `facet_path` (Vector{Int}, length k)
+# = the chain of facets defining the current (D - k)-cell. `apex_stack`
+# (Vector{Int}, length k) = the chain of canonical apex vertices picked
+# at higher levels (one per recursion depth). `vertex_set` = canonical
+# vertices in the current cell. Returns `Rational{R}` contribution.
+function _vol_recursive_dgeneric(poly::IntFlatPolytope{D,T},
+                                  canon::Vector{Int32},
+                                  vof::BitMatrix,
+                                  facet_path::Vector{Int},
+                                  apex_stack::Vector{Int},
+                                  vertex_set::BitVector,
+                                  ::Type{R}) where {D,T,R<:Signed}
+    cell_dim = D - length(facet_path)
+
+    if cell_dim == 1
+        # Edge: should have exactly 2 canonical vertices.
+        endpoints = Int[]
+        @inbounds for c in 1:length(vertex_set)
+            vertex_set[c] && push!(endpoints, c)
+        end
+        length(endpoints) == 2 || return zero(Rational{R})
+        a, b = endpoints[1], endpoints[2]
+        verts = vcat(apex_stack, [a, b])
+        return _vol_dsimplex_generic(poly, verts, R)
+    end
+
+    if cell_dim == 2
+        cycle = Int[]
+        ok = _walk_polygon_dgeneric!(cycle, poly, vertex_set, canon)
+        ok || return zero(Rational{R})
+        sum_rat = zero(Rational{R})
+        z_0 = cycle[1]
+        @inbounds for i in 2:(length(cycle) - 1)
+            verts = vcat(apex_stack, [z_0, cycle[i], cycle[i + 1]])
+            sum_rat += _vol_dsimplex_generic(poly, verts, R)
+        end
+        return sum_rat
+    end
+
+    # cell_dim ≥ 3: pick smallest canonical vertex as `w_0`.
+    w_0 = 0
+    @inbounds for c in 1:length(vertex_set)
+        if vertex_set[c]
+            w_0 = c; break
+        end
+    end
+    w_0 == 0 && return zero(Rational{R})
+
+    nf = poly.nfacets
+    sub_vertex_set = falses(length(vertex_set))
+    sum_rat = zero(Rational{R})
+
+    @inbounds for fid in 1:nf
+        # Already in path?
+        in_path = false
+        for f in facet_path
+            if f == fid; in_path = true; break; end
+        end
+        in_path && continue
+        # `w_0` on this facet?
+        vof[w_0, fid] && continue
+        # Build sub_vertex_set = vertex_set ∩ {v on fid}
+        any_in = false
+        for c in 1:length(vertex_set)
+            in_sub = vertex_set[c] && vof[c, fid]
+            sub_vertex_set[c] = in_sub
+            in_sub && (any_in = true)
+        end
+        any_in || continue
+
+        sub_path = vcat(facet_path, fid)
+        sub_apex = vcat(apex_stack, w_0)
+        sum_rat += _vol_recursive_dgeneric(poly, canon, vof,
+                                            sub_path, sub_apex,
+                                            sub_vertex_set, R)
+    end
+
+    return sum_rat
+end
+
+"""
+    volume_exact(poly::IntFlatPolytope{D,T}, ::Type{R} = T) -> Rational{R}
+    where D ∈ {5, 6}
+
+Exact `D`-volume for D = 5 / D = 6 IntExact polytopes via the same
+sqrt-free fan triangulation as the D = 4 method, generalized to a
+recursive enumeration of facet-intersection cells. Each leaf
+(D-simplex) contributes `|det(M)| / D!`.
+
+Cost: `O(M^D)` outer iterations where `M = poly.nfacets`. Fine for
+unit-box / unit-simplex inputs; clipped polytopes with many facets
+get expensive at D = 6. Use `R = BigInt` for overflow defense.
+"""
+function volume_exact(poly::IntFlatPolytope{D,T},
+                      ::Type{R} = T) where {D,T,R<:Signed}
+    @assert D == 5 || D == 6 "volume_exact: only D ∈ {2, 3, 4, 5, 6} supported in IntExact"
+    nv = poly.nverts
+    nv == 0 && return zero(Rational{R})
+
+    canon = _build_canonical_dgeneric(poly)
+    apex = Int(canon[1])
+    vof = _vertex_on_facet_table(poly, canon)
+
+    # Initial vertex_set = all canonical vertices.
+    vertex_set = falses(nv)
+    @inbounds for v in 1:nv
+        vertex_set[Int(canon[v])] = true
+    end
+
+    sum_rat = zero(Rational{R})
+    @inbounds for fid in 1:poly.nfacets
+        # apex on this facet?
+        vof[apex, fid] && continue
+        # Build sub_vertex_set
+        sub = falses(nv)
+        any_in = false
+        for c in 1:nv
+            in_sub = vertex_set[c] && vof[c, fid]
+            sub[c] = in_sub
+            in_sub && (any_in = true)
+        end
+        any_in || continue
+        sum_rat += _vol_recursive_dgeneric(poly, canon, vof,
+                                            [fid], [apex],
+                                            sub, R)
+    end
+    return sum_rat
+end
+
 end # module IntExact

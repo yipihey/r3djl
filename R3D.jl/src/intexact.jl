@@ -1802,13 +1802,27 @@ product.
 The polytope must be convex (which all `clip!`-derived polytopes are);
 non-convex polytopes will give wrong answers because fan triangulation
 relies on convexity.
+
+Robust to coincident vertex instances. Exact integer arithmetic can't
+ε-nudge sd_num[vcur] == 0 in `clip!`, so an axis-aligned clip that
+hits a polytope vertex exactly produces two distinct vertex instances
+at the same geometric position (one per cut facet that meets there).
+A pre-pass builds a canonical-vertex map (smallest index per
+coincident group) and the fan triangulator unions in-facet
+adjacencies across all instances of each canonical vertex — correctly
+handling the cone-singular vertex that the coincidence creates.
 """
 function volume_exact(poly::IntFlatPolytope{4,T},
                       ::Type{R} = T) where {T,R<:Signed}
     nv = poly.nverts
     nv == 0 && return zero(Rational{R})
 
-    apex = 1   # polytope apex
+    # Canonical map: `canon[v]` = smallest-indexed instance of any
+    # vertex geometrically coincident with `v`. Identity map when no
+    # coincidences (the common case).
+    canon = _build_canonical_d4(poly)
+
+    apex = Int(canon[1])   # canonical polytope apex
     sum_rat = zero(Rational{R})
 
     # Enumerate each facet exactly once.
@@ -1819,18 +1833,51 @@ function volume_exact(poly::IntFlatPolytope{4,T},
         seen_f[fid] && continue
         seen_f[fid] = true
 
-        # Skip if `apex` is on this facet.
+        # Skip if any instance of canonical `apex` is on this facet.
         on_apex = false
-        for ka in 1:4
-            if Int(poly.facets[ka, apex]) == fid
-                on_apex = true; break
+        for v_a in 1:nv
+            Int(canon[v_a]) != apex && continue
+            for ka in 1:4
+                if Int(poly.facets[ka, v_a]) == fid
+                    on_apex = true; break
+                end
             end
+            on_apex && break
         end
         on_apex && continue
 
-        sum_rat += _vol_facet_d4(poly, fid, apex, R)
+        sum_rat += _vol_facet_d4(poly, fid, apex, canon, R)
     end
     return sum_rat
+end
+
+# Build the canonical-vertex map: `canon[v]` = smallest-indexed vertex
+# geometrically coincident with `v`. Two vertices are coincident iff
+# their `(positions_num[1..D, v], positions_den[v])` tuples agree
+# verbatim — which holds because the per-clip GCD reduce keeps every
+# vertex in lowest terms, so coincident points have identical
+# (numerator, denominator) tuples.
+function _build_canonical_d4(poly::IntFlatPolytope{4,T}) where {T}
+    nv = poly.nverts
+    canon = Vector{Int32}(undef, nv)
+    @inbounds for v in 1:nv
+        canon[v] = Int32(v)
+    end
+    @inbounds for v in 1:nv
+        canon[v] != Int32(v) && continue
+        for w in (v + 1):nv
+            canon[w] != Int32(w) && continue
+            poly.positions_den[v] == poly.positions_den[w] || continue
+            same = true
+            for i in 1:4
+                if poly.positions_num[i, v] != poly.positions_num[i, w]
+                    same = false; break
+                end
+            end
+            same && (canon[w] = Int32(v))
+        end
+    end
+    return canon
 end
 
 # Test whether 4 vertices `ref, p1, p2, p3` of a D = 4 IntExact polytope
@@ -1871,12 +1918,17 @@ end
 end
 
 # Walk the boundary cycle of the 2-face of facet `fid` (encoded by
-# `in_facet`) at vertex `v` along edges (v, n_a) and (v, n_b). Pushes
-# the cycle vertices in order onto `cycle` (cleared first). Returns
-# `true` on success; `false` on a degenerate walk (no coplanar next).
+# `in_facet`) at canonical vertex `v` along edges (v, n_a) and (v, n_b).
+# Pushes canonical cycle vertices in order onto `cycle` (cleared first).
+# Uses `canon` to dedupe coincident vertex instances; uses `pnbrs_of`
+# to look up the unioned in-facet neighbours of each canonical vertex.
+# Returns `true` on success; `false` on a degenerate walk (no coplanar
+# next vertex).
 function _walk_2face_d4!(cycle::Vector{Int},
                           poly::IntFlatPolytope{4,T},
-                          in_facet::Vector{Bool},
+                          in_facet_can::AbstractVector{Bool},
+                          canon::Vector{Int32},
+                          pnbrs_can::Vector{Vector{Int}},
                           v::Int, n_a::Int, n_b::Int) where {T}
     empty!(cycle)
     push!(cycle, v); push!(cycle, n_a)
@@ -1887,10 +1939,7 @@ function _walk_2face_d4!(cycle::Vector{Int},
         steps += 1
         steps > nv + 4 && return false
         v_next = 0
-        @inbounds for k in 1:4
-            cand = Int(poly.pnbrs[k, v_curr])
-            cand == 0 && continue
-            in_facet[cand] || continue
+        @inbounds for cand in pnbrs_can[v_curr]
             cand == v_prev && continue
             if _coplanar_d4(poly, v, n_a, n_b, cand)
                 v_next = cand; break
@@ -1907,53 +1956,81 @@ function _walk_2face_d4!(cycle::Vector{Int},
 end
 
 # Fan-triangulate facet `fid` of a D = 4 polytope (a 3-polytope embedded
-# in a 3-hyperplane of R^4). Picks `w_0 = smallest in-facet vertex`,
-# enumerates each 2-face of `fid` exactly once via "smallest-vertex of
-# cycle" deduplication, fan-triangulates each 2-face NOT containing
-# `w_0` into triangles, and combines with `apex` to form 4-simplices.
+# in a 3-hyperplane of R^4). Operates on CANONICAL vertex IDs (via
+# `canon`) so coincident vertex instances become a single
+# canonical vertex with unioned in-facet adjacency. Picks `w_0 =
+# smallest in-facet canonical vertex`, enumerates each 2-face of `fid`
+# exactly once via "smallest-vertex of cycle" deduplication,
+# fan-triangulates each 2-face NOT containing `w_0` into triangles, and
+# combines with `apex` to form 4-simplices.
 function _vol_facet_d4(poly::IntFlatPolytope{4,T}, fid::Int, apex::Int,
+                        canon::Vector{Int32},
                         ::Type{R}) where {T,R<:Signed}
     fid_i = Int32(fid)
     nv = poly.nverts
 
-    in_facet = Vector{Bool}(undef, nv)
-    @inbounds for v in 1:nv
-        on = false
+    # `in_facet_can[c]` = true iff c is a canonical vertex (canon[c] == c)
+    # AND some instance with canon[w] == c lies on facet fid.
+    in_facet_can = falses(nv)
+    @inbounds for w in 1:nv
+        on_w = false
         for k in 1:4
-            if poly.facets[k, v] == fid_i
-                on = true; break
+            if poly.facets[k, w] == fid_i
+                on_w = true; break
             end
         end
-        in_facet[v] = on
+        on_w && (in_facet_can[Int(canon[w])] = true)
     end
 
+    # Build canonical in-facet adjacency: for each canonical vertex `c`
+    # on the facet, `pnbrs_can[c]` is the unique-by-canonical list of
+    # canonical IDs of `pnbrs[*, w]` for any instance `w` with
+    # `canon[w] == c`, restricted to `in_facet_can[*]` and excluding
+    # `c` itself (no self-loops at the cone-singular merged vertex).
+    pnbrs_can = Vector{Vector{Int}}(undef, nv)
+    @inbounds for c in 1:nv
+        pnbrs_can[c] = in_facet_can[c] ? Int[] : Int[]
+    end
+    @inbounds for w in 1:nv
+        on_w = false
+        for k in 1:4
+            if poly.facets[k, w] == fid_i
+                on_w = true; break
+            end
+        end
+        on_w || continue
+        c = Int(canon[w])
+        for k in 1:4
+            n = Int(poly.pnbrs[k, w])
+            n == 0 && continue
+            cn = Int(canon[n])
+            cn == c && continue           # self-loop at coincident vertices
+            in_facet_can[cn] || continue  # neighbour off the facet
+            already = false
+            for x in pnbrs_can[c]
+                if x == cn; already = true; break; end
+            end
+            already || push!(pnbrs_can[c], cn)
+        end
+    end
+
+    # `w_0` = smallest-indexed canonical vertex on the facet.
     w_0 = 0
-    @inbounds for v in 1:nv
-        if in_facet[v]
-            w_0 = v; break
+    @inbounds for c in 1:nv
+        if in_facet_can[c]
+            w_0 = c; break
         end
     end
     @assert w_0 != 0 "_vol_facet_d4: facet $fid has no vertices"
 
     sum_rat = zero(Rational{R})
     cycle = Int[]
-    in_nbrs_v = Int[]   # reused per vertex
 
-    # Walk every 2-face of `fid` exactly once: at each vertex `v` on
-    # `fid`, enumerate ordered pairs (n_a, n_b) of v's in-facet
-    # neighbours; the 2-face containing edges (v, n_a) and (v, n_b) is
-    # processed iff `v` is the smallest-indexed vertex of that 2-face's
-    # cycle (and additionally we use the lexicographically-smallest
-    # (n_a, n_b) pair at v for the 2-face — by walking via n_a first;
-    # walking via n_b would trace the same cycle in reverse).
+    # Enumerate each 2-face of `fid` exactly once at its smallest
+    # canonical vertex.
     @inbounds for v in 1:nv
-        in_facet[v] || continue
-
-        empty!(in_nbrs_v)
-        for k in 1:4
-            n = Int(poly.pnbrs[k, v])
-            n != 0 && in_facet[n] && push!(in_nbrs_v, n)
-        end
+        in_facet_can[v] || continue
+        in_nbrs_v = pnbrs_can[v]
         n_inn = length(in_nbrs_v)
         n_inn >= 2 || continue
 
@@ -1961,31 +2038,22 @@ function _vol_facet_d4(poly::IntFlatPolytope{4,T}, fid::Int, apex::Int,
             n_a = in_nbrs_v[ii]
             n_b = in_nbrs_v[jj]
 
-            ok = _walk_2face_d4!(cycle, poly, in_facet, v, n_a, n_b)
+            ok = _walk_2face_d4!(cycle, poly, in_facet_can, canon,
+                                  pnbrs_can, v, n_a, n_b)
             ok || continue
 
-            # Smallest-vertex dedup. Also: at the canonical vertex `v`,
-            # the 2-face determines a UNIQUE pair {n_a, n_b}; we must
-            # skip if (n_a, n_b) isn't the canonical pair (e.g. swapped).
-            # Since we only iterate ii < jj, each unordered pair is
-            # visited once, so this is automatic. But each 2-face has 3
-            # pairs at v if v has > 2 in-facet neighbours and the 2-face
-            # only uses 2 of them — we must verify the cycle's 2nd vertex
-            # is `n_a` (not some unrelated vertex from the same plane).
             cycle_min = cycle[1]
             for c in cycle
                 c < cycle_min && (cycle_min = c)
             end
             cycle_min != v && continue
 
-            # Skip if w_0 is on this 2-face (cone has zero 4-volume).
             on_w0 = false
             for c in cycle
                 if c == w_0; on_w0 = true; break; end
             end
             on_w0 && continue
 
-            # Fan-triangulate cycle from cycle[1].
             z_0 = cycle[1]
             for i in 2:(length(cycle) - 1)
                 sum_rat += _vol_4simplex(poly, apex, w_0, z_0,

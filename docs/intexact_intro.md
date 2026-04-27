@@ -284,15 +284,17 @@ sum would remain integer (mass conservation).
 - `D = 4` `clip!` does not ε-nudge boundary vertices (the float
   `R3D.Flat.clip_plane!` does, with `eps(T) * 256`). When two
   sequential axis-aligned cuts intersect exactly at a vertex of the
-  polytope (`sd_num[vcur] == 0`), the integer cut formula collapses
-  to a position coincident with `vcur`, leaving the polytope with a
-  duplicate vertex. `volume_exact` is correct on convex polytopes
-  produced by non-degenerate clip sequences (~75 % of random axis-
-  aligned 2-clip sequences on the 10× simplex pass at 1e-9 vs.
-  Flat); axis-aligned cuts that hit corner-coincident vertices may
-  return a partial volume. Use non-degenerate cuts, scale up the
-  polytope to push degeneracies off-grid, or fall back to
-  `R3D.Flat` for those workloads.
+  polytope (`sd_num[vcur] == 0`), the integer cut formula produces
+  two distinct vertex instances at the same geometric position (one
+  per cut facet meeting there). `volume_exact` handles this via a
+  pre-pass that builds a canonical-vertex map and unions in-facet
+  adjacencies — so axis-aligned voxelization-grid workloads that hit
+  exact corner coincidences give the correct volume (the original
+  bug-report case `v_np == v_pn` now holds bit-exactly). Other
+  IntExact operations (`moments_exact`, `voxelize_fold!`) at `D >= 4`
+  would need analogous canonical-pass treatment when added — the
+  D = 3 path doesn't expose this since its polynomial-moments
+  recursion never enumerates 2-faces directly.
 - `rotate!` accepts only integer-orthogonal matrices. The assertion
   `A * A' == I` triggers if you pass anything else; use
   `R3D.Flat.rotate!` for general `SO(D)` rotations (their entries

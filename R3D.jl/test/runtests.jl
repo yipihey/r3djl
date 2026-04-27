@@ -3251,12 +3251,16 @@ end
     end
 
     @testset "random clips differential vs Flat" begin
-        # Random non-degenerate clips on the (10×) D = 4 simplex,
-        # cross-checked against `R3D.Flat`'s float volume to 1e-9.
-        # Some axis-aligned random clips happen to land on exact-integer
-        # boundary vertices (sd_num == 0), producing the coincident-
-        # vertex degeneracy that exact integer arithmetic cannot ε-nudge
-        # past — accept up to 25 % failure on those.
+        # Random clips on the (10×) D = 4 simplex, cross-checked
+        # against `R3D.Flat`'s float volume.
+        #
+        # NB: Flat itself accumulates FP error per clip (its ε-nudge
+        # and the LTD orthonormalization both lose precision), so the
+        # tolerance scales with clip depth. At 2 clips, 1e-9 is fine;
+        # at 3+ clips Flat drifts into the 1e-3 range on ~5% of trials
+        # — those are FP errors in Flat, not bugs in IntExact (the
+        # exact rational from IntExact has been hand-checked on
+        # several "disagreements" and is correct).
         Random.seed!(20260426)
         agreed = 0
         nontrivial = 0
@@ -3294,6 +3298,65 @@ end
             err < 1e-9 && (agreed += 1)
         end
         @test nontrivial >= 5
-        @test agreed >= div(nontrivial * 3, 4)
+        # Phase 7 canonical-vertex pass: full agreement to 1e-9 on
+        # 2-clip random batches (Flat's FP error stays below this
+        # threshold at clip depth 2).
+        @test agreed == nontrivial
+    end
+
+    @testset "boundary-vertex bug-report case (Phase 7 fix)" begin
+        # The 2× simplex with sequential cuts at x[1] = 1 then x[2] = 1
+        # creates the corner (1, 1, 0, 0) lying exactly on both cut
+        # planes. Before Phase 7, integer arithmetic emitted two
+        # distinct vertex instances at this point, and `volume_exact`
+        # undercounted the resulting cone-singular vertex's
+        # contribution. The canonical-vertex pass in `volume_exact`
+        # merges the instances and unions their in-facet adjacencies.
+        function clip2(planes)
+            p = R3D.IntExact.IntFlatPolytope{4,Int64}(512)
+            R3D.IntExact.init_simplex!(p,
+                [[0, 0, 0, 0], [2, 0, 0, 0], [0, 2, 0, 0],
+                 [0, 0, 2, 0], [0, 0, 0, 2]])
+            for pp in planes
+                R3D.IntExact.clip!(p, pp)
+            end
+            return R3D.IntExact.volume_exact(p)
+        end
+        plane_neg(axis, c) = R3D.Plane{4,Int64}(
+            ntuple(k -> Int64(k == axis ? -1 : 0), Val(4)), Int64(c))
+        plane_pos(axis, c) = R3D.Plane{4,Int64}(
+            ntuple(k -> Int64(k == axis ?  1 : 0), Val(4)), Int64(-c))
+
+        v_nn = clip2((plane_neg(1, 1), plane_neg(2, 1)))
+        v_np = clip2((plane_neg(1, 1), plane_pos(2, 1)))
+        v_pn = clip2((plane_pos(1, 1), plane_neg(2, 1)))
+        v_pp = clip2((plane_pos(1, 1), plane_pos(2, 1)))
+
+        # Coordinate-swap symmetry: v_np == v_pn (the original bug
+        # report's primary symptom — Flat float gave 0.0026 vs. 0.0052).
+        @test v_np == v_pn
+
+        # Per-quadrant exact values.
+        @test v_nn == 7 // 12     # 16/24 - 2/24 (small corners removed)
+        @test v_np == 1 // 24
+        @test v_pn == 1 // 24
+        @test v_pp == 0 // 1
+
+        # Total volume preservation.
+        @test v_nn + v_np + v_pn + v_pp == 2 // 3   # = 16 / 24
+    end
+
+    @testset "canonical-pass detects coincident vertices" begin
+        # Direct probe of the helper: the sequential-cut polytope
+        # contains exactly one duplicate-vertex pair at (1, 1, 0, 0).
+        poly = R3D.IntExact.IntFlatPolytope{4,Int64}(512)
+        R3D.IntExact.init_simplex!(poly,
+            [[0, 0, 0, 0], [2, 0, 0, 0], [0, 2, 0, 0],
+             [0, 0, 2, 0], [0, 0, 0, 2]])
+        R3D.IntExact.clip!(poly, R3D.Plane{4,Int64}((-1, 0, 0, 0), 1))
+        R3D.IntExact.clip!(poly, R3D.Plane{4,Int64}((0, -1, 0, 0), 1))
+        canon = R3D.IntExact._build_canonical_d4(poly)
+        # Some vertex is canonicalized away (canon[v] != v for some v).
+        @test count(v -> canon[v] != Int32(v), 1:poly.nverts) == 1
     end
 end

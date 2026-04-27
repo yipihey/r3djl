@@ -43,6 +43,13 @@ module IntExact
 using StaticArrays: SVector, MVector
 using ..R3D: Plane, Vec, num_moments
 
+# `fits_in(::Type{T}, x)` — returns whether `x` (of `widen(T)` type)
+# fits in `T`. For `T = BigInt`, `widen(BigInt) = BigInt` and there are
+# no bounds, so always returns true.
+@inline _fits_in(::Type{BigInt}, x) = true
+@inline _fits_in(::Type{T}, x) where {T<:Signed} =
+    typemin(T) <= x <= typemax(T)
+
 # ---------------------------------------------------------------------------
 # Type
 # ---------------------------------------------------------------------------
@@ -271,27 +278,37 @@ function clip_plane!(poly::IntFlatPolytope{3,T}, plane::Plane{3,T}) where {T}
             #   newpos = (-Sb * pa_num + Sa * pb_num) / (Sa * db - Sb * da)
             # so the new numerators come out as a single integer linear
             # combination of pa_num and pb_num — no extra `da, db` factors.
-            new_den = Sa * db - Sb * da
-            # Sa ≥ 0 and Sb < 0 with da, db > 0 ⇒ new_den > 0 strictly.
-            new_num1 = Sa * poly.positions_num[1, vnext] - Sb * poly.positions_num[1, vcur]
-            new_num2 = Sa * poly.positions_num[2, vnext] - Sb * poly.positions_num[2, vcur]
-            new_num3 = Sa * poly.positions_num[3, vnext] - Sb * poly.positions_num[3, vcur]
+            #
+            # Compute in `widen(T)` to absorb transient overflow during
+            # the cut formula. The GCD-reduced result usually fits back
+            # in `T`; if it doesn't, return false so the caller can retry
+            # with a wider storage type.
+            WT = widen(T)
+            new_den_w  = WT(Sa) * WT(db) - WT(Sb) * WT(da)
+            new_num1_w = WT(Sa) * WT(poly.positions_num[1, vnext]) -
+                         WT(Sb) * WT(poly.positions_num[1, vcur])
+            new_num2_w = WT(Sa) * WT(poly.positions_num[2, vnext]) -
+                         WT(Sb) * WT(poly.positions_num[2, vcur])
+            new_num3_w = WT(Sa) * WT(poly.positions_num[3, vnext]) -
+                         WT(Sb) * WT(poly.positions_num[3, vcur])
 
-            # Lazy GCD reduction: divide num/den by their common factor.
-            # Cheap (~tens of cycles for Int64) and keeps subsequent clips
-            # in tighter integer ranges.
-            g = gcd(gcd(gcd(new_den, new_num1), new_num2), new_num3)
-            if g > one(T)
-                new_den  = div(new_den,  g)
-                new_num1 = div(new_num1, g)
-                new_num2 = div(new_num2, g)
-                new_num3 = div(new_num3, g)
+            g = gcd(gcd(gcd(new_den_w, new_num1_w), new_num2_w), new_num3_w)
+            if g > one(WT)
+                new_den_w  = div(new_den_w,  g)
+                new_num1_w = div(new_num1_w, g)
+                new_num2_w = div(new_num2_w, g)
+                new_num3_w = div(new_num3_w, g)
             end
 
-            poly.positions_num[1, new_idx] = new_num1
-            poly.positions_num[2, new_idx] = new_num2
-            poly.positions_num[3, new_idx] = new_num3
-            poly.positions_den[new_idx]    = new_den
+            _fits_in(T, new_den_w) || return false
+            _fits_in(T, new_num1_w) || return false
+            _fits_in(T, new_num2_w) || return false
+            _fits_in(T, new_num3_w) || return false
+
+            poly.positions_num[1, new_idx] = T(new_num1_w)
+            poly.positions_num[2, new_idx] = T(new_num2_w)
+            poly.positions_num[3, new_idx] = T(new_num3_w)
+            poly.positions_den[new_idx]    = T(new_den_w)
 
             poly.pnbrs[1, new_idx] = Int32(vcur)
             poly.pnbrs[2, new_idx] = Int32(0)
@@ -593,22 +610,34 @@ function clip_plane!(poly::IntFlatPolytope{2,T}, plane::Plane{2,T}) where {T}
             # Same integer linear-combination cut formula as D = 3:
             # new_pos = (Sa·pb − Sb·pa) / (Sa·db − Sb·da), where the
             # da, db factors cancel out of the numerator algebraically.
-            new_den  = Sa * db - Sb * da   # > 0 since Sa ≥ 0, Sb < 0, da, db > 0
-            new_num1 = Sa * poly.positions_num[1, vnext] -
-                       Sb * poly.positions_num[1, vcur]
-            new_num2 = Sa * poly.positions_num[2, vnext] -
-                       Sb * poly.positions_num[2, vcur]
+            # Compute in `widen(T)` to absorb the s^2-scale transient
+            # overflow that hits narrow `T` (e.g. `Int32` with
+            # coordinates up to ~46 000): `Sa * pos_num` can exceed
+            # `T`'s range even when the GCD-reduced answer fits back.
+            WT = widen(T)
+            new_den_w  = WT(Sa) * WT(db) - WT(Sb) * WT(da)
+            new_num1_w = WT(Sa) * WT(poly.positions_num[1, vnext]) -
+                         WT(Sb) * WT(poly.positions_num[1, vcur])
+            new_num2_w = WT(Sa) * WT(poly.positions_num[2, vnext]) -
+                         WT(Sb) * WT(poly.positions_num[2, vcur])
 
-            g = gcd(gcd(new_den, new_num1), new_num2)
-            if g > one(T)
-                new_den  = div(new_den,  g)
-                new_num1 = div(new_num1, g)
-                new_num2 = div(new_num2, g)
+            g = gcd(gcd(new_den_w, new_num1_w), new_num2_w)
+            if g > one(WT)
+                new_den_w  = div(new_den_w,  g)
+                new_num1_w = div(new_num1_w, g)
+                new_num2_w = div(new_num2_w, g)
             end
 
-            poly.positions_num[1, new_idx] = new_num1
-            poly.positions_num[2, new_idx] = new_num2
-            poly.positions_den[new_idx]    = new_den
+            # Cast back to T. If the GCD-reduced values still don't
+            # fit, signal failure — caller should retry with a wider
+            # storage type.
+            _fits_in(T, new_den_w) || return false
+            _fits_in(T, new_num1_w) || return false
+            _fits_in(T, new_num2_w) || return false
+
+            poly.positions_num[1, new_idx] = T(new_num1_w)
+            poly.positions_num[2, new_idx] = T(new_num2_w)
+            poly.positions_den[new_idx]    = T(new_den_w)
 
             other = 3 - np                  # 1↔2 swap
             poly.pnbrs[other, new_idx] = Int32(vcur)
@@ -1611,21 +1640,31 @@ function clip_plane!(poly::IntFlatPolytope{D,T}, plane::Plane{D,T}) where {D,T}
             #   new_den  = Sa * db - Sb * da   (> 0 strictly, since Sa ≥ 0,
             #                                   Sb < 0, da, db > 0)
             #   new_num_i = Sa * pos_num[i, vnext] - Sb * pos_num[i, vcur]
-            new_den = Sa * db - Sb * da
-            g = new_den
+            #
+            # Compute in `widen(T)` to absorb transient overflow during
+            # the cut formula, then GCD-reduce and try to cast back.
+            WT = widen(T)
+            new_den_w = WT(Sa) * WT(db) - WT(Sb) * WT(da)
+            num_w = ntuple(i -> WT(Sa) * WT(poly.positions_num[i, vnext]) -
+                                WT(Sb) * WT(poly.positions_num[i, vcur]),
+                           Val(D))
+            g = new_den_w
             for i in 1:D
-                num_i = Sa * poly.positions_num[i, vnext] -
-                        Sb * poly.positions_num[i, vcur]
-                poly.positions_num[i, new_v] = num_i
-                g = gcd(g, num_i)
+                g = gcd(g, num_w[i])
             end
-            if g > one(T)
-                new_den = div(new_den, g)
-                for i in 1:D
-                    poly.positions_num[i, new_v] = div(poly.positions_num[i, new_v], g)
-                end
+            if g > one(WT)
+                new_den_w = div(new_den_w, g)
+                num_w = ntuple(i -> div(num_w[i], g), Val(D))
             end
-            poly.positions_den[new_v] = new_den
+
+            # Cast back to T; signal failure if even the GCD-reduced
+            # values exceed `T`'s range.
+            _fits_in(T, new_den_w) || return false
+            for i in 1:D
+                _fits_in(T, num_w[i]) || return false
+                poly.positions_num[i, new_v] = T(num_w[i])
+            end
+            poly.positions_den[new_v] = T(new_den_w)
 
             poly.pnbrs[1, new_v] = Int32(vcur)
             for k in 2:D

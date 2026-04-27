@@ -323,6 +323,14 @@ sum would remain integer (mass conservation).
   doubt about overflow, run with `T = BigInt` (or `R = BigInt`
   accumulator on the moment / volume calls).
 
+- `clip!` computes its cut-formula intermediates (`Sa * pos_num`,
+  which can reach `coord²`) in `widen(T)` and casts back to `T`
+  after GCD reduction. So narrow types like `T = Int32` survive
+  coords up to roughly `2³¹` (not just `√(2³¹) ≈ 46 000`) before
+  the GCD-reduced result can't fit back. If the GCD-reduced value
+  *still* exceeds `T`, `clip!` returns `false` rather than silently
+  producing a corrupt polytope — switch to wider `T` and retry.
+
 ## What does the overflow look like in practice?
 
 Output of `R3D.jl/bench/intexact_overflow.jl`, which clips a

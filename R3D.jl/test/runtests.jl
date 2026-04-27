@@ -2710,6 +2710,48 @@ end
         @test isapprox(Float64(R3D.IntExact.area_exact(big_poly)),
                        R3D.Flat.moments(float_poly, 0)[1]; atol = 1e-9)
     end
+
+    @testset "Int32-storage cut formula widens through transient overflow" begin
+        # Regression for upstream-reported bug: triangle (0,0)-(s,0)-(s,s)
+        # at s = 65535 stored in `T = Int32` clipped by [s/2, s] × [0, s/2].
+        # The cut formula's `Sa * pos_num` term reaches s² = 4.29e9 which
+        # exceeds Int32_max ≈ 2.15e9, silently wrapping to garbage. Pre-fix
+        # the polytope had a vertex at (-131071, 2147450880)/65535
+        # ≈ (-2.0, 32768) — outside the original triangle.
+        # Fix: compute cut intermediates in `widen(Int32) = Int64`, GCD-
+        # reduce, cast back; the reduced values fit Int32 cleanly.
+        s = Int32(65535)
+        T = Int32
+
+        tri = R3D.IntExact.IntFlatPolytope{2,T}(64)
+        R3D.IntExact.init_simplex!(tri,
+            [T(0), T(0)], [s, T(0)], [s, s])
+
+        ok1 = R3D.IntExact.clip!(tri, R3D.Plane{2,T}((T(1), T(0)), -(s ÷ T(2))))
+        @test ok1
+        @test all(0 <= tri.positions_num[1, v] <= s for v in 1:tri.nverts)
+        @test all(0 <= tri.positions_num[2, v] <= s for v in 1:tri.nverts)
+
+        ok2 = R3D.IntExact.clip!(tri, R3D.Plane{2,T}((T(0), T(-1)), s ÷ T(2)))
+        @test ok2
+        # Every vertex must land inside the original triangle's bounding
+        # box [0, s]² (the bug had one at (-131071/65535, 32768) = (-2, 32768)).
+        for v in 1:tri.nverts
+            d = tri.positions_den[v]
+            @test 0 <= tri.positions_num[1, v]
+            @test tri.positions_num[1, v] <= s * d
+            @test 0 <= tri.positions_num[2, v]
+            @test tri.positions_num[2, v] <= s * d
+        end
+
+        # Area of the cut piece [s/2, s] × [0, s/2] ∩ triangle =
+        # rectangle (s ÷ 2 wide × s ÷ 2 tall) — the diagonal y = x clips
+        # off nothing inside this region since y ≤ s/2 ≤ s/2 ≤ x.
+        # Width = s − (s ÷ 2), height = s ÷ 2.
+        w = Int64(s) - Int64(s ÷ 2)
+        h = Int64(s ÷ 2)
+        @test R3D.IntExact.area_exact(tri, Int64) == w * h // 1
+    end
 end
 
 @testset "R3D.IntExact polynomial moments at D ∈ {2, 3}" begin
